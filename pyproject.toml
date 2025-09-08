@@ -19,6 +19,10 @@ dependencies = [
 [project.scripts]
 microbrain = "microbrain.cli:main"
 
+# Auto-discover 'microbrain' package in the repo root
+[tool.setuptools.packages.find]
+include = ["microbrain*"]
+
 [tool.black]
 line-length = 100
 

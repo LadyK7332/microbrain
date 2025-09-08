@@ -1,4 +1,4 @@
-"""
+﻿"""
 Command-line entry point for microbrain.
 """
 from .mind import main as _main
