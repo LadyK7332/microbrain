@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "microbrain"
+version = "0.1.0"
+description = "Modular neuron/worker-based mind architecture."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE.md" }
+authors = [{ name = "Joseph W. Brugh" }]
+dependencies = [
+    "vosk==0.3.45",
+    "sounddevice==0.4.6",
+    "numpy>=1.24"
+]
+
+[project.scripts]
+microbrain = "microbrain.cli:main"
+
+[tool.black]
+line-length = 100
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "I", "UP", "B"]

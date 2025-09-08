@@ -28,30 +28,35 @@ async def main_async(cfg: AppConfig):
     from microbrain.tools import ToolRegistry
     from microbrain.agent import Agent
 
-    client = OllamaClient(base_url=cfg.ollama_base, model=cfg.model)
+    client = OllamaClient(host=cfg.ollama_base, model=cfg.model)
     mem = MemoryStore(memdir=cfg.memdir, onnx_embed_path=cfg.onnx_embed_path, onnx_provider=cfg.onnx_provider, onnx_max_len=cfg.onnx_max_len)
     tools = ToolRegistry()
     agent = Agent(client=client, memory=mem, tools=tools, logger=logger)
 
-    if cfg.vosk_model_path:
-        from microbrain.voice.asr import STT
-        from microbrain.voice.tts import TTS
-        from microbrain.voice.loop import voice_chat_loop
-        stt = STT(model_path=cfg.vosk_model_path, mic_device=cfg.mic_device, sample_rate=cfg.sample_rate, logger=logger)
-        tts = TTS(voice_name=cfg.tts_voice, rate=cfg.tts_rate, volume=cfg.tts_volume, logger=logger)
-        await voice_chat_loop(stt, tts, agent, logger)
-    else:
-        logger.info("Voice not enabled; starting text REPL. Ctrl+C to exit.")
-        while True:
-            try:
-                prompt = input("you> ").strip()
-            except (EOFError, KeyboardInterrupt):
-                print()
-                break
-            if not prompt:
-                continue
-            reply = await agent.complete(prompt)
-            print("bot>", reply)
+if cfg.voice:
+    if not cfg.vosk_model_path:
+        logger.error("Voice requested but --vosk-model-path is missing.")
+        return
+    from microbrain.voice.asr import STT
+    from microbrain.voice.tts import TTS
+    from microbrain.voice.loop import voice_chat_loop
+    stt = STT(model_path=cfg.vosk_model_path, mic_device=cfg.mic_device,
+              sample_rate=cfg.sample_rate, logger=logger)
+    tts = TTS(voice_name=cfg.tts_voice, rate=cfg.tts_rate,
+              volume=cfg.tts_volume, logger=logger)
+    await voice_chat_loop(stt, tts, agent, logger)
+else:
+    logger.info("Voice not enabled; starting text REPL. Ctrl+C to exit.")
+    while True:
+        try:
+            prompt = input("you> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if not prompt:
+            continue
+        reply = await agent.complete(prompt)
+        print("bot>", reply)
 
 def main():
     args = build_arg_parser().parse_args()
@@ -69,6 +74,7 @@ def main():
         tts_rate=args.tts_rate,
         tts_volume=args.tts_volume,
         log_level=args.log_level,
+        voice=args.voice, 
     )
     asyncio.run(main_async(cfg))
 
