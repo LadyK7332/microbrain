@@ -31,7 +31,10 @@ def voice_chat_loop(agent, stt: STT, tts: TTS):
         # Ask the LLM
         messages = [
             {"role": "system", "content": agent.system},
-            {"role": "user", "content": f"{context_text}\n\nUser: {user_text}\nPlan step-by-step, then answer briefly."}
+            {
+                "role": "user",
+                "content": f"{context_text}\n\nUser: {user_text}\nPlan step-by-step, then answer briefly.",
+            },
         ]
         reply = agent.ollama.chat(messages, options={"temperature": 0.2})
         agent.mem.add_semantic(f"ASSISTANT SAID: {reply[:500]}", {"mode": "voice"})

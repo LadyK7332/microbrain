@@ -3,6 +3,7 @@ class TTS:
     Offline TTS using Windows SAPI via pyttsx3.
     You can pass a name substring (e.g., 'Zira', 'Aria', 'Female') to pick a mature feminine voice.
     """
+
     def __init__(self, rate: int = 175, volume: float = 1.0, preferred: str = ""):
         self.engine = pyttsx3.init()
         # rate / volume
@@ -43,7 +44,10 @@ class TTS:
 
     def list_voices(self) -> list[str]:
         try:
-            return [f"{i}: {v.name} ({v.id})" for i, v in enumerate(self.engine.getProperty("voices") or [])]
+            return [
+                f"{i}: {v.name} ({v.id})"
+                for i, v in enumerate(self.engine.getProperty("voices") or [])
+            ]
         except Exception:
             return []
 

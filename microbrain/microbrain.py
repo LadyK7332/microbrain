@@ -1,10 +1,14 @@
 from __future__ import annotations
+
+
 class MicroBrain:
     def __init__(self, ollama, mem, neuron_names: list[str]):
         self.ollama, self.mem = ollama, mem
         registry = {
-            "planner": PlannerNeuron, "reasoner": ReasonerNeuron,
-            "memory": MemoryNeuron, "coder": CoderNeuron
+            "planner": PlannerNeuron,
+            "reasoner": ReasonerNeuron,
+            "memory": MemoryNeuron,
+            "coder": CoderNeuron,
         }
         self.neurons = [registry[n](ollama, mem) for n in neuron_names if n in registry]
         self.bus: Deque[MBMessage] = deque(maxlen=50)

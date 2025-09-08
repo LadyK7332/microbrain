@@ -1,5 +1,4 @@
 # Imports
-from typing import Optional, List
 
 
 class JSONLStore:
@@ -11,7 +10,7 @@ class JSONLStore:
                 pass
         self._lock = threading.Lock()
 
-# inside JSONLStore.__init__
+    # inside JSONLStore.__init__
 
     def append(self, obj: dict) -> None:
         with self._lock:
@@ -21,12 +20,13 @@ class JSONLStore:
     def read_all(self) -> list[dict]:
         with self._lock:
             items = []
-            with open(self.path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if line:
-                            items.append(json.loads(line))
+            with open(self.path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        items.append(json.loads(line))
             return items
+
 
 class ONNXEmbedder:
     """
@@ -36,17 +36,24 @@ class ONNXEmbedder:
       - 'pooler_output' (B, D)
     We apply mean pooling over token dimension if last_hidden_state is provided.
     """
-    def __init__(self, onnx_path: str, tokenizer_path_or_json: str | None,
-                 provider: str = "DmlExecutionProvider", max_len: int = 256):
-        self.sess = ort.InferenceSession(
-            onnx_path,
-            providers=[provider, "CPUExecutionProvider"]
-        )
+
+    def __init__(
+        self,
+        onnx_path: str,
+        tokenizer_path_or_json: str | None,
+        provider: str = "DmlExecutionProvider",
+        max_len: int = 256,
+    ):
+        self.sess = ort.InferenceSession(onnx_path, providers=[provider, "CPUExecutionProvider"])
         # Load tokenizer: if you pass a tokenizer JSON path, Tokenizer.from_file works.
         # If None, we fall back to a whitespace tokenizer (works but poorer quality).
         self.max_len = max_len
         self.tokenizer = None
-        if Tokenizer is not None and tokenizer_path_or_json and os.path.exists(tokenizer_path_or_json):
+        if (
+            Tokenizer is not None
+            and tokenizer_path_or_json
+            and os.path.exists(tokenizer_path_or_json)
+        ):
             self.tokenizer = Tokenizer.from_file(tokenizer_path_or_json)
         # else: leave self.tokenizer = None (will use whitespace fallback)
 
@@ -88,6 +95,7 @@ class ONNXEmbedder:
             ids, attn = self._ws_tokenize(text)
 
         import numpy as np
+
         input_ids = np.array([ids], dtype=np.int64)
         attention_mask = np.array([attn], dtype=np.int64)
 
@@ -98,7 +106,9 @@ class ONNXEmbedder:
         if self.out_pool:
             vec = outputs[[o.name for o in self.sess.get_outputs()].index(self.out_pool)][0]  # (D,)
         elif self.out_last:
-            last = outputs[[o.name for o in self.sess.get_outputs()].index(self.out_last)][0]  # (T,D)
+            last = outputs[[o.name for o in self.sess.get_outputs()].index(self.out_last)][
+                0
+            ]  # (T,D)
             # mean pool over tokens with attention mask
             mask = attention_mask[0][: last.shape[0]].astype(float)
             mask = mask[:, None]
@@ -113,6 +123,7 @@ class ONNXEmbedder:
         n = float((vec**2).sum()) ** 0.5 or 1.0
         return (vec / n).tolist()
 
+
 class MemoryStore:
     """
     Persistent memory with optional Ollama embeddings.
@@ -120,7 +131,14 @@ class MemoryStore:
       - semantic.jsonl (text, vec, meta, ts)
       - episodic.jsonl (text, meta, ts)
     """
-    def __init__(self, memdir: Optional[str] = None, onnx_embed_path: Optional[str] = None, onnx_provider: Optional[str] = None, onnx_max_len: int = 256):
+
+    def __init__(
+        self,
+        memdir: str | None = None,
+        onnx_embed_path: str | None = None,
+        onnx_provider: str | None = None,
+        onnx_max_len: int = 256,
+    ):
         self.ollama = ollama
         self.base_dir = base_dir
         self.embedder = embedder
@@ -136,11 +154,12 @@ class MemoryStore:
         self.embedder = None
         if self.onnx_embed_path:
             try:
-                self.embedder = ONNXEmbedder(self.onnx_embed_path, provider=self.onnx_provider, max_len=self.onnx_max_len)
+                self.embedder = ONNXEmbedder(
+                    self.onnx_embed_path, provider=self.onnx_provider, max_len=self.onnx_max_len
+                )
             except Exception as e:
                 # Fallback or raise—your call. For now, just print/log.
                 print(f"[MemoryStore] ONNX init failed: {e}")
-
 
         # Load existing items (if any)
         for row in self.sem_file.read_all():
@@ -174,11 +193,14 @@ class MemoryStore:
         self.epi_file.append(item)
 
     def _cosine(self, a: list[float], b: list[float]) -> float:
-        if not a or not b: return 0.0
+        if not a or not b:
+            return 0.0
         import math
-        dot = sum(x*y for x, y in zip(a, b))
-        na = math.sqrt(sum(x*x for x in a)); nb = math.sqrt(sum(y*y for y in b))
-        return (dot / (na*nb)) if na and nb else 0.0
+
+        dot = sum(x * y for x, y in zip(a, b, strict=False))
+        na = math.sqrt(sum(x * x for x in a))
+        nb = math.sqrt(sum(y * y for y in b))
+        return (dot / (na * nb)) if na and nb else 0.0
 
     def search_semantic(self, query: str, k: int = 5) -> list[dict]:
         try:
@@ -196,11 +218,13 @@ class MemoryStore:
     def last_episodic(self, n: int = 3) -> list[dict]:
         return self.episodic[-n:]
 
+
 def _local_embed(text: str) -> list[float]:
-        # 256-dim hash vector; no dependencies
-        vec = [0.0] * 256
-        for b in text.encode("utf-8", errors="ignore"):
-            vec[b % 256] += 1.0
-        import math
-        n = math.sqrt(sum(v*v for v in vec)) or 1.0
-        return [v/n for v in vec]
+    # 256-dim hash vector; no dependencies
+    vec = [0.0] * 256
+    for b in text.encode("utf-8", errors="ignore"):
+        vec[b % 256] += 1.0
+    import math
+
+    n = math.sqrt(sum(v * v for v in vec)) or 1.0
+    return [v / n for v in vec]

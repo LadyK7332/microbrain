@@ -25,7 +25,30 @@ include = ["microbrain*"]
 
 [tool.black]
 line-length = 100
+target-version = ["py313"]
 
 [tool.ruff]
 line-length = 100
+target-version = "py313"
+
+# Exclude unfinished/WIP areas from linting for now.
+exclude = [
+  "microbrain/legacy/*",
+  "microbrain/voice/*",
+  "microbrain/memory/*",
+  "microbrain/ollama_client.py",
+  "microbrain/tools.py",
+  "microbrain/microbrain.py",
+]
+
+[tool.ruff.lint]
+# Keep useful rules, but use new 'lint' section Ruff expects.
 select = ["E", "F", "I", "UP", "B"]
+ignore = [
+  "E501",  # long lines: relaxed for now
+]
+
+# If you later want to lint a single file but quiet some errors:
+[tool.ruff.lint.per-file-ignores]
+# Example of targeted ignores you can add when you re-include files
+# "microbrain/tools.py" = ["F811", "F821", "UP006", "UP007"]

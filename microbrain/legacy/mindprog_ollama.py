@@ -15,15 +15,23 @@ Requires: Ollama running locally (default http://127.0.0.1:11434).
 """
 
 from __future__ import annotations
-import argparse, json, os, sys, time, threading, pyttsx3, queue
-from typing import Any, Dict, List, Optional, Callable
-import urllib.request
-import urllib.error
+
+import argparse
+import json
+import os
 import queue
+import threading
+import time
+import urllib.error
+import urllib.request
+from typing import Any, Callable, Dict, List, Optional
+
+import onnxruntime as ort
 import pyttsx3
 import sounddevice as sd
-from vosk import Model as VoskModel, KaldiRecognizer
-import onnxruntime as ort
+from vosk import KaldiRecognizer
+from vosk import Model as VoskModel
+
 # replace this:
 # from tokenizers import Tokenizer
 
@@ -34,15 +42,22 @@ except Exception:
     Tokenizer = None
 # =============== Ollama client ===============
 
+
 def _http_json(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=600) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
+
 class OllamaClient:
-    def __init__(self, host: Optional[str] = None, model: str = "llama3",
-                use_chat: bool = True, embed_model: Optional[str] = None):
+    def __init__(
+        self,
+        host: Optional[str] = None,
+        model: str = "llama3",
+        use_chat: bool = True,
+        embed_model: Optional[str] = None,
+    ):
         self.host = host or os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
         self.model = model
         self.use_chat = use_chat
@@ -52,27 +67,37 @@ class OllamaClient:
     def chat(self, messages: List[Dict[str, str]], options: Optional[Dict[str, Any]] = None) -> str:
         url = f"{self.host}/api/chat"
         payload = {"model": self.model, "messages": messages, "stream": False}
-        if options: payload["options"] = options
+        if options:
+            payload["options"] = options
         res = _http_json(url, payload)
         return res.get("message", {}).get("content", "")
 
     # Simple generate fallback
     def generate(self, prompt: str, options: Optional[Dict[str, Any]] = None) -> str:
         url = f"{self.host}/api/generate"
-        payload = {"model": self.model, "prompt": prompt, "stream": False}  # <-- fix model_model typo
-        if options: payload["options"] = options
+        payload = {
+            "model": self.model,
+            "prompt": prompt,
+            "stream": False,
+        }  # <-- fix model_model typo
+        if options:
+            payload["options"] = options
         res = _http_json(url, payload)
         return res.get("response", "")
 
     # Embeddings
     def embed(self, text: str) -> List[float]:
         url = f"{self.host}/api/embeddings"
-        payload = {"model": (self.embed_model or self.model), "prompt": text}  # <-- honor embed_model
+        payload = {
+            "model": (self.embed_model or self.model),
+            "prompt": text,
+        }  # <-- honor embed_model
         try:
             res = _http_json(url, payload)
             return res.get("embedding", [])
         except Exception:
             return []  # let MemoryStore fall back to _local_embed
+
 
 # =============== Memory (semantic + episodic) ===============
 class JSONLStore:
@@ -84,7 +109,7 @@ class JSONLStore:
                 pass
         self._lock = threading.Lock()
 
-# inside JSONLStore.__init__
+    # inside JSONLStore.__init__
 
     def append(self, obj: dict) -> None:
         with self._lock:
@@ -94,21 +119,24 @@ class JSONLStore:
     def read_all(self) -> list[dict]:
         with self._lock:
             items = []
-            with open(self.path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if line:
-                            items.append(json.loads(line))
+            with open(self.path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        items.append(json.loads(line))
             return items
 
+
 def _local_embed(text: str) -> list[float]:
-        # 256-dim hash vector; no dependencies
-        vec = [0.0] * 256
-        for b in text.encode("utf-8", errors="ignore"):
-            vec[b % 256] += 1.0
-        import math
-        n = math.sqrt(sum(v*v for v in vec)) or 1.0
-        return [v/n for v in vec]
+    # 256-dim hash vector; no dependencies
+    vec = [0.0] * 256
+    for b in text.encode("utf-8", errors="ignore"):
+        vec[b % 256] += 1.0
+    import math
+
+    n = math.sqrt(sum(v * v for v in vec)) or 1.0
+    return [v / n for v in vec]
+
 
 class ONNXEmbedder:
     """
@@ -118,17 +146,24 @@ class ONNXEmbedder:
       - 'pooler_output' (B, D)
     We apply mean pooling over token dimension if last_hidden_state is provided.
     """
-    def __init__(self, onnx_path: str, tokenizer_path_or_json: str | None,
-                 provider: str = "DmlExecutionProvider", max_len: int = 256):
-        self.sess = ort.InferenceSession(
-            onnx_path,
-            providers=[provider, "CPUExecutionProvider"]
-        )
+
+    def __init__(
+        self,
+        onnx_path: str,
+        tokenizer_path_or_json: str | None,
+        provider: str = "DmlExecutionProvider",
+        max_len: int = 256,
+    ):
+        self.sess = ort.InferenceSession(onnx_path, providers=[provider, "CPUExecutionProvider"])
         # Load tokenizer: if you pass a tokenizer JSON path, Tokenizer.from_file works.
         # If None, we fall back to a whitespace tokenizer (works but poorer quality).
         self.max_len = max_len
         self.tokenizer = None
-        if Tokenizer is not None and tokenizer_path_or_json and os.path.exists(tokenizer_path_or_json):
+        if (
+            Tokenizer is not None
+            and tokenizer_path_or_json
+            and os.path.exists(tokenizer_path_or_json)
+        ):
             self.tokenizer = Tokenizer.from_file(tokenizer_path_or_json)
         # else: leave self.tokenizer = None (will use whitespace fallback)
 
@@ -170,6 +205,7 @@ class ONNXEmbedder:
             ids, attn = self._ws_tokenize(text)
 
         import numpy as np
+
         input_ids = np.array([ids], dtype=np.int64)
         attention_mask = np.array([attn], dtype=np.int64)
 
@@ -180,7 +216,9 @@ class ONNXEmbedder:
         if self.out_pool:
             vec = outputs[[o.name for o in self.sess.get_outputs()].index(self.out_pool)][0]  # (D,)
         elif self.out_last:
-            last = outputs[[o.name for o in self.sess.get_outputs()].index(self.out_last)][0]  # (T,D)
+            last = outputs[[o.name for o in self.sess.get_outputs()].index(self.out_last)][
+                0
+            ]  # (T,D)
             # mean pool over tokens with attention mask
             mask = attention_mask[0][: last.shape[0]].astype(float)
             mask = mask[:, None]
@@ -195,6 +233,7 @@ class ONNXEmbedder:
         n = float((vec**2).sum()) ** 0.5 or 1.0
         return (vec / n).tolist()
 
+
 class MemoryStore:
     """
     Persistent memory with optional Ollama embeddings.
@@ -202,6 +241,7 @@ class MemoryStore:
       - semantic.jsonl (text, vec, meta, ts)
       - episodic.jsonl (text, meta, ts)
     """
+
     def __init__(self, ollama, base_dir: str, embedder=None):
         self.ollama = ollama
         self.base_dir = base_dir
@@ -245,11 +285,14 @@ class MemoryStore:
         self.epi_file.append(item)
 
     def _cosine(self, a: list[float], b: list[float]) -> float:
-        if not a or not b: return 0.0
+        if not a or not b:
+            return 0.0
         import math
-        dot = sum(x*y for x, y in zip(a, b))
-        na = math.sqrt(sum(x*x for x in a)); nb = math.sqrt(sum(y*y for y in b))
-        return (dot / (na*nb)) if na and nb else 0.0
+
+        dot = sum(x * y for x, y in zip(a, b))
+        na = math.sqrt(sum(x * x for x in a))
+        nb = math.sqrt(sum(y * y for y in b))
+        return (dot / (na * nb)) if na and nb else 0.0
 
     def search_semantic(self, query: str, k: int = 5) -> list[dict]:
         try:
@@ -267,33 +310,48 @@ class MemoryStore:
     def last_episodic(self, n: int = 3) -> list[dict]:
         return self.episodic[-n:]
 
+
 # =============== Tools ===============
 
 ToolFn = Callable[[Dict[str, Any]], Dict[str, Any]]
 
+
 class ToolRegistry:
-    def __init__(self): self._tools: Dict[str, ToolFn] = {}
-    def register(self, name: str, fn: ToolFn): self._tools[name] = fn
+    def __init__(self):
+        self._tools: Dict[str, ToolFn] = {}
+
+    def register(self, name: str, fn: ToolFn):
+        self._tools[name] = fn
+
     def call(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
-        fn = self._tools.get(name); 
-        if not fn: return {"ok": False, "error": f"unknown_tool:{name}"}
-        try: return {"ok": True, "result": fn(args)}
-        except Exception as e: return {"ok": False, "error": f"tool_error:{e}"}
+        fn = self._tools.get(name)
+        if not fn:
+            return {"ok": False, "error": f"unknown_tool:{name}"}
+        try:
+            return {"ok": True, "result": fn(args)}
+        except Exception as e:
+            return {"ok": False, "error": f"tool_error:{e}"}
+
 
 # Example tools
 def tool_time(_: Dict[str, Any]) -> Dict[str, Any]:
     import datetime as dt
-    return {"utc": dt.datetime.utcnow().replace(microsecond=0).isoformat()+"Z"}
+
+    return {"utc": dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"}
+
 
 def tool_search_mem(args: Dict[str, Any]) -> Dict[str, Any]:
     q = args.get("query", "")
     k = int(args.get("k", 5))
     hits = AGENT["mem"].search_semantic(q, k=k)
     return {"matches": [{"text": h["text"], "meta": h["meta"]} for h in hits]}
+
+
 # =============== MicroBrain (multi-neuron) ===============
-from dataclasses import dataclass, field
 from collections import deque
+from dataclasses import dataclass, field
 from typing import Deque
+
 
 @dataclass
 class MBMessage:
@@ -301,14 +359,20 @@ class MBMessage:
     content: str
     meta: dict = field(default_factory=dict)
 
+
 class Neuron:
     name: str = "neuron"
-    def __init__(self, ollama, mem): self.ollama, self.mem = ollama, mem
+
+    def __init__(self, ollama, mem):
+        self.ollama, self.mem = ollama, mem
+
     def step(self, inbox: list[MBMessage], goal: str) -> MBMessage:
         return MBMessage(role="neuron", content="(noop)", meta={"neuron": self.name})
 
+
 class PlannerNeuron(Neuron):
     name = "planner"
+
     def step(self, inbox, goal):
         context = "\n".join(m.content for m in inbox[-5:])
         prompt = (
@@ -317,15 +381,19 @@ class PlannerNeuron(Neuron):
             "Rules: Be concise; 1-2 lines per action; if goal is achieved, say: DONE."
         )
         out = self.ollama.chat(
-            [{"role":"system","content":"You plan in crisp steps."},
-             {"role":"user","content":prompt}],
-            options={"temperature":0.2}
+            [
+                {"role": "system", "content": "You plan in crisp steps."},
+                {"role": "user", "content": prompt},
+            ],
+            options={"temperature": 0.2},
         )
-        self.mem.add_semantic(f"[PLAN]\n{out}", {"neuron":"planner"})
+        self.mem.add_semantic(f"[PLAN]\n{out}", {"neuron": "planner"})
         return MBMessage(role="neuron", content=out, meta={"neuron": self.name})
+
 
 class ReasonerNeuron(Neuron):
     name = "reasoner"
+
     def step(self, inbox, goal):
         context = "\n".join(m.content for m in inbox[-5:])
         prompt = (
@@ -334,15 +402,19 @@ class ReasonerNeuron(Neuron):
             "Respond with a short rationale and a concrete result. If the task is complete, end with: DONE."
         )
         out = self.ollama.chat(
-            [{"role":"system","content":"Be precise, brief, actionable."},
-             {"role":"user","content":prompt}],
-            options={"temperature":0.2}
+            [
+                {"role": "system", "content": "Be precise, brief, actionable."},
+                {"role": "user", "content": prompt},
+            ],
+            options={"temperature": 0.2},
         )
-        self.mem.add_semantic(f"[REASON]\n{out}", {"neuron":"reasoner"})
+        self.mem.add_semantic(f"[REASON]\n{out}", {"neuron": "reasoner"})
         return MBMessage(role="neuron", content=out, meta={"neuron": self.name})
+
 
 class MemoryNeuron(Neuron):
     name = "memory"
+
     def step(self, inbox, goal):
         # pull a query from goal or last msg; then stuff top-k recalls into memory/output
         query = (inbox[-1].content if inbox else goal)[:500]
@@ -350,12 +422,14 @@ class MemoryNeuron(Neuron):
         summary = "\n".join(f"- {h['text'][:280]}" for h in hits)
         out = f"Top recalls for: {query[:80]}\n{summary or '(none)'}"
         # also tuck a compact memo for cross-neuron use
-        self.mem.add_episodic(f"[RECALL]\n{out}", {"neuron":"memory"})
+        self.mem.add_episodic(f"[RECALL]\n{out}", {"neuron": "memory"})
         return MBMessage(role="neuron", content=out, meta={"neuron": self.name})
+
 
 # Optional: a code-focused neuron (kept minimal)
 class CoderNeuron(Neuron):
     name = "coder"
+
     def step(self, inbox, goal):
         context = "\n".join(m.content for m in inbox[-5:])
         prompt = (
@@ -364,19 +438,24 @@ class CoderNeuron(Neuron):
             "If no code is needed, say 'SKIP'."
         )
         out = self.ollama.chat(
-            [{"role":"system","content":"You write correct, minimal code."},
-             {"role":"user","content":prompt}],
-            options={"temperature":0.2}
+            [
+                {"role": "system", "content": "You write correct, minimal code."},
+                {"role": "user", "content": prompt},
+            ],
+            options={"temperature": 0.2},
         )
-        self.mem.add_semantic(f"[CODE]\n{out}", {"neuron":"coder"})
+        self.mem.add_semantic(f"[CODE]\n{out}", {"neuron": "coder"})
         return MBMessage(role="neuron", content=out, meta={"neuron": self.name})
+
 
 class MicroBrain:
     def __init__(self, ollama, mem, neuron_names: list[str]):
         self.ollama, self.mem = ollama, mem
         registry = {
-            "planner": PlannerNeuron, "reasoner": ReasonerNeuron,
-            "memory": MemoryNeuron, "coder": CoderNeuron
+            "planner": PlannerNeuron,
+            "reasoner": ReasonerNeuron,
+            "memory": MemoryNeuron,
+            "coder": CoderNeuron,
         }
         self.neurons = [registry[n](ollama, mem) for n in neuron_names if n in registry]
         self.bus: Deque[MBMessage] = deque(maxlen=50)
@@ -391,6 +470,8 @@ class MicroBrain:
                 if "DONE" in msg.content.upper():
                     return list(self.bus)
         return list(self.bus)
+
+
 # =============== Voice I/O ===============
 class TTS:
     def __init__(self, rate: int = 175):
@@ -404,6 +485,7 @@ class TTS:
     def say(self, text: str):
         self.engine.say(text)
         self.engine.runAndWait()
+
 
 class STT:
     def __init__(self, vosk_model_path: str, device: int | None = None, samplerate: int = 0):
@@ -430,23 +512,26 @@ class STT:
         self.model = VoskModel(vosk_model_path)
         self.rec = KaldiRecognizer(self.model, self.rate)
         self.rec.SetWords(True)
-        self._q: "queue.Queue[bytes]" = queue.Queue()
+        self._q: queue.Queue[bytes] = queue.Queue()
 
     def _callback(self, indata, frames, time, status):
         if status:  # non-fatal stream status
             pass
         self._q.put(bytes(indata))
 
-    def listen_once(self, prompt_tts: "TTS | None" = None, prompt_text: str = "Listening.") -> str:
+    def listen_once(self, prompt_tts: TTS | None = None, prompt_text: str = "Listening.") -> str:
         if prompt_tts:
             prompt_tts.say(prompt_text)
 
-        kwargs = dict(samplerate=self.rate, blocksize=4096, dtype="int16", channels=1,
-                    callback=self._callback)
+        kwargs = dict(
+            samplerate=self.rate, blocksize=4096, dtype="int16", channels=1, callback=self._callback
+        )
         if self.device is not None:
             kwargs["device"] = self.device
 
-        import time as _t, json as _json
+        import json as _json
+        import time as _t
+
         t0 = _t.time()
         got_bytes = 0
         with sd.RawInputStream(**kwargs):
@@ -467,6 +552,7 @@ class STT:
                 if _t.time() - t0 > 5:
                     print(f"[voice] timeout 5s; partial='{partial}' bytes={got_bytes}")
                     return partial.strip()
+
 
 def voice_chat_loop(agent, stt: STT, tts: TTS):
     tts.say("Voice mode ready. Say 'exit' to quit.")
@@ -494,14 +580,17 @@ def voice_chat_loop(agent, stt: STT, tts: TTS):
         context_text = "\n".join(context_lines)
         messages = [
             {"role": "system", "content": agent.system},
-            {"role": "user", "content":
-                f"{context_text}\n\nUser: {user_text}\nPlan step-by-step, then answer briefly."}
+            {
+                "role": "user",
+                "content": f"{context_text}\n\nUser: {user_text}\nPlan step-by-step, then answer briefly.",
+            },
         ]
 
         # Generate reply
         reply = agent.ollama.chat(messages, options={"temperature": 0.2})
         agent.mem.add_semantic(f"ASSISTANT SAID: {reply[:500]}", {"mode": "voice"})
         tts.say(reply[:500])  # speak first ~500 chars to avoid very long monologues
+
 
 # =============== Agent ===============
 
@@ -510,8 +599,15 @@ DEFAULT_SYSTEM = (
     "think in small steps, and provide concise next actions."
 )
 
+
 class Agent:
-    def __init__(self, ollama: OllamaClient, mem: MemoryStore, tools: ToolRegistry, system: str = DEFAULT_SYSTEM):
+    def __init__(
+        self,
+        ollama: OllamaClient,
+        mem: MemoryStore,
+        tools: ToolRegistry,
+        system: str = DEFAULT_SYSTEM,
+    ):
         self.ollama = ollama
         self.mem = mem
         self.tools = tools
@@ -519,18 +615,20 @@ class Agent:
 
     def step(self, user_input: str) -> str:
         # Log perception
-        self.mem.add_episodic(f"USER: {user_input}", {"role":"user"})
+        self.mem.add_episodic(f"USER: {user_input}", {"role": "user"})
         # Retrieve context
         sem = self.mem.search_semantic(user_input, k=5)
         epis = self.mem.last_episodic(3)
 
         context_lines = []
-        if sem: 
+        if sem:
             context_lines.append("Relevant semantic memory:")
-            for h in sem: context_lines.append(f"- {h['text']}")
+            for h in sem:
+                context_lines.append(f"- {h['text']}")
         if epis:
             context_lines.append("\nRecent episodic memory:")
-            for e in epis: context_lines.append(f"- {e['text']}")
+            for e in epis:
+                context_lines.append(f"- {e['text']}")
 
         context_text = "\n".join(context_lines)
         prompt = (
@@ -541,27 +639,38 @@ class Agent:
         )
 
         # Prefer chat endpoint to keep system/user roles
-        messages = [{"role":"system","content":self.system},
-                    {"role":"user","content":user_input}]
-        if context_lines: messages.insert(1, {"role":"system","content":"\n".join(context_lines)})
+        messages = [
+            {"role": "system", "content": self.system},
+            {"role": "user", "content": user_input},
+        ]
+        if context_lines:
+            messages.insert(1, {"role": "system", "content": "\n".join(context_lines)})
 
         try:
-            reply = self.ollama.chat(messages, options={"temperature":0.2})
+            reply = self.ollama.chat(messages, options={"temperature": 0.2})
         except Exception:
-            reply = self.ollama.generate(prompt, options={"temperature":0.2})
+            reply = self.ollama.generate(prompt, options={"temperature": 0.2})
 
         # Store semantic reflection of reply for future retrieval
-        self.mem.add_semantic(reply, {"role":"assistant"})
-        self.mem.add_episodic(f"ASSISTANT: {reply}", {"role":"assistant"})
+        self.mem.add_semantic(reply, {"role": "assistant"})
+        self.mem.add_episodic(f"ASSISTANT: {reply}", {"role": "assistant"})
         return reply
+
 
 # =============== Wiring & CLI ===============
 
 AGENT: Dict[str, Any] = {}
 
-def build_agent(model: str, host: Optional[str], embed_model: Optional[str],
-                memdir: str, onnx_embed_path: Optional[str],
-                onnx_provider: str, onnx_max_len: int) -> Agent:
+
+def build_agent(
+    model: str,
+    host: Optional[str],
+    embed_model: Optional[str],
+    memdir: str,
+    onnx_embed_path: Optional[str],
+    onnx_provider: str,
+    onnx_max_len: int,
+) -> Agent:
     embedder = None
     if onnx_embed_path:
         # auto-detect tokenizer.json in the same folder as model.onnx
@@ -569,8 +678,9 @@ def build_agent(model: str, host: Optional[str], embed_model: Optional[str],
         tokenizer_json = os.path.join(model_dir, "tokenizer.json")
         if not os.path.exists(tokenizer_json):
             tokenizer_json = None  # fallback to whitespace tokenizer
-        embedder = ONNXEmbedder(onnx_embed_path, tokenizer_json,
-                                provider=onnx_provider, max_len=onnx_max_len)
+        embedder = ONNXEmbedder(
+            onnx_embed_path, tokenizer_json, provider=onnx_provider, max_len=onnx_max_len
+        )
 
     oll = OllamaClient(host=host, model=model, use_chat=True, embed_model=embed_model)
     mem = MemoryStore(ollama=oll, base_dir=memdir, embedder=embedder)  # <--- pass embedder
@@ -581,12 +691,14 @@ def build_agent(model: str, host: Optional[str], embed_model: Optional[str],
     AGENT["mem"] = mem
     return agent
 
+
 # =============== Voice I/O ===============
 class TTS:
     """
     Offline TTS using Windows SAPI via pyttsx3.
     You can pass a name substring (e.g., 'Zira', 'Aria', 'Female') to pick a mature feminine voice.
     """
+
     def __init__(self, rate: int = 175, volume: float = 1.0, preferred: str = ""):
         self.engine = pyttsx3.init()
         # rate / volume
@@ -627,7 +739,10 @@ class TTS:
 
     def list_voices(self) -> list[str]:
         try:
-            return [f"{i}: {v.name} ({v.id})" for i, v in enumerate(self.engine.getProperty("voices") or [])]
+            return [
+                f"{i}: {v.name} ({v.id})"
+                for i, v in enumerate(self.engine.getProperty("voices") or [])
+            ]
         except Exception:
             return []
 
@@ -640,6 +755,7 @@ class STT:
     """
     Vosk STT with sounddevice. Uses device default samplerate unless you pass one.
     """
+
     def __init__(self, vosk_model_path: str, device: int | None = None, samplerate: int = 0):
         if not vosk_model_path or not os.path.isdir(vosk_model_path):
             raise RuntimeError("Invalid --vosk-model-path (folder not found).")
@@ -660,7 +776,7 @@ class STT:
         self.model = VoskModel(vosk_model_path)
         self.rec = KaldiRecognizer(self.model, self.rate)
         self.rec.SetWords(True)
-        self._q: "queue.Queue[bytes]" = queue.Queue()
+        self._q: queue.Queue[bytes] = queue.Queue()
 
     def _callback(self, indata, frames, time, status):
         if status:
@@ -668,17 +784,20 @@ class STT:
             pass
         self._q.put(bytes(indata))
 
-    def listen_once(self, prompt_tts: "TTS | None" = None, prompt_text: str = "Listening.") -> str:
+    def listen_once(self, prompt_tts: TTS | None = None, prompt_text: str = "Listening.") -> str:
         if prompt_tts:
             prompt_tts.say(prompt_text)
 
         # Use explicit device if provided
-        kwargs = dict(samplerate=self.rate, blocksize=4096, dtype="int16", channels=1, callback=self._callback)
+        kwargs = dict(
+            samplerate=self.rate, blocksize=4096, dtype="int16", channels=1, callback=self._callback
+        )
         if self.device is not None:
             kwargs["device"] = self.device
 
         # Collect ~5 seconds or until a final result
         import time as _t
+
         t0 = _t.time()
         with sd.RawInputStream(**kwargs):
             partial = ""
@@ -686,12 +805,14 @@ class STT:
                 data = self._q.get()
                 if self.rec.AcceptWaveform(data):
                     import json as _json
+
                     res = _json.loads(self.rec.Result())
                     text = (res.get("text") or "").strip()
                     if text:
                         return text
                 else:
                     import json as _json
+
                     p = _json.loads(self.rec.PartialResult()).get("partial", "")
                     if p:
                         partial = p
@@ -732,7 +853,10 @@ def voice_chat_loop(agent, stt: STT, tts: TTS):
         # Ask the LLM
         messages = [
             {"role": "system", "content": agent.system},
-            {"role": "user", "content": f"{context_text}\n\nUser: {user_text}\nPlan step-by-step, then answer briefly."}
+            {
+                "role": "user",
+                "content": f"{context_text}\n\nUser: {user_text}\nPlan step-by-step, then answer briefly.",
+            },
         ]
         reply = agent.ollama.chat(messages, options={"temperature": 0.2})
         agent.mem.add_semantic(f"ASSISTANT SAID: {reply[:500]}", {"mode": "voice"})
@@ -743,50 +867,101 @@ def voice_chat_loop(agent, stt: STT, tts: TTS):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--embed-model", type=str, default=None,
-                help="Ollama model to use for embeddings (e.g., nomic-embed-text)")
-    ap.add_argument("--model", type=str, default="llama3", help="Ollama model name (e.g., llama3, mistral, qwen2.5, codellama)")
-    ap.add_argument("--memdir", type=str, default="memory",
-                help="Directory for persistent memory JSONL files")
-    ap.add_argument("--host", type=str, default=None, help="Ollama host URL (default http://127.0.0.1:11434 or $OLLAMA_HOST)")
+    ap.add_argument(
+        "--embed-model",
+        type=str,
+        default=None,
+        help="Ollama model to use for embeddings (e.g., nomic-embed-text)",
+    )
+    ap.add_argument(
+        "--model",
+        type=str,
+        default="llama3",
+        help="Ollama model name (e.g., llama3, mistral, qwen2.5, codellama)",
+    )
+    ap.add_argument(
+        "--memdir", type=str, default="memory", help="Directory for persistent memory JSONL files"
+    )
+    ap.add_argument(
+        "--host",
+        type=str,
+        default=None,
+        help="Ollama host URL (default http://127.0.0.1:11434 or $OLLAMA_HOST)",
+    )
     ap.add_argument("--ask", type=str, help="Ask once and exit")
     ap.add_argument("--demo", action="store_true", help="Interactive REPL")
-    ap.add_argument("--onnx-embed-path", type=str, default=None,
-                help="Path to an ONNX embedding model (.onnx). If set, RX 6600 via DirectML will be used for embeddings.")
-    ap.add_argument("--onnx-provider", type=str, default="DmlExecutionProvider",
-                help="ONNX Runtime EP (default: DmlExecutionProvider). Fallbacks: CPUExecutionProvider")
-    ap.add_argument("--onnx-max-len", type=int, default=256,
-                help="Max tokens for ONNX tokenizer input (default 256).")
-    ap.add_argument("--microbrain", action="store_true",
-                help="Run MicroBrain multi-neuron scheduler instead of single-agent REPL.")
-    ap.add_argument("--goal", type=str, default="Plan useful next steps for this workspace.",
-                    help="High-level goal for the MicroBrain run.")
-    ap.add_argument("--neurons", type=str, default="planner,reasoner,memory",
-                    help="Comma-separated neuron set (e.g., planner,reasoner,memory,coder).")
-    ap.add_argument("--steps", type=int, default=8,
-                    help="Max scheduler steps before stopping.")
-    ap.add_argument("--k", type=int, default=5,
-                    help="Top-k semantic recalls per memory query.")
-    ap.add_argument("--voice", action="store_true",
-                help="Enable voice I/O mode (mic in, TTS out).")
-    ap.add_argument("--vosk-model-path", type=str, default=None,
-                    help="Path to an unzipped Vosk STT model directory.")
-    ap.add_argument("--mic-device", type=int, default=None,
-                    help="Input device index (see: python -m sounddevice).")
-    ap.add_argument("--sample-rate", type=int, default=0,
-                    help="Mic sample rate. 0 = use device default.")
-    ap.add_argument("--tts-rate", type=int, default=175,
-                    help="Speech rate (words/min).")
-    ap.add_argument("--tts-volume", type=float, default=1.0,
-                    help="TTS volume 0.0–1.0.")
-    ap.add_argument("--tts-voice", type=str, default="",
-                    help="Preferred voice name substring (e.g. 'Zira', 'Aria', 'Female').")
-
+    ap.add_argument(
+        "--onnx-embed-path",
+        type=str,
+        default=None,
+        help="Path to an ONNX embedding model (.onnx). If set, RX 6600 via DirectML will be used for embeddings.",
+    )
+    ap.add_argument(
+        "--onnx-provider",
+        type=str,
+        default="DmlExecutionProvider",
+        help="ONNX Runtime EP (default: DmlExecutionProvider). Fallbacks: CPUExecutionProvider",
+    )
+    ap.add_argument(
+        "--onnx-max-len",
+        type=int,
+        default=256,
+        help="Max tokens for ONNX tokenizer input (default 256).",
+    )
+    ap.add_argument(
+        "--microbrain",
+        action="store_true",
+        help="Run MicroBrain multi-neuron scheduler instead of single-agent REPL.",
+    )
+    ap.add_argument(
+        "--goal",
+        type=str,
+        default="Plan useful next steps for this workspace.",
+        help="High-level goal for the MicroBrain run.",
+    )
+    ap.add_argument(
+        "--neurons",
+        type=str,
+        default="planner,reasoner,memory",
+        help="Comma-separated neuron set (e.g., planner,reasoner,memory,coder).",
+    )
+    ap.add_argument("--steps", type=int, default=8, help="Max scheduler steps before stopping.")
+    ap.add_argument("--k", type=int, default=5, help="Top-k semantic recalls per memory query.")
+    ap.add_argument("--voice", action="store_true", help="Enable voice I/O mode (mic in, TTS out).")
+    ap.add_argument(
+        "--vosk-model-path",
+        type=str,
+        default=None,
+        help="Path to an unzipped Vosk STT model directory.",
+    )
+    ap.add_argument(
+        "--mic-device",
+        type=int,
+        default=None,
+        help="Input device index (see: python -m sounddevice).",
+    )
+    ap.add_argument(
+        "--sample-rate", type=int, default=0, help="Mic sample rate. 0 = use device default."
+    )
+    ap.add_argument("--tts-rate", type=int, default=175, help="Speech rate (words/min).")
+    ap.add_argument("--tts-volume", type=float, default=1.0, help="TTS volume 0.0–1.0.")
+    ap.add_argument(
+        "--tts-voice",
+        type=str,
+        default="",
+        help="Preferred voice name substring (e.g. 'Zira', 'Aria', 'Female').",
+    )
 
     args = ap.parse_args()
-    agent = build_agent(args.model, args.host, args.embed_model,
-                    args.memdir, args.onnx_embed_path,
-                    args.onnx_provider, args.onnx_max_len)
+    agent = build_agent(
+        args.model,
+        args.host,
+        args.embed_model,
+        args.memdir,
+        args.onnx_embed_path,
+        args.onnx_provider,
+        args.onnx_max_len,
+    )
     if args.microbrain:
         names = [n.strip().lower() for n in args.neurons.split(",") if n.strip()]
         mb = MicroBrain(agent.ollama, agent.mem, names)
@@ -796,8 +971,8 @@ def main():
             tag = m.meta.get("neuron", m.role)
             print(f"[{tag}] {m.content[:400]}")
         return
-# ----- after building `agent` and printing the "Loaded N/M" banner -----
-# ----- Voice block (single source of truth) -----
+    # ----- after building `agent` and printing the "Loaded N/M" banner -----
+    # ----- Voice block (single source of truth) -----
     if args.voice:
         if not args.vosk_model_path:
             print("[error] --vosk-model-path is required for --voice")
@@ -805,7 +980,7 @@ def main():
 
         try:
             # Use your known-good combo by default unless overridden
-            mic_idx = args.mic_device if args.mic_device is not None else 1       # MME index 1
+            mic_idx = args.mic_device if args.mic_device is not None else 1  # MME index 1
             samp_rate = args.sample_rate if args.sample_rate and args.sample_rate > 0 else 44100
             print(f"[voice] init with device={mic_idx} samplerate={samp_rate}")
 
@@ -819,20 +994,26 @@ def main():
 
         except Exception as e:
             print(f"[error] Voice setup failed: {e}")
-            import traceback; traceback.print_exc()
+            import traceback
+
+            traceback.print_exc()
             return
 
         try:
             voice_chat_loop(agent, stt, tts)
         except Exception as e:
             print(f"[error] Voice loop crashed: {e}")
-            import traceback; traceback.print_exc()
+            import traceback
+
+            traceback.print_exc()
         return
-# ----- end voice block -----
+    # ----- end voice block -----
 
     # Debug banner
-    print(f"Loaded {len(agent.mem.semantic)} semantic items, "
-        f"{len(agent.mem.episodic)} episodic items from {args.memdir}")
+    print(
+        f"Loaded {len(agent.mem.semantic)} semantic items, "
+        f"{len(agent.mem.episodic)} episodic items from {args.memdir}"
+    )
 
     # Prime some semantic memory so search_mem has something to find
     agent.mem.add_semantic("You can use the tool 'time' to get UTC time.")
@@ -848,12 +1029,16 @@ def main():
             try:
                 text = input("> ").strip()
             except (EOFError, KeyboardInterrupt):
-                print("\nbye"); break
-            if text.lower() in {"exit","quit"}: print("bye"); break
+                print("\nbye")
+                break
+            if text.lower() in {"exit", "quit"}:
+                print("bye")
+                break
             print(agent.step(text))
         return
 
     ap.print_help()
+
 
 if __name__ == "__main__":
     main()
