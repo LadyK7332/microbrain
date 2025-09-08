@@ -1,3 +1,15 @@
+#Imports
+from __future__ import annotations
+from microbrain.ollama_client import OllamaClient
+from microbrain.memory.memory_store import MemoryStore
+from microbrain.tools import ToolRegistry
+
+# pull the default system prompt from config; fall back if not present
+try:
+    from microbrain.config import DEFAULT_SYSTEM
+except Exception:
+    DEFAULT_SYSTEM = "You are a helpful, concise agent. Think step-by-step and prefer short, actionable outputs."
+#Agent Class Creation
 class Agent:
     def __init__(self, ollama: OllamaClient, mem: MemoryStore, tools: ToolRegistry, system: str = DEFAULT_SYSTEM):
         self.ollama = ollama
