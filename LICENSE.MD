@@ -29,4 +29,4 @@ This software and all associated files (the “Software”) are the exclusive pr
 ## Contact
 
 For permissions beyond this license, please contact:  
-**Joseph W. Brugh**  
+**Hazard0814**  
