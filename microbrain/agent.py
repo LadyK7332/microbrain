@@ -3,6 +3,11 @@ from __future__ import annotations
 
 from microbrain.memory.memory_store import MemoryStore
 from microbrain.ollama_client import OllamaClient
+
+try:
+    from microbrain.llamacpp_client import LlamaCppClient
+except Exception:
+    LlamaCppClient = None  # optional fallback
 from microbrain.tools import ToolRegistry
 
 # pull the default system prompt from config; fall back if not present
@@ -23,7 +28,7 @@ class Agent:
         tools: ToolRegistry,
         system: str = DEFAULT_SYSTEM,
     ):
-        self.ollama = ollama
+        self.llm = ollama
         self.mem = mem
         self.tools = tools
         self.system = system
@@ -62,9 +67,9 @@ class Agent:
             messages.insert(1, {"role": "system", "content": "\n".join(context_lines)})
 
         try:
-            reply = self.ollama.chat(messages, options={"temperature": 0.2})
+            reply = self.llm.chat(messages, options={"temperature": 0.2})
         except Exception:
-            reply = self.ollama.generate(prompt, options={"temperature": 0.2})
+            reply = self.llm.generate(prompt, options={"temperature": 0.2})
 
         # Store semantic reflection of reply for future retrieval
         self.mem.add_semantic(reply, {"role": "assistant"})

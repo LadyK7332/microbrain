@@ -1,5 +1,9 @@
 # Imports
-
+from typing import List, Dict, Any, Optional
+from pathlib import Path
+import os
+import math
+import hashlib
 
 class JSONLStore:
     def __init__(self, path: str):
@@ -123,6 +127,26 @@ class ONNXEmbedder:
         n = float((vec**2).sum()) ** 0.5 or 1.0
         return (vec / n).tolist()
 
+class SimpleHashEmbedder:
+    """Minimal dependency-free embedding using a hashing trick (deterministic)."""
+    def __init__(self, dim: int = 256):
+        self.dim = int(dim)
+
+    def embed(self, text: str) -> list[float]:
+        vec = [0.0] * self.dim
+        for tok in text.split():
+            h = int(hashlib.blake2b(tok.encode("utf-8"), digest_size=8).hexdigest(), 16)
+            i = h % self.dim
+            sign = 1.0 if ((h >> 63) & 1) == 0 else -1.0
+            vec[i] += sign
+        # L2 normalize
+        n = math.sqrt(sum(v * v for v in vec)) or 1.0
+        return [v / n for v in vec]
+
+    # Allow call-style usage too: embedder("text")
+    def __call__(self, text: str) -> list[float]:
+        return self.embed(text)
+
 
 class MemoryStore:
     """
@@ -138,9 +162,11 @@ class MemoryStore:
         onnx_embed_path: str | None = None,
         onnx_provider: str | None = None,
         onnx_max_len: int = 256,
+        ollama: Optional[Any] = None,  # NEW: generic LLM client
     ):
         self.ollama = ollama
-        self.base_dir = base_dir
+        self.base_dir = Path(memdir)
+        self.base_dir.mkdir(parents=True, exist_ok=True)
         self.embedder = embedder
         self.semantic: list[dict] = []  # {text, vec, meta, ts}
         self.episodic: list[dict] = []  # {text, meta, ts}
