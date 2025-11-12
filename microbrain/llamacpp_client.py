@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import json
 import urllib.request
-from typing import Any, Dict, List
+from typing import Any
 
 
-def _post_json(url: str, payload: Dict[str, Any], timeout: float = 600.0) -> Dict[str, Any]:
+def _post_json(url: str, payload: dict[str, Any], timeout: float = 600.0) -> dict[str, Any]:
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -14,6 +14,7 @@ def _post_json(url: str, payload: Dict[str, Any], timeout: float = 600.0) -> Dic
 
 class LlamaCppClient:
     """Talks to llama-server (OpenAI-like endpoints) with legacy fallback."""
+
     def __init__(self, host: str = "http://127.0.0.1:8080", model: str | None = None):
         self.host = host.rstrip("/")
         self.model = model or "default"
@@ -36,7 +37,7 @@ class LlamaCppClient:
         except Exception:
             return ""
 
-    def chat(self, messages: List[Dict[str, str]], **kw: Any) -> str:
+    def chat(self, messages: list[dict[str, str]], **kw: Any) -> str:
         try:
             res = _post_json(
                 f"{self.host}/v1/chat/completions",

@@ -1,14 +1,16 @@
 from __future__ import annotations
+
 from dataclasses import dataclass, field
-from typing import Optional, Dict, List
+
 import numpy as np
+
 
 @dataclass
 class DenseRegion:
     name: str
     n_pre: int
     n_post: int
-    W: Optional[np.ndarray] = None
+    W: np.ndarray | None = None
     activation: str = "tanh"  # "linear" | "relu" | "tanh"
 
     x: np.ndarray = field(init=False, repr=False)
@@ -23,16 +25,16 @@ class DenseRegion:
         self.x = np.zeros((self.n_pre,), dtype=np.float32)
         self.y = np.zeros((self.n_post,), dtype=np.float32)
 
-    def pre_activity(self) -> Dict[str, np.ndarray]:
+    def pre_activity(self) -> dict[str, np.ndarray]:
         return {"x": self.x}
 
-    def post_activity(self) -> Dict[str, np.ndarray]:
+    def post_activity(self) -> dict[str, np.ndarray]:
         return {"y": self.y}
 
-    def weights(self) -> List[List[float]]:
+    def weights(self) -> list[list[float]]:
         return self.W.tolist()
 
-    def step(self, dt: float, inputs: Dict[str, np.ndarray]) -> None:
+    def step(self, dt: float, inputs: dict[str, np.ndarray]) -> None:
         xin = inputs.get("x")
         if xin is None:
             return

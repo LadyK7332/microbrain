@@ -4,6 +4,17 @@ from pathlib import Path
 import os
 import math
 import hashlib
+import json, threading, time
+
+try:
+    import onnxruntime as ort
+except Exception:
+    ort = None
+try:
+    from tokenizers import Tokenizer
+except Exception:
+    Tokenizer = None
+
 
 class JSONLStore:
     def __init__(self, path: str):
@@ -127,8 +138,10 @@ class ONNXEmbedder:
         n = float((vec**2).sum()) ** 0.5 or 1.0
         return (vec / n).tolist()
 
+
 class SimpleHashEmbedder:
     """Minimal dependency-free embedding using a hashing trick (deterministic)."""
+
     def __init__(self, dim: int = 256):
         self.dim = int(dim)
 
@@ -161,31 +174,56 @@ class MemoryStore:
         memdir: str | None = None,
         onnx_embed_path: str | None = None,
         onnx_provider: str | None = None,
+        tokenizer_path_or_json: str | None = None,
         onnx_max_len: int = 256,
         ollama: Optional[Any] = None,  # NEW: generic LLM client
     ):
         self.ollama = ollama
-        self.base_dir = Path(memdir)
+        # pick a default provider if none is passed
+        if onnx_provider is None:
+            onnx_provider = "DmlExecutionProvider" if os.name == "nt" else "CPUExecutionProvider"
+        mem_root = memdir or os.getenv("MB_MEMDIR") or str(Path.cwd() / "memory")
+        self.base_dir = Path(mem_root)
         self.base_dir.mkdir(parents=True, exist_ok=True)
-        self.embedder = embedder
+
+        # Build an embedder chain: LLM (if it implements .embed) -> ONNX -> Local hasher
+        env_onnx = os.getenv("MB_ONNX_EMBED")
+        env_tok = os.getenv("MB_TOKENIZER_JSON")
+
+        use_onnx_path = onnx_embed_path or env_onnx
+        use_tok_json = tokenizer_path_or_json or env_tok
+        try:
+            # 1) Prefer the live LLM if it exposes an embedding method
+            if ollama is not None and hasattr(ollama, "embed"):
+                embedder_obj = ollama  # treat the LLM client as the embedder
+
+            # 2) Otherwise try ONNX (DirectML on Windows if available)
+            elif use_onnx_path:
+                embedder_obj = ONNXEmbedder(
+                    onnx_path=use_onnx_path,
+                    tokenizer_path_or_json=use_tok_json,
+                    provider=onnx_provider,
+                    max_len=onnx_max_len,
+                )
+
+            # 3) Last resort: cheap local hasher so we never crash
+            else:
+                embedder_obj = SimpleHashEmbedder(dim=256)
+
+        except Exception:
+            # Absolute last resort fallback, in case ONNX init fails, etc.
+            embedder_obj = SimpleHashEmbedder(dim=256)
+
+        self.embedder = embedder_obj
         self.semantic: list[dict] = []  # {text, vec, meta, ts}
         self.episodic: list[dict] = []  # {text, meta, ts}
         self.dim: int | None = None
-        self.sem_file = JSONLStore(os.path.join(base_dir, "semantic.jsonl"))
-        self.epi_file = JSONLStore(os.path.join(base_dir, "episodic.jsonl"))
+        self.sem_file = JSONLStore(self.base_dir / "semantic.jsonl")
+        self.epi_file = JSONLStore(self.base_dir / "episodic.jsonl")
         self.memdir = memdir
         self.onnx_embed_path = onnx_embed_path
         self.onnx_provider = onnx_provider
         self.onnx_max_len = onnx_max_len
-        self.embedder = None
-        if self.onnx_embed_path:
-            try:
-                self.embedder = ONNXEmbedder(
-                    self.onnx_embed_path, provider=self.onnx_provider, max_len=self.onnx_max_len
-                )
-            except Exception as e:
-                # Fallback or raise—your call. For now, just print/log.
-                print(f"[MemoryStore] ONNX init failed: {e}")
 
         # Load existing items (if any)
         for row in self.sem_file.read_all():

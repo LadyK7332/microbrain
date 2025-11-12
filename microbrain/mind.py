@@ -3,6 +3,8 @@
 import argparse
 import asyncio
 import os
+import sys
+from pathlib import Path
 
 from microbrain.config import AppConfig
 from microbrain.llamacpp_client import LlamaCppClient
@@ -34,6 +36,64 @@ def build_arg_parser():
     return p
 
 
+# scan .gguf model and present menu
+def _scan_gguf(dirpath: Path) -> list[Path]:
+    try:
+        return sorted(
+            dirpath.glob("*.gguf"),
+            key=lambda p: p.stat().st_size,
+            reverse=True,  # biggest first
+        )
+    except Exception:
+        return []
+
+
+# if session is interactive then show menu
+def _pick_model(model_env: str | None) -> str:
+    # 1) Respect explicit env if it points to a real file
+    if model_env and Path(model_env).exists():
+        return model_env
+
+    # 2) Scan default models directory next to this file
+    models_dir = Path(__file__).resolve().parent / "models"
+    candidates = _scan_gguf(models_dir)
+    if not candidates:
+        raise FileNotFoundError(
+            f"No .gguf models found in {models_dir}. "
+            "Set MB_LLAMA_MODEL or place a .gguf in microbrain/models."
+        )
+
+    # 3) Optional: MB_LLAMA_AUTOPICK=N (1-based index)
+    auto = os.getenv("MB_LLAMA_AUTOPICK")
+    if auto:
+        try:
+            idx = int(auto)
+            if 1 <= idx <= len(candidates):
+                return str(candidates[idx - 1])
+        except Exception:
+            pass  # fall through to interactive/default
+
+    # 4) If interactive TTY and multiple, present a tiny menu
+    if sys.stdin.isatty() and len(candidates) > 1:
+        print("\nSelect a GGUF model:")
+        for i, p in enumerate(candidates, 1):
+            try:
+                sz_gib = p.stat().st_size / (1024**3)
+                print(f"[{i}] {p.name}  ({sz_gib:.2f} GiB)")
+            except Exception:
+                print(f"[{i}] {p.name}")
+        choice = input("Enter number [1]: ").strip()
+        if choice.isdigit():
+            ch = int(choice)
+            if 1 <= ch <= len(candidates):
+                return str(candidates[ch - 1])
+
+    # 5) Default to the first (largest) candidate
+    return str(candidates[0])
+
+    #####
+
+
 async def main_async(cfg: AppConfig):
     logger = configure_logging(cfg.log_level)
 
@@ -46,7 +106,7 @@ async def main_async(cfg: AppConfig):
     # --- Start / use llama.cpp server by default ---
     host = os.getenv("MB_LLAMA_HOST", getattr(cfg, "llama_host", "127.0.0.1"))
     port = int(os.getenv("MB_LLAMA_PORT", str(getattr(cfg, "llama_port", 8080))))
-    model_path = os.getenv("MB_LLAMA_MODEL", getattr(cfg, "llama_model", ""))  # REQUIRED
+    model_path = _pick_model(os.getenv("MB_LLAMA_MODEL"))  # REQUIRED
     server_path = os.getenv("MB_LLAMA_SERVER", getattr(cfg, "llama_server", "")) or None
     threads = getattr(cfg, "threads", os.cpu_count() or 4)
     ngl = int(os.getenv("MB_LLAMA_NGL", "999"))

@@ -10,9 +10,8 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Optional
 
-_LLAMA_PROC: Optional[subprocess.Popen] = None
+_LLAMA_PROC: subprocess.Popen | None = None
 
 
 def _is_listening(host: str, port: int, timeout: float = 0.5) -> bool:
@@ -44,7 +43,7 @@ def is_server_up(host: str = "127.0.0.1", port: int = 8080) -> bool:
     return _is_listening(host, port) and _http_probe(base)
 
 
-def find_llama_server_exe(explicit: Optional[str] = None) -> Optional[str]:
+def find_llama_server_exe(explicit: str | None = None) -> str | None:
     """
     Returns full path to llama-server.exe if found.
     Search order:
@@ -80,10 +79,10 @@ def start_llama_server(
     model_path: str,
     host: str = "127.0.0.1",
     port: int = 8080,
-    threads: Optional[int] = None,
-    ngl: Optional[int] = 999,
-    extra_args: Optional[str] = None,
-    log_path: Optional[str] = "llama_server.log",
+    threads: int | None = None,
+    ngl: int | None = 999,
+    extra_args: str | None = None,
+    log_path: str | None = "llama_server.log",
 ) -> subprocess.Popen:
     """Start llama-server and return the Popen handle (does not block)."""
     args = [server_path, "-m", model_path, "--host", host, "--port", str(port)]
@@ -96,7 +95,7 @@ def start_llama_server(
         args += shlex.split(extra_args, posix=False)
 
     # Prefer Vulkan build (no special env needed if compiled with it)
-    env = os.environ.copy()
+    # Commented out due to error, kept for just in case # env = os.environ.copy()
 
     stdout = open(log_path, "a", encoding="utf-8")
     stderr = subprocess.STDOUT
@@ -126,12 +125,12 @@ def start_llama_server(
 def ensure_llama_server(
     *,
     model_path: str,
-    server_path: Optional[str] = None,
+    server_path: str | None = None,
     host: str = "127.0.0.1",
     port: int = 8080,
-    threads: Optional[int] = None,
-    ngl: Optional[int] = 999,
-    extra_args: Optional[str] = None,
+    threads: int | None = None,
+    ngl: int | None = 999,
+    extra_args: str | None = None,
     wait_sec: int = 30,
 ) -> None:
     """If not already up, start llama-server and wait until it’s ready (or timeout)."""
@@ -141,9 +140,7 @@ def ensure_llama_server(
 
     sp = find_llama_server_exe(server_path)
     if not sp:
-        raise RuntimeError(
-            "llama-server not found. Set MB_LLAMA_SERVER or ensure it’s on PATH."
-        )
+        raise RuntimeError("llama-server not found. Set MB_LLAMA_SERVER or ensure it’s on PATH.")
 
     _LLAMA_PROC = start_llama_server(
         server_path=sp,
