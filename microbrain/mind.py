@@ -9,6 +9,7 @@ from pathlib import Path
 from microbrain.config import AppConfig
 from microbrain.llamacpp_client import LlamaCppClient
 from microbrain.llm.llama_runtime import ensure_llama_server
+from microbrain.memory.emotional_journal import EmotionJournal
 from microbrain.utils.logging_setup import configure_logging
 
 try:
@@ -33,6 +34,14 @@ def build_arg_parser():
     p.add_argument("--tts-rate", type=int, default=170)
     p.add_argument("--tts-volume", type=float, default=1.0)
     p.add_argument("--log-level", default="INFO")
+    p.add_argument(
+        "--llama-backend",
+        default=os.getenv("MB_LLAMA_BACKEND", "auto"),
+        choices=["auto", "vulkan", "cuda", "metal", "rocm", "cpu"],
+        help="Backend for llama.cpp (auto|vulkan|cuda|metal|rocm|cpu).",
+    )
+    p.add_argument("--vulkan", action="store_true", help="Alias for --llama-backend vulkan")
+
     return p
 
 
@@ -99,6 +108,8 @@ async def main_async(cfg: AppConfig):
 
     # Lazy imports to avoid circulars
     from microbrain.agent import Agent
+    from microbrain.core.bus import EventBus
+    from microbrain.learning.hebb import HebbianLearner
     from microbrain.memory.memory_store import MemoryStore
     from microbrain.tools import ToolRegistry
 
@@ -115,6 +126,14 @@ async def main_async(cfg: AppConfig):
     if not model_path:
         raise RuntimeError("Set MB_LLAMA_MODEL (or cfg.llama_model) to your .gguf model path.")
 
+    backend = getattr(cfg, "llama_backend", os.getenv("MB_LLAMA_BACKEND", "auto"))
+    if getattr(cfg, "vulkan", False):  # only if you added the --vulkan flag above
+        backend = "vulkan"
+
+    # If forcing CPU, make sure ngl is 0
+    if backend.lower() == "cpu":
+        os.environ["MB_LLAMA_NGL"] = "0"
+
     # Start llama-server if not already up
     ensure_llama_server(
         model_path=model_path,
@@ -123,6 +142,7 @@ async def main_async(cfg: AppConfig):
         port=port,
         threads=threads,
         ngl=ngl,
+        backend=backend,
         extra_args=extra,
         wait_sec=int(os.getenv("MB_LLAMA_WAIT", "180")),  # was 30
     )
@@ -139,8 +159,12 @@ async def main_async(cfg: AppConfig):
         ollama=llm,  # name kept for compatibility
     )
 
+    bus = EventBus()
+    _hebb = HebbianLearner(memdir=memdir, embedder=mem.embedder, bus=bus)
+
     tools = ToolRegistry()
-    agent = Agent(client=llm, memory=mem, tools=tools, logger=logger)
+    ej = EmotionJournal(path=Path(memdir) / "emotion_journal.jsonl")
+    agent = Agent(llm=llm, memory=mem, tools=tools, logger=logger, bus=bus, ejournal=ej)
 
     # ---------------- voice/repl block MUST be inside main_async ----------------
     if cfg.voice:

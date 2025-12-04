@@ -85,14 +85,18 @@ def start_llama_server(
     log_path: str | None = "llama_server.log",
 ) -> subprocess.Popen:
     """Start llama-server and return the Popen handle (does not block)."""
-    args = [server_path, "-m", model_path, "--host", host, "--port", str(port)]
+    cmd = [server_path, "--model", model_path, "--host", host, "--port", str(port)]
     if threads:
-        args += ["-t", str(threads)]
-    if ngl is not None:
-        args += ["-ngl", str(ngl)]
+        cmd += ["--threads", str(threads)]
+    if isinstance(ngl, int) and ngl >= 0:
+        # alias "-ngl" also works; both map to n-gpu-layers
+        cmd += ["--n-gpu-layers", str(ngl)]
     if extra_args:
-        # Use Windows-safe splitting
-        args += shlex.split(extra_args, posix=False)
+        cmd += (
+            list(extra_args)
+            if isinstance(extra_args, list | tuple)
+            else shlex.split(str(extra_args), posix=False)
+        )
 
     # Prefer Vulkan build (no special env needed if compiled with it)
     # Commented out due to error, kept for just in case # env = os.environ.copy()
@@ -101,7 +105,7 @@ def start_llama_server(
     stderr = subprocess.STDOUT
 
     proc = subprocess.Popen(
-        args,
+        cmd,
         stdout=stdout,
         stderr=stderr,
         creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
@@ -130,6 +134,7 @@ def ensure_llama_server(
     port: int = 8080,
     threads: int | None = None,
     ngl: int | None = 999,
+    backend: str = "auto",
     extra_args: str | None = None,
     wait_sec: int = 30,
 ) -> None:

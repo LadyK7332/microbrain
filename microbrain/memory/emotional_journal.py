@@ -18,6 +18,28 @@ class EmotionJournal:
         with self.path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
+    def record(
+        self,
+        actor: str,
+        text: str,
+        valence: float = 0.0,
+        arousal: float = 0.0,
+        salience: float = 0.0,
+        tags: List[str] | None = None,
+        **extra: Any,
+    ) -> None:
+        entry: Dict[str, Any] = {
+            "actor": actor,
+            "text": text,
+            "valence": float(valence),
+            "arousal": float(arousal),
+            "salience": float(salience),
+            "tags": list(tags or []),
+        }
+        if extra:
+            entry.update(extra)
+        self.append(entry)
+
     def recent(self, n: int = 50) -> List[Dict[str, Any]]:
         buf: List[Dict[str, Any]] = []
         with self.path.open("r", encoding="utf-8") as f:

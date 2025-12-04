@@ -4,10 +4,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
-from microbrain.memory.emotion_journal import EmotionJournal
+from microbrain.memory.emotional_journal import EmotionJournal
 
 try:
     from microbrain.llamacpp_client import LlamaCppClient
@@ -26,17 +27,18 @@ except Exception:
 
 # Agent Class Creation
 class Agent:
+    #   def __init__(self, llm, memory, tools, logger, bus=None, *args, **kwargs):
     def __init__(
         self,
-        llm: Any | None = None,
-        ollama: Any | None = None,
-        client: Any | None = None,
-        memory=None,
-        tools=None,
-        logger=None,
+        llm,
+        memory,
+        tools,
+        logger,
+        bus: Any | None = None,
+        ejournal: EmotionJournal | None = None,
     ):
         # normalize aliases: prefer llm, then client, then ollama
-        chosen = llm or client or ollama
+        chosen = llm
         if chosen is None:
             raise ValueError("Agent requires an LLM client (llm/client/ollama)")
 
@@ -44,10 +46,10 @@ class Agent:
         self.llm = chosen
         self.client = chosen
         self.ollama = chosen
-
         self.memory = memory
         self.tools = tools or ToolRegistry()
         self.logger = logger
+        self.bus = bus
         self.system = DEFAULT_SYSTEM
         # pDNA + emotion journal plumbing
         self._pdna_path = self._resolve_pdna_path()
@@ -65,6 +67,15 @@ class Agent:
 
         # simple rules switch you can toggle later
         self.rules = {"autosalience": True}
+        self.ejournal = ejournal
+
+    def _emit(self, topic: str, **payload):
+        try:
+            if self.bus is not None:
+                self.bus.publish(topic, **payload)
+        except Exception:
+            # keep the agent resilient; bus issues shouldn’t crash interaction
+            pass
 
     # --- pDNA helpers -------------------------------------------------
     def _resolve_pdna_path(self) -> str:
@@ -101,18 +112,85 @@ class Agent:
             )
         self._save_pdna()
 
+    def _estimate_affect(self, text: str) -> tuple[float, float, float]:
+        """Return (valence[-1..1], arousal[0..1], salience[0..1]) from a quick heuristic."""
+        t = text.lower()
+        pos = {"great", "good", "nice", "love", "awesome", "yay", "glad", "thanks", "cool", "win"}
+        neg = {"bad", "sad", "angry", "hate", "terrible", "awful", "nope", "ugh", "fail"}
+        intens = {"very", "really", "so", "extremely", "super", "!!!", "!!", "!"}
+
+        words = re.findall(r"[a-z']+", t)
+        if not words:
+            return 0.0, 0.0, 0.1
+
+        npos = sum(w in pos for w in words)
+        nneg = sum(w in neg for w in words)
+        nint = sum(w in intens for w in words) + t.count("!") + t.count("?")
+
+        valence = (npos - nneg) / max(1, (npos + nneg))
+        valence = max(-1.0, min(1.0, valence))
+
+        arousal = min(1.0, (nint / max(5, len(words))) * 3.0)
+
+        has_code = ("```" in text) or ("{" in text and "}" in text)
+        longish = len(text) > 280
+        questions = t.count("?")
+        salience = 0.2 + 0.3 * has_code + 0.2 * longish + 0.3 * min(1.0, questions / 3)
+        salience = max(0.0, min(1.0, salience))
+
+        return float(valence), float(arousal), float(salience)
+
     # ------------------------------------------------------------------
     def step(self, user_input: str) -> str:
+        # --- USER turn affect/journal/meta ---
+        u_val, u_aro, u_sal = self._estimate_affect(user_input)
+        self._emit("user.affect.estimated", valence=u_val, arousal=u_aro, salience=u_sal)
+
+        if hasattr(self, "ejournal") and self.ejournal:
+            try:
+                self.ejournal.record(
+                    actor="user",
+                    text=user_input,
+                    valence=u_val,
+                    arousal=u_aro,
+                    salience=u_sal,
+                    tags=["auto"],
+                )
+            except Exception:
+                if self.logger:
+                    self.logger.debug("EmotionJournal record (user) failed", exc_info=True)
+
+        u_meta = {"role": "user", "valence": u_val, "arousal": u_aro, "salience": u_sal}
+        # Write user turn into memory with affect metadata
+        if hasattr(self, "memory") and self.memory:
+            try:
+                self.memory.add_semantic(user_input, u_meta)
+                self.memory.add_episodic(f"USER: {user_input}", u_meta)
+                self._emit("user.memory.write", wrote_semantic=True, wrote_episodic=True, **u_meta)
+            except Exception:
+                if self.logger:
+                    self.logger.debug("Memory write (user) failed", exc_info=True)
+
+        # Optional pDNA nudge
+        if u_sal > 0.25:
+            self._emit("user.pdna.feedback", valence=u_val, salience=u_sal)
+        # --- end USER turn block ---
+
         if self.memory is None:
             return (
                 "Memory subsystem is unavailable; I can chat, but can’t recall/write memories yet."
             )
         # Log perception
         self.memory.add_episodic(f"USER: {user_input}", {"role": "user"})
+        self._emit("agent.input", text=user_input)
+        self._emit("nl.input", text=user_input)
 
         # Retrieve context
         sem = self.memory.search_semantic(user_input, k=5)
         epis = self.memory.last_episodic(3)
+        self._emit(
+            "agent.context.built", semantic_count=len(sem or []), episodic_count=len(epis or [])
+        )
 
         context_lines = []
         if sem:
@@ -130,10 +208,12 @@ class Agent:
         ]
         if context_lines:
             messages.insert(1, {"role": "system", "content": "\n".join(context_lines)})
+        self._emit("agent.llm.request", message_count=len(messages))
 
         # Prefer chat; fall back to generate
         try:
             reply = self.llm.chat(messages, options={"temperature": 0.2})
+            self._emit("agent.llm.reply", text=reply)
         except Exception:
             prompt = (
                 f"{self.system}\n\n"
@@ -142,9 +222,30 @@ class Agent:
                 f"Plan step-by-step, call tools if useful, then answer."
             )
             reply = self.llm.generate(prompt, options={"temperature": 0.2})
+        val, aro, sal = self._estimate_affect(reply)
+        self._emit("agent.affect.estimated", valence=val, arousal=aro, salience=sal)
+        self._emit("llm.output", text=reply, salience=sal)
+        # log to emotion journal
+        if hasattr(self, "ejournal") and self.ejournal:
+            try:
+                self.ejournal.record(
+                    actor="assistant",
+                    text=reply,
+                    valence=val,
+                    arousal=aro,
+                    salience=sal,
+                    tags=["auto"],
+                )
+            except Exception:
+                if self.logger:
+                    self.logger.debug("EmotionJournal record failed", exc_info=True)
         # Store semantic reflection of reply for future retrieval
-        self.memory.add_semantic(reply, {"role": "assistant"})
-        self.memory.add_episodic(f"ASSISTANT: {reply}", {"role": "assistant"})
+        meta = {"role": "assistant", "valence": val, "arousal": aro, "salience": sal}
+        self.memory.add_semantic(reply, meta)
+        self.memory.add_episodic(f"ASSISTANT: {reply}", meta)
+        self._emit("agent.memory.write", wrote_semantic=True, wrote_episodic=True, **meta)
+        if sal > 0.25:
+            self._emit("agent.pdna.feedback", valence=val, salience=sal)
         return reply
 
     async def complete(self, user_input: str) -> str:
