@@ -220,6 +220,43 @@ class TextRouterNeuron(BaseNeuron):
                     meta={"kind": "why_explain_request"},
                 )]
 
+            if cmd in ("as_audio", "audio"):
+                # Treat the rest of the line as if it came from microphone STT.
+                spoken_text = arg_text.strip()
+                if not spoken_text:
+                    return [self._speech(
+                        "Usage: /as_audio <what you would have said out loud>",
+                        channel=channel,
+                        style="system",
+                        event=event,
+                    )]
+
+                await ctx.log_debug(
+                    f"[{self.name}] Injecting audio transcription as percept/audio",
+                    channel=channel,
+                    text_preview=spoken_text[:80],
+                )
+
+                audio_payload = {
+                    "text": spoken_text,
+                    "confidence": 1.0,
+                    "speaker": "user",
+                    "channel": channel,
+                    "raw_meta": {
+                        "source": "cli",
+                        "input_modality": "audio",
+                    },
+                }
+
+                audio_event = Event(
+                    topic="percept/audio",
+                    payload=audio_payload,
+                    source=self.name,
+                    correlation_id=event.correlation_id,
+                )
+
+                return [audio_event]
+
             # Unknown command
             await ctx.log_debug(
                 f"[{self.name}] Unknown command, responding locally",
