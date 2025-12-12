@@ -1,0 +1,48 @@
+# microbrain/neurons/debug_tap.py
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict
+
+from microbrain.eventbus import EventBus
+
+
+@dataclass
+class DebugTapNeuron:
+    """
+    Simple neuron that listens to key topics and logs what passes through.
+    This is for debugging orchestrator/neurons wiring.
+    """
+
+    bus: EventBus
+    name: str = "debug_tap"
+
+    def __post_init__(self) -> None:
+        # Subscribe to the main interesting topics.
+        # Add/remove as needed.
+        self.bus.subscribe("percept/text", self.on_percept_text)
+        self.bus.subscribe("context/update", self.on_context_update)
+        self.bus.subscribe("trainer/reward", self.on_trainer_reward)
+        self.bus.subscribe("act/text", self.on_act_text)
+
+        # If your EventBus supports wildcards and you’ve implemented that,
+        # you could also hook a global tap there.
+
+    # --- handlers -------------------------------------------------------
+
+    def _log(self, topic: str, payload: Dict[str, Any]) -> None:
+        # Keep it very obvious in logs.
+        print(f"[DEBUG_TAP:{topic}] {payload}")
+
+    def on_percept_text(self, payload: Dict[str, Any]) -> None:
+        self._log("percept/text", payload)
+
+    def on_context_update(self, payload: Dict[str, Any]) -> None:
+        self._log("context/update", payload)
+
+    def on_trainer_reward(self, payload: Dict[str, Any]) -> None:
+        self._log("trainer/reward", payload)
+
+    def on_act_text(self, payload: Dict[str, Any]) -> None:
+        self._log("act/text", payload)

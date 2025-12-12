@@ -1,0 +1,54 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003" DefaultTargets="Build">
+  <PropertyGroup>
+    <Configuration Condition=" '$(Configuration)' == '' ">Debug</Configuration>
+    <SchemaVersion>2.0</SchemaVersion>
+    <ProjectGuid>{7fbd8616-b4b1-45ee-80e8-56c11996afc3}</ProjectGuid>
+    <ProjectHome />
+    <StartupFile>mind.py</StartupFile>
+    <SearchPath />
+    <WorkingDirectory>.</WorkingDirectory>
+    <OutputPath>.</OutputPath>
+    <ProjectTypeGuids>{888888a0-9f3d-457c-b088-3a5042f75d52}</ProjectTypeGuids>
+    <LaunchProvider>Standard Python launcher</LaunchProvider>
+    <InterpreterId />
+    <CommandLineArguments>--voice --vosk-model-path "G:\microbrain\microbrain\models\vosk-model-small-en-us-0.15" --mic-device 1 --sample-rate 44100 --tts-voice Zira</CommandLineArguments>
+    <EnableNativeCodeDebugging>False</EnableNativeCodeDebugging>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)' == 'Debug'" />
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'" />
+  <PropertyGroup>
+    <VisualStudioVersion Condition=" '$(VisualStudioVersion)' == '' ">10.0</VisualStudioVersion>
+  </PropertyGroup>
+  <ItemGroup>
+    <Content Include="requirements.txt" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="agent.py" />
+    <Compile Include="config.py" />
+    <Compile Include="legacy\mindprog_ollama.py" />
+    <Compile Include="legacy\__init__.py" />
+    <Compile Include="memory\memory_store.py" />
+    <Compile Include="memory\__init__.py" />
+    <Compile Include="microbrain.py" />
+    <Compile Include="mind.py" />
+    <Compile Include="ollama_client.py" />
+    <Compile Include="patterns\__init__.py" />
+    <Compile Include="tools.py" />
+    <Compile Include="utils\logging_setup.py" />
+    <Compile Include="utils\__init__.py" />
+    <Compile Include="voice\asr.py" />
+    <Compile Include="voice\loop.py" />
+    <Compile Include="voice\tts.py" />
+    <Compile Include="voice\__init__.py" />
+    <Compile Include="__init__.py" />
+  </ItemGroup>
+  <ItemGroup>
+    <Folder Include="legacy" />
+    <Folder Include="memory" />
+    <Folder Include="patterns" />
+    <Folder Include="utils" />
+    <Folder Include="voice" />
+  </ItemGroup>
+  <Import Project="$(MSBuildExtensionsPath32)\Microsoft\VisualStudio\v$(VisualStudioVersion)\Python Tools\Microsoft.PythonTools.targets" />
+</Project>
