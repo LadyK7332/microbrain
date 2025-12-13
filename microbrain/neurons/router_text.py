@@ -222,7 +222,7 @@ class TextRouterNeuron(BaseNeuron):
 
             if cmd in ("as_audio", "audio"):
                 # Treat the rest of the line as if it came from microphone STT.
-                spoken_text = arg_text.strip()
+                spoken_text = arg.strip()
                 if not spoken_text:
                     return [self._speech(
                         "Usage: /as_audio <what you would have said out loud>",

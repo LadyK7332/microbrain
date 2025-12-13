@@ -17,6 +17,9 @@ from microbrain.utils.logging_setup import configure_logging
 from microbrain.orchestrator.orchestrator import Orchestrator
 from microbrain.orchestrator.neuron_loader import auto_register_neurons
 from microbrain.orchestrator.debug_utils import set_debug_enabled
+from microbrain.utils.vosk_audio import VoskAudioListener
+from microbrain.orchestrator.event_bus import Event  # adjust import if Event is elsewhere
+
 
 try:
     from microbrain.regions.dense import DenseRegion  # CPU (optional)
@@ -121,6 +124,10 @@ def _pick_model(model_env: str | None) -> str:
 async def main_async(cfg: AppConfig):
     logger = configure_logging(cfg.log_level)
 
+    # Grab the running event loop so background threads (e.g. Vosk)
+    # can safely schedule events into the orchestrator.
+    loop = asyncio.get_running_loop()
+
     # Lazy imports to avoid circulars
     from microbrain.orchestrator.orchestrator import Orchestrator
     from microbrain.orchestrator.neuron_loader import auto_register_neurons
@@ -128,6 +135,7 @@ async def main_async(cfg: AppConfig):
 
     # Build orchestrator runtime
     orch = Orchestrator()
+    vosk_listener = None  # will hold VoskAudioListener if voice is enabled
 
     # --- Persistent memory wiring (MemoryStore + EmotionJournal) ---
     mem_store = MemoryStore(
@@ -158,16 +166,66 @@ async def main_async(cfg: AppConfig):
     # Provide the LLM backend used by LLMReasonerNeuron
     orch.kv_store["llm:generate"] = llm_generate
 
+    # --- Optional: Vosk mic listener -> percept/audio events ---
+    if cfg.voice and cfg.vosk_model_path:
+
+        def on_transcript(text: str) -> None:
+            """
+            Called from VoskAudioListener's background thread whenever
+            a *final* transcription is ready.
+            Schedules a percept/audio event into the orchestrator.
+            """
+            spoken = (text or "").strip()
+            if not spoken:
+                return
+
+            payload = {
+                "text": spoken,
+                "confidence": 1.0,
+                "speaker": "user",
+                "channel": "repl",
+                "raw_meta": {
+                    "input_modality": "audio",
+                    "source": "mic",
+                },
+            }
+
+            def _inject() -> None:
+                # Schedule async push_event inside the main loop
+                asyncio.create_task(
+                    orch.push_event(
+                        "percept/audio",
+                        payload,
+                        meta={"source": "mic", "channel": "repl"},
+                    )
+                )
+
+            # Thread-safe scheduling into the main event loop
+            loop.call_soon_threadsafe(_inject)
+
+        try:
+            vosk_listener = VoskAudioListener(
+                model_path=cfg.vosk_model_path,
+                on_transcript=on_transcript,
+                samplerate=cfg.sample_rate,
+            )
+            vosk_listener.start()
+            logger.info(
+                "Vosk audio listener started | model=%s sample_rate=%s",
+                cfg.vosk_model_path,
+                cfg.sample_rate,
+            )
+        except Exception as exc:
+            logger.warning("Failed to start Vosk audio listener: %s", exc)
+            vosk_listener = None
+    elif cfg.voice and not cfg.vosk_model_path:
+        logger.warning(
+            "Voice mode requested but --vosk-model-path not provided; "
+            "voice input will be disabled."
+        )
 
     # Start the orchestrator
     await orch.start()
-
-    # For now, voice isn't wired into the orchestrator, so we always run text REPL.
-    if cfg.voice:
-        logger.warning(
-            "Voice mode is not yet integrated with the orchestrator; "
-            "falling back to text REPL."
-        )
 
     logger.info("Starting text REPL via orchestrator. Ctrl+C to exit.")
 
@@ -192,6 +250,13 @@ async def main_async(cfg: AppConfig):
             # Let neurons process; speech_output neuron will print replies
             await orch.wait_for_idle(timeout=30.0)
     finally:
+        # Stop Vosk listener if it was started
+        if vosk_listener is not None:
+            try:
+                vosk_listener.stop()
+            except Exception as exc:
+                logger.warning("Error stopping Vosk audio listener: %s", exc)
+
         await orch.stop()
         logger.info("MicroBrain orchestrator stopped.")
 
