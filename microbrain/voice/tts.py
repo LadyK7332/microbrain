@@ -1,3 +1,5 @@
+import pyttsx3
+
 class TTS:
     """
     Offline TTS using Windows SAPI via pyttsx3.

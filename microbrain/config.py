@@ -11,9 +11,12 @@ class AppConfig:
     ollama_base: str = "http://localhost:11434"
     model: str = "mistral"
     memdir: str | None = None
-    vosk_model_path: str | None = None
+    # Voice / STT
     mic_device: int | None = None
     sample_rate: int = 16000
+    whisper_model: str = "small.en"     # faster-whisper model name
+    vad_aggressiveness: int = 2         # 0..3 (more aggressive = fewer false positives)
+    voice: bool = False
     tts_voice: str | None = None
     tts_rate: int = 170
     tts_volume: float = 1.0

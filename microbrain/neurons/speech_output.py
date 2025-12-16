@@ -3,10 +3,15 @@ from typing import Any, Dict, Iterable
 from microbrain.orchestrator.neuron_base import BaseNeuron, NeuronConfig, Event
 from microbrain.orchestrator.orchestrator import Orchestrator
 from microbrain.orchestrator.debug_utils import is_debug_enabled
+from microbrain.voice.tts import TTS
 
 
 
 class SpeechOutputNeuron(BaseNeuron):
+    def __init__(self, config: NeuronConfig):
+        super().__init__(config)
+        self._tts: TTS | None = None
+        self._tts_cfg: tuple[str | None, int, float] | None = None
     """
     Terminal sink that prints speech actions to the console.
 
@@ -45,15 +50,23 @@ class SpeechOutputNeuron(BaseNeuron):
             return []
 
         # --- Debug vs normal behavior ----------------------------------------
-        if is_debug_enabled():
-            # Dev mode: keep detailed SPEECH lines
-            print(f"[SPEECH:{channel}:{style}] {text}")
-        else:
-            # Normal mode: only show assistant replies as `bot>`
-            # (LLMReasoner emits channel='repl', style='assistant')
-            if channel == "repl":
-                print(f"bot> {text}")
-            # Echo or other channels are suppressed in normal mode
+        # Optional TTS (enabled by --tts-voice ...)
+        try:
+            enabled = await ctx.get_kv("tts:enabled", False)
+            if enabled and channel in ("repl", "default"):
+                voice = await ctx.get_kv("tts:voice", None)
+                rate = await ctx.get_kv("tts:rate", 155)
+                volume = await ctx.get_kv("tts:volume", 0.9)
+
+                cfg_tuple = (voice, int(rate), float(volume))
+                if self._tts is None or self._tts_cfg != cfg_tuple:
+                    self._tts = TTS(rate=int(rate), volume=float(volume), preferred=voice or "")
+                    self._tts_cfg = cfg_tuple
+
+                self._tts.say(text)
+        except Exception:
+            # Never let audio output kill the brain loop
+            pass
 
         # This is a sink: no further events
         return []

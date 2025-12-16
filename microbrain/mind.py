@@ -17,8 +17,8 @@ from microbrain.utils.logging_setup import configure_logging
 from microbrain.orchestrator.orchestrator import Orchestrator
 from microbrain.orchestrator.neuron_loader import auto_register_neurons
 from microbrain.orchestrator.debug_utils import set_debug_enabled
-from microbrain.utils.vosk_audio import VoskAudioListener
-from microbrain.orchestrator.event_bus import Event  # adjust import if Event is elsewhere
+from microbrain.utils.whisper_audio import WhisperAudioListener, WhisperAudioConfig
+from microbrain.utils.mic_probe_runtime import list_input_devices, probe_rms
 
 
 try:
@@ -41,9 +41,10 @@ def build_arg_parser():
     p.add_argument("--onnx-max-len", type=int, default=256)
     p.add_argument("--memdir", default=None)
     p.add_argument("--voice", action="store_true")
-    p.add_argument("--vosk-model-path", default=None)
     p.add_argument("--mic-device", type=int, default=None)
     p.add_argument("--sample-rate", type=int, default=16000)
+    p.add_argument("--whisper-model", default="small.en")
+    p.add_argument("--vad-aggressiveness", type=int, default=2)
     p.add_argument("--tts-voice", default=None)
     p.add_argument("--tts-rate", type=int, default=170)
     p.add_argument("--tts-volume", type=float, default=1.0)
@@ -59,9 +60,8 @@ def build_arg_parser():
         help="Backend for llama.cpp (auto|vulkan|cuda|metal|rocm|cpu).",
     )
     p.add_argument("--vulkan", action="store_true", help="Alias for --llama-backend vulkan")
-
+    
     return p
-
 
 # scan .gguf model and present menu
 def _scan_gguf(dirpath: Path) -> list[Path]:
@@ -137,6 +137,12 @@ async def main_async(cfg: AppConfig):
     orch = Orchestrator()
     vosk_listener = None  # will hold VoskAudioListener if voice is enabled
 
+    # --- TTS wiring (speech output) ---
+    orch.kv_store["tts:enabled"] = bool(cfg.tts_voice)
+    orch.kv_store["tts:voice"] = cfg.tts_voice
+    orch.kv_store["tts:rate"] = cfg.tts_rate
+    orch.kv_store["tts:volume"] = cfg.tts_volume
+
     # --- Persistent memory wiring (MemoryStore + EmotionJournal) ---
     mem_store = MemoryStore(
         memdir=cfg.memdir,
@@ -167,14 +173,54 @@ async def main_async(cfg: AppConfig):
     orch.kv_store["llm:generate"] = llm_generate
 
     # --- Optional: Vosk mic listener -> percept/audio events ---
-    if cfg.voice and cfg.vosk_model_path:
+    whisper_listener = None  # will hold WhisperAudioListener if voice is enabled
 
+    if cfg.voice:
+        # --- Mic probe: enumerate + RMS/peak, fail loudly if too quiet ---
+        try:
+            devices = list_input_devices()
+            logger.info("MIC PROBE: input devices (index | ch | default_sr | name):")
+            for d in devices:
+                logger.info(
+                    "  %s | ch=%s | default_sr=%s | %s",
+                    d["index"],
+                    d["max_input_channels"],
+                    int(d["default_samplerate"]),
+                    d["name"],
+                )
+
+            logger.info(
+                "MIC PROBE: selecting device=%s sample_rate=%s",
+                cfg.mic_device,
+                cfg.sample_rate,
+            )
+
+            res = probe_rms(
+                device=cfg.mic_device,
+                samplerate=cfg.sample_rate,
+                seconds=0.75,
+                rms_threshold=0.003,
+            )
+            logger.info(
+                "MIC PROBE: OK | device=%s (%s) sr=%s rms=%.6f peak=%.6f",
+                res.device,
+                res.device_name,
+                res.samplerate,
+                res.rms,
+                res.peak,
+            )
+        except Exception as exc:
+            logger.error("MIC PROBE: FAILED | %s", exc)
+            logger.error(
+                "MIC PROBE: disabling voice. "
+                "Try: pass --mic-device <index> (avoid Sound Mapper), "
+                "disable exclusive mode on the mic, check privacy permissions."
+            )
+            cfg.voice = False
+
+    # --- Whisper listener -> percept/audio ---
+    if cfg.voice:
         def on_transcript(text: str) -> None:
-            """
-            Called from VoskAudioListener's background thread whenever
-            a *final* transcription is ready.
-            Schedules a percept/audio event into the orchestrator.
-            """
             spoken = (text or "").strip()
             if not spoken:
                 return
@@ -191,7 +237,6 @@ async def main_async(cfg: AppConfig):
             }
 
             def _inject() -> None:
-                # Schedule async push_event inside the main loop
                 asyncio.create_task(
                     orch.push_event(
                         "percept/audio",
@@ -200,69 +245,66 @@ async def main_async(cfg: AppConfig):
                     )
                 )
 
-            # Thread-safe scheduling into the main event loop
             loop.call_soon_threadsafe(_inject)
 
         try:
-            vosk_listener = VoskAudioListener(
-                model_path=cfg.vosk_model_path,
-                on_transcript=on_transcript,
-                samplerate=cfg.sample_rate,
+            wcfg = WhisperAudioConfig(
+                model_name=cfg.whisper_model,
+                device_index=cfg.mic_device,
+                sample_rate=cfg.sample_rate,
+                vad_aggressiveness=cfg.vad_aggressiveness,
             )
-            vosk_listener.start()
+            whisper_listener = WhisperAudioListener(
+                cfg=wcfg,
+                on_transcript=on_transcript,
+                on_debug=lambda s: logger.info("%s", s),
+            )
+            whisper_listener.start()
             logger.info(
-                "Vosk audio listener started | model=%s sample_rate=%s",
-                cfg.vosk_model_path,
+                "Whisper audio listener started | model=%s sample_rate=%s device=%s vad=%s",
+                cfg.whisper_model,
                 cfg.sample_rate,
+                cfg.mic_device,
+                cfg.vad_aggressiveness,
             )
         except Exception as exc:
-            logger.warning("Failed to start Vosk audio listener: %s", exc)
-            vosk_listener = None
-    elif cfg.voice and not cfg.vosk_model_path:
-        logger.warning(
-            "Voice mode requested but --vosk-model-path not provided; "
-            "voice input will be disabled."
-        )
+            logger.warning("Failed to start Whisper audio listener: %s", exc)
+            whisper_listener = None
 
     # Start the orchestrator
     await orch.start()
 
-    logger.info("Starting text REPL via orchestrator. Ctrl+C to exit.")
-
-    try:
+    if cfg.voice:
+        logger.info("Voice mode active … REPL disabled …")
         while True:
-            try:
-                prompt = input("you> ").strip()
-            except (EOFError, KeyboardInterrupt):
-                print()
-                break
+            await asyncio.sleep(0.1)
 
+    else:
+        logger.info("Starting text REPL …")
+        while True:
+            prompt = input("you> ").strip()
             if not prompt:
                 continue
 
-            # Send user text into the orchestrator as input/text
             await orch.push_event(
                 "input/text",
                 prompt,
                 meta={"source": "cli", "channel": "repl"},
             )
 
-            # Let neurons process; speech_output neuron will print replies
             await orch.wait_for_idle(timeout=30.0)
-    finally:
-        # Stop Vosk listener if it was started
-        if vosk_listener is not None:
-            try:
-                vosk_listener.stop()
-            except Exception as exc:
-                logger.warning("Error stopping Vosk audio listener: %s", exc)
+            # Stop Vosk listener if it was started
+            if whisper_listener is not None:
+                try:
+                    whisper_listener.stop()
+                except Exception as exc:
+                    logger.warning("Error stopping Whisper audio listener: %s", exc)
 
-        await orch.stop()
-        logger.info("MicroBrain orchestrator stopped.")
+            await orch.stop()
+            logger.info("MicroBrain orchestrator stopped.")
 
 def main():
     args = build_arg_parser().parse_args()
-
     # NEW: flip the global neuron debug flag based on CLI
     set_debug_enabled(getattr(args, "debug", False))
 
@@ -273,9 +315,10 @@ def main():
         ollama_base=args.ollama_base,
         model=args.model,
         memdir=args.memdir,
-        vosk_model_path=args.vosk_model_path,
         mic_device=args.mic_device,
         sample_rate=args.sample_rate,
+        whisper_model=args.whisper_model,
+        vad_aggressiveness=args.vad_aggressiveness,        
         tts_voice=args.tts_voice,
         tts_rate=args.tts_rate,
         tts_volume=args.tts_volume,
