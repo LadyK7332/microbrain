@@ -8,16 +8,17 @@ from microbrain.voice.tts import TTS
 
 
 class SpeechOutputNeuron(BaseNeuron):
-    def __init__(self, config: NeuronConfig):
-        super().__init__(config)
-        self._tts: TTS | None = None
-        self._tts_cfg: tuple[str | None, int, float] | None = None
     """
     Terminal sink that prints speech actions to the console.
 
     - In normal mode: prints only the assistant reply as `bot> ...`.
     - In debug mode: prints detailed `[SPEECH:channel:style] ...` lines.
     """
+
+    def __init__(self, config: NeuronConfig):
+        super().__init__(config)
+        self._tts: TTS | None = None
+        self._tts_cfg: tuple[str | None, int, float] | None = None
 
     async def process(self, event: Event, ctx) -> Iterable[Event]:
         # --- debug roll call (only active when --debug is passed) ----
@@ -46,14 +47,21 @@ class SpeechOutputNeuron(BaseNeuron):
 
         text = text.strip()
         if not text:
-            # Nothing meaningful to say, just drop it
             return []
 
-        # --- Debug vs normal behavior ----------------------------------------
-        # Optional TTS (enabled by --tts-voice ...)
+        # Always print something visible
+        if is_debug_enabled():
+            print(f"[SPEECH:{channel}:{style}] {text}")
+        else:
+            if channel == "repl":
+                print(f"bot> {text}")
+            else:
+                print(text)
+
+        # --- Optional TTS -----------------------------------------------------
         try:
             enabled = await ctx.get_kv("tts:enabled", False)
-            if enabled and channel in ("repl", "default"):
+            if enabled and channel in ("repl", "default", "cli"):
                 voice = await ctx.get_kv("tts:voice", None)
                 rate = await ctx.get_kv("tts:rate", 155)
                 volume = await ctx.get_kv("tts:volume", 0.9)
@@ -64,12 +72,14 @@ class SpeechOutputNeuron(BaseNeuron):
                     self._tts_cfg = cfg_tuple
 
                 self._tts.say(text)
-        except Exception:
-            # Never let audio output kill the brain loop
-            pass
+                self._tts.runAndWait()
+        except Exception as exc:
+            if is_debug_enabled():
+                print(f"[SPEECH:TTS_ERROR] {exc!r}")
 
         # This is a sink: no further events
         return []
+
 
 def build_neurons(orchestrator: Orchestrator):
     """
