@@ -7,8 +7,6 @@ import sys
 from pathlib import Path
 
 from microbrain.config import AppConfig
-from microbrain.llamacpp_client import LlamaCppClient
-from microbrain.llm.llama_runtime import ensure_llama_server
 from microbrain.memory.emotional_journal import EmotionJournal
 from microbrain.memory.memory_store import MemoryStore
 from microbrain.hrm.core import HRMCore
@@ -120,6 +118,37 @@ def _pick_model(model_env: str | None) -> str:
 
     #####
 
+def _resolve_llama_backend(arg_backend: str, vulkan_flag: bool) -> str:
+    """
+    Normalize backend selection so we mirror CLI precedence:
+    - --vulkan flag overrides everything
+    - otherwise, use the explicit --llama-backend value (already seeded from env)
+    """
+    if vulkan_flag:
+        return "vulkan"
+    return arg_backend
+
+
+def _resolve_memdir(arg_memdir: str | None) -> str:
+    """
+    CLI > MB_MEMDIR env > default ./memory
+    """
+    if arg_memdir:
+        return arg_memdir
+    env_memdir = os.getenv("MB_MEMDIR")
+    if env_memdir:
+        return env_memdir
+    return str(Path.cwd() / "memory")
+
+
+def _resolve_model_path(arg_model: str | None) -> str:
+    """
+    CLI > MB_LLAMA_MODEL env > auto-pick from ./models
+    """
+    explicit = arg_model or os.getenv("MB_LLAMA_MODEL")
+    if explicit:
+        return explicit
+    return _pick_model(None)
 
 async def main_async(cfg: AppConfig):
     logger = configure_logging(cfg.log_level)
@@ -137,11 +166,20 @@ async def main_async(cfg: AppConfig):
     orch = Orchestrator()
     vosk_listener = None  # will hold VoskAudioListener if voice is enabled
 
-    # --- TTS wiring (speech output) ---
-    orch.kv_store["tts:enabled"] = bool(cfg.tts_voice)
-    orch.kv_store["tts:voice"] = cfg.tts_voice
-    orch.kv_store["tts:rate"] = cfg.tts_rate
-    orch.kv_store["tts:volume"] = cfg.tts_volume
+   # Optional: voice sink for speech output
+    if cfg.voice:
+        try:
+            tts = TTS(
+                rate=cfg.tts_rate,
+                volume=cfg.tts_volume,
+                preferred=cfg.tts_voice or "",
+            )
+            orch.kv_store["voice:tts"] = tts
+            logger.info("Voice mode enabled (pyttsx3)")
+        except Exception as exc:
+            logger.error("Failed to initialize TTS; continuing without voice", exc_info=exc)
+            orch.kv_store["voice:tts"] = None
+            cfg.voice = False
 
     # --- Persistent memory wiring (MemoryStore + EmotionJournal) ---
     mem_store = MemoryStore(
@@ -289,7 +327,7 @@ async def main_async(cfg: AppConfig):
             await orch.push_event(
                 "input/text",
                 prompt,
-                meta={"source": "cli", "channel": "repl"},
+                meta={"source": "mic", "channel": "repl"},
             )
 
             await orch.wait_for_idle(timeout=30.0)
