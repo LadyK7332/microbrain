@@ -6,5 +6,5 @@ into a modular layout. Review and adjust imports if any references were renamed 
 ## Run (text REPL)
 python -m microbrain.mind
 
-## Run with voice (Vosk + pyttsx3)
-python -m microbrain.mind --vosk-model-path "G:\mind_prog_mini\models\vosk-model-small-en-us-0.15" --mic-device 1 --tts-voice Zira
+## Run with voice (Faster-Whisper + pyttsx3)
+python -m microbrain.mind --whisper-model-path "G:\\models\\faster-whisper-small" --mic-device 1 --tts-voice Zira

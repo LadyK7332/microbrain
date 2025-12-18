@@ -12,7 +12,7 @@
     <ProjectTypeGuids>{888888a0-9f3d-457c-b088-3a5042f75d52}</ProjectTypeGuids>
     <LaunchProvider>Standard Python launcher</LaunchProvider>
     <InterpreterId />
-    <CommandLineArguments>--voice --vosk-model-path "G:\microbrain\microbrain\models\vosk-model-small-en-us-0.15" --mic-device 1 --sample-rate 44100 --tts-voice Zira</CommandLineArguments>
+    <CommandLineArguments>--voice --whisper-model-path "G:\microbrain\microbrain\models\faster-whisper-small" --mic-device 1 --sample-rate 44100 --tts-voice Zira</CommandLineArguments>
     <EnableNativeCodeDebugging>False</EnableNativeCodeDebugging>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)' == 'Debug'" />

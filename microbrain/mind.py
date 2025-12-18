@@ -41,7 +41,7 @@ def build_arg_parser():
     p.add_argument("--voice", action="store_true")
     p.add_argument("--mic-device", type=int, default=None)
     p.add_argument("--sample-rate", type=int, default=16000)
-    p.add_argument("--whisper-model", default="small.en")
+    p.add_argument("--whisper-model-path", default=None, help="Path to Faster-Whisper model")    
     p.add_argument("--vad-aggressiveness", type=int, default=2)
     p.add_argument("--tts-voice", default=None)
     p.add_argument("--tts-rate", type=int, default=170)
@@ -353,9 +353,9 @@ def main():
         ollama_base=args.ollama_base,
         model=args.model,
         memdir=args.memdir,
+        whisper_model_path=args.whisper_model_path,
         mic_device=args.mic_device,
         sample_rate=args.sample_rate,
-        whisper_model=args.whisper_model,
         vad_aggressiveness=args.vad_aggressiveness,        
         tts_voice=args.tts_voice,
         tts_rate=args.tts_rate,

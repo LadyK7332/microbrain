@@ -215,9 +215,10 @@ class Agent:
             reply = self.llm.chat(messages, options={"temperature": 0.2})
             self._emit("agent.llm.reply", text=reply)
         except Exception:
+            context_block = "\n".join(context_lines)
             prompt = (
                 f"{self.system}\n\n"
-                f"{'\n'.join(context_lines)}\n\n"
+                f"{context_block}\n\n"
                 f"User: {user_input}\n"
                 f"Plan step-by-step, call tools if useful, then answer."
             )

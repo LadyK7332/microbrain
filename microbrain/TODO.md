@@ -6,7 +6,7 @@ Effective order for key settings:
    - `--model`              → override model path/name
    - `--memdir`             → override memory directory
    - `--llama-backend` / `--vulkan`
-   - `--voice`, `--vosk-model-path`, `--mic-device`
+   - `--voice`, `--whisper-model-path`, `--mic-device`
    - `--tts-voice`, `--tts-rate`, `--tts-volume`
    - `--log-level`
 

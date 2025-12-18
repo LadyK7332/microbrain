@@ -1,3 +1,7 @@
+from microbrain.voice.asr import STT
+from microbrain.voice.tts import TTS
+
+
 def voice_chat_loop(agent, stt: STT, tts: TTS):
     # announce + show the chosen voice
     chosen = getattr(tts, "chosen_voice", None)
