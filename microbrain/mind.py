@@ -43,7 +43,7 @@ def build_arg_parser():
     p.add_argument("--voice", action="store_true")
     p.add_argument("--mic-device", type=int, default=None)
     p.add_argument("--sample-rate", type=int, default=16000)
-    p.add_argument("--whisper-model-path", default=None, help="Path to Faster-Whisper model")    
+    p.add_argument("--whisper-model", default="small.en")
     p.add_argument("--vad-aggressiveness", type=int, default=2)
     p.add_argument("--tts-voice", default=None)
     p.add_argument("--tts-rate", type=int, default=170)
@@ -265,28 +265,19 @@ async def main_async(cfg: AppConfig):
             if not spoken:
                 return
 
-            payload = {
-                "text": spoken,
-                "confidence": 1.0,
-                "speaker": "user",
-                "channel": "repl",
-                "raw_meta": {
-                    "input_modality": "audio",
-                    "source": "mic",
-                },
-            }
+            # This callback runs on a background thread (Whisper listener thread),
+            # so we must schedule the coroutine onto the main asyncio loop.
+            logger.info("VOICE INJECT -> input/text | %r", spoken)
 
-            def _inject() -> None:
-                asyncio.create_task(
-                    orch.push_event(
-                        "percept/audio",
-                        payload,
-                        meta={"source": "cli", "channel": "repl"},
-                    )
-                )
-
-            loop.call_soon_threadsafe(_inject)
-
+            asyncio.run_coroutine_threadsafe(
+                orch.push_event(
+                    "input/text",
+                    spoken,
+                    meta={"source": "mic", "channel": "repl"},
+                ),
+                loop,
+            )
+                
         try:
             wcfg = WhisperAudioConfig(
                 model_name=cfg.whisper_model,
@@ -329,13 +320,10 @@ async def main_async(cfg: AppConfig):
             await orch.push_event(
                 "input/text",
                 prompt,
-                meta={"source": "mic", "channel": "repl"},
+                meta={"source": "cli", "channel": "repl"},
             )
 
             await orch.wait_for_idle(timeout=30.0)
-
-            await orch.stop()
-            logger.info("MicroBrain orchestrator stopped.")
 
 def main():
     args = build_arg_parser().parse_args()
@@ -349,7 +337,7 @@ def main():
         ollama_base=args.ollama_base,
         model=args.model,
         memdir=args.memdir,
-        whisper_model=args.whisper_model_path,
+        whisper_model=args.whisper_model,
         mic_device=args.mic_device,
         sample_rate=args.sample_rate,
         vad_aggressiveness=args.vad_aggressiveness,        
