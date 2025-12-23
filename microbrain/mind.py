@@ -2,10 +2,12 @@
 
 import argparse
 import asyncio
+import logging
 import os
 import sys
 from pathlib import Path
 
+from microbrain.voice.tts import TTS
 from microbrain.config import AppConfig
 from microbrain.memory.emotional_journal import EmotionJournal
 from microbrain.memory.memory_store import MemoryStore
@@ -279,7 +281,7 @@ async def main_async(cfg: AppConfig):
                     orch.push_event(
                         "percept/audio",
                         payload,
-                        meta={"source": "mic", "channel": "repl"},
+                        meta={"source": "cli", "channel": "repl"},
                     )
                 )
 
@@ -331,12 +333,6 @@ async def main_async(cfg: AppConfig):
             )
 
             await orch.wait_for_idle(timeout=30.0)
-            # Stop Vosk listener if it was started
-            if whisper_listener is not None:
-                try:
-                    whisper_listener.stop()
-                except Exception as exc:
-                    logger.warning("Error stopping Whisper audio listener: %s", exc)
 
             await orch.stop()
             logger.info("MicroBrain orchestrator stopped.")
@@ -353,7 +349,7 @@ def main():
         ollama_base=args.ollama_base,
         model=args.model,
         memdir=args.memdir,
-        whisper_model_path=args.whisper_model_path,
+        whisper_model=args.whisper_model_path,
         mic_device=args.mic_device,
         sample_rate=args.sample_rate,
         vad_aggressiveness=args.vad_aggressiveness,        
