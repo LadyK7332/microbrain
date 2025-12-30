@@ -8,7 +8,7 @@ from typing import Any, Dict, Optional
 
 from microbrain.llamacpp_client import LlamaCppClient
 from microbrain.llm.llama_runtime import ensure_llama_server
-from microbrain.mind import _pick_model
+from microbrain.utils.model_picker import pick_model
 
 """
 Adapter between MicroBrain's existing llama.cpp / DeepSeek setup and the
@@ -40,7 +40,7 @@ def _build_client() -> LlamaCppClient:
     port = int(os.getenv("MB_LLAMA_PORT", "8080"))
 
     # Use the same picker that mind.py uses
-    model_path = _pick_model(os.getenv("MB_LLAMA_MODEL"))
+    model_path = pick_model(os.getenv("MB_LLAMA_MODEL"))
     server_path = os.getenv("MB_LLAMA_SERVER") or None
     threads = os.cpu_count() or 4
     ngl = int(os.getenv("MB_LLAMA_NGL", "999"))

@@ -19,6 +19,8 @@ from microbrain.orchestrator.neuron_loader import auto_register_neurons
 from microbrain.orchestrator.debug_utils import set_debug_enabled
 from microbrain.utils.whisper_audio import WhisperAudioListener, WhisperAudioConfig
 from microbrain.utils.mic_probe_runtime import list_input_devices, probe_rms
+from microbrain.llm_backend import llm_generate
+from microbrain.babble_backend import babble_generate
 
 
 try:
@@ -210,7 +212,14 @@ async def main_async(cfg: AppConfig):
     auto_register_neurons(orch)
 
     # Provide the LLM backend used by LLMReasonerNeuron
-    orch.kv_store["llm:generate"] = llm_generate
+    #
+    # If you pass --model none (or off), we run "babble backend" instead of an LLM.
+    model_name = (cfg.model or "").strip().lower()
+    if model_name in ("none", "off", "babble"):
+        orch.kv_store["llm:generate"] = babble_generate
+        logger.warning("LLM disabled; using babble backend for cognition output.")
+    else:
+        orch.kv_store["llm:generate"] = llm_generate
 
     # --- Optional: Whisper mic listener -> percept/audio events ---
     whisper_listener = None  # will hold WhisperAudioListener if voice is enabled
