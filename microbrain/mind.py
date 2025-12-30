@@ -212,7 +212,7 @@ async def main_async(cfg: AppConfig):
     # Provide the LLM backend used by LLMReasonerNeuron
     orch.kv_store["llm:generate"] = llm_generate
 
-    # --- Optional: Vosk mic listener -> percept/audio events ---
+    # --- Optional: Whisper mic listener -> percept/audio events ---
     whisper_listener = None  # will hold WhisperAudioListener if voice is enabled
 
     if cfg.voice:
