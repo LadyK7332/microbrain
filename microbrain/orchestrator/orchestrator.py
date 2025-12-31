@@ -7,7 +7,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Protocol, Callabl
 
 from .event_bus import EventBus
 from .neuron_base import BaseNeuron, Event, NeuronConfig
-
+from microbrain.core.attention_controller import AttentionController
 
 # =====================================================================================
 # Logging backend placeholder (upgradable later)
@@ -100,6 +100,10 @@ class Orchestrator:
         # Pipes & storage
         self.bus = EventBus()
         self.kv_store: Dict[str, Any] = {}
+
+        # Attention gate for external vs internal speech
+        self.attention = AttentionController()
+        self.kv_store["attention:controller"] = self.attention
 
         # Async event queue
         self.event_queue: asyncio.Queue[Event] = asyncio.Queue()
@@ -202,6 +206,10 @@ class Orchestrator:
             try:
                 # Block until an event arrives
                 event = await self.event_queue.get()
+
+                # Update attention gate based on external stimuli
+                self.attention.observe_event(event)
+                self.attention.update_allow_babble()
 
                 # Dispatch through EventBus
                 new_events = await self.bus.dispatch(event)
