@@ -48,6 +48,28 @@ class CuriosityDriveNeuron(BaseNeuron):
         boredom_level = float(boredom.get("level", 0.0) or 0.0)
         boredom_high = bool(boredom.get("high", False))
 
+        # Gate internal curiosity/babble:
+        #  - only when boredom is ACTIVE (not just 'a little low')
+        #  - and the attention controller allows internal speech (no recent external stimulus)
+        boredom_active = bool(boredom.get("active", False))
+        allow_babble = bool(await ctx.get_kv("attention:allow_babble", True))
+        if (not boredom_active) or (not allow_babble):
+            state.update(
+                {
+                    "ticks_since_last": ticks_since_last,
+                    "internal_thought_id": internal_thought_id,
+                }
+            )
+            await self.save_state(ctx, "curiosity_state", state)
+            self.debug(
+                "curiosity_gate_closed",
+                boredom_active=boredom_active,
+                allow_babble=allow_babble,
+                boredom_level=boredom_level,
+                ticks_since_last=ticks_since_last,
+            )
+            return []
+
         # If boredom is low, curiosity stays mostly idle
         if boredom_level < 0.4:
             # We'll still increment our internal tick counter below,
@@ -121,6 +143,20 @@ class CuriosityDriveNeuron(BaseNeuron):
             await self.save_state(ctx, "curiosity_state", state)
             return []
 
+
+        # NEW: only allow internal babble if boredom is active and attention gate allows it
+        boredom_active = bool(boredom.get("active", False))
+        allow_babble = bool(await ctx.get_kv("attention:allow_babble", False))
+        if not boredom_active or not allow_babble:
+            state.update(
+                {
+                    "ticks_since_last": ticks_since_last,
+                    "internal_thought_id": internal_thought_id,
+                }
+            )
+            await self.save_state(ctx, "curiosity_state", state)
+            return []
+        
         # Reset tick counter and increment internal thought id
         ticks_since_last = 0
         internal_thought_id += 1

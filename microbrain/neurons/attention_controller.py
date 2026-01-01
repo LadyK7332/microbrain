@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
@@ -52,6 +53,51 @@ class AttentionControllerNeuron(BaseNeuron):
             meta=event.meta,
         )
 
+        # ------------------------------
+        # Step 4.1: Heartbeat-driven attention gate
+        # ------------------------------
+        if event.topic == "clock/tick":
+            state: Dict[str, Any] = await self.load_state(
+                ctx,
+                "attention_state",
+                default={
+                    "salience": 0.3,
+                    "focus_signature": None,
+                    "focus_age": 0,
+
+                    # Step 4.1: external-vs-internal speech gate
+                    "external_hold_ms": 4000,
+                    "last_external_ts": time.time(),
+                    "allow_babble": False,
+                    "prev_allow_babble": None,
+                },
+            )
+
+            now = time.time()
+            hold_ms = int(state.get("external_hold_ms", 4000))
+            last_ext = float(state.get("last_external_ts", now))
+            elapsed_ms = (now - last_ext) * 1000.0
+
+            allow_babble = elapsed_ms >= float(hold_ms)
+            state["allow_babble"] = allow_babble
+
+            await ctx.set_kv("attention:allow_babble", allow_babble)
+            await ctx.set_kv("attention:focus_target", "internal" if allow_babble else "external")
+
+            prev = state.get("prev_allow_babble", None)
+            if prev is None or bool(prev) != bool(allow_babble):
+                state["prev_allow_babble"] = allow_babble
+                self.debug(
+                    "attention_gate_flip",
+                    allow_babble=allow_babble,
+                    focus_target=("internal" if allow_babble else "external"),
+                    elapsed_ms=int(elapsed_ms),
+                    hold_ms=hold_ms,
+                )
+
+            await self.save_state(ctx, "attention_state", state)
+            return []
+
         # Only treat certain topics as attentional "ticks"
         if event.topic not in ("percept/text", "percept/vision", "act/speech"):
             return []
@@ -102,8 +148,55 @@ class AttentionControllerNeuron(BaseNeuron):
                 "salience": 0.3,
                 "focus_signature": None,
                 "focus_age": 0,
+
+                # Step 4.1: external-vs-internal speech gate
+                "external_hold_ms": 4000,
+                "last_external_ts": time.time(),
+                "allow_babble": False,
+                "prev_allow_babble": None,
             },
         )
+
+        # Attention Gating
+        now = time.time()
+
+        # Best-effort source extraction
+        src = ""
+        if event.source:
+            src = str(event.source)
+        elif event.meta and event.meta.get("source"):
+            src = str(event.meta.get("source"))
+        elif isinstance(event.payload, dict) and event.payload.get("source"):
+            src = str(event.payload.get("source"))
+
+        # External stimulus updates last_external_ts
+        if src in {"cli", "mic"}:
+            state["last_external_ts"] = now
+
+        hold_ms = int(state.get("external_hold_ms", 4000))
+        last_ext = float(state.get("last_external_ts", now))
+        elapsed_ms = (now - last_ext) * 1000.0
+
+        allow_babble = elapsed_ms >= float(hold_ms)
+        state["allow_babble"] = allow_babble
+
+        # Publish to global KV so other neurons can consult it
+        await ctx.set_kv("attention:allow_babble", allow_babble)
+        await ctx.set_kv("attention:focus_target", "internal" if allow_babble else "external")
+
+        # Optional: only log when the gate flips
+        prev = state.get("prev_allow_babble", None)
+        if prev is None or bool(prev) != bool(allow_babble):
+            state["prev_allow_babble"] = allow_babble
+            self.debug(
+                "attention_gate_flip",
+                allow_babble=allow_babble,
+                focus_target=("internal" if allow_babble else "external"),
+                elapsed_ms=int(elapsed_ms),
+                hold_ms=hold_ms,
+                src=src,
+            )
+
 
         salience = float(state.get("salience", 0.3) or 0.3)
         prev_sig = state.get("focus_signature", None)
@@ -205,6 +298,7 @@ def build_neurons(orchestrator: Orchestrator):
     cfg = NeuronConfig(
         name=NEURON_NAME,
         subscribed_topics=[
+            "clock/tick",
             "percept/text",
             "percept/vision",  # safe even if not yet used
             "act/speech",

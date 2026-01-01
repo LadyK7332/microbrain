@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 
 from microbrain.voice.tts import TTS
@@ -17,7 +18,8 @@ from microbrain.utils.logging_setup import configure_logging
 from microbrain.orchestrator.orchestrator import Orchestrator
 from microbrain.orchestrator.neuron_loader import auto_register_neurons
 from microbrain.orchestrator.debug_utils import set_debug_enabled
-from microbrain.utils.whisper_audio import WhisperAudioListener, WhisperAudioConfig
+WhisperAudioListener = None
+WhisperAudioConfig = None
 from microbrain.utils.mic_probe_runtime import list_input_devices, probe_rms
 from microbrain.llm_backend import llm_generate
 from microbrain.babble_backend import babble_generate
@@ -269,50 +271,46 @@ async def main_async(cfg: AppConfig):
 
     # --- Whisper listener -> percept/audio ---
     if cfg.voice:
-        def on_transcript(text: str) -> None:
-            spoken = (text or "").strip()
-            if not spoken:
-                return
-
-            # This callback runs on a background thread (Whisper listener thread),
-            # so we must schedule the coroutine onto the main asyncio loop.
-            logger.info("VOICE INJECT -> input/text | %r", spoken)
-
-            asyncio.run_coroutine_threadsafe(
-                orch.push_event(
-                    "input/text",
-                    spoken,
-                    meta={"source": "mic", "channel": "repl"},
-                ),
-                loop,
-            )
-                
         try:
-            wcfg = WhisperAudioConfig(
-                model_name=cfg.whisper_model,
-                device_index=cfg.mic_device,
-                sample_rate=cfg.sample_rate,
-                vad_aggressiveness=cfg.vad_aggressiveness,
-            )
-            whisper_listener = WhisperAudioListener(
-                cfg=wcfg,
-                on_transcript=on_transcript,
-                on_debug=lambda s: logger.info("%s", s),
-            )
-            whisper_listener.start()
-            logger.info(
-                "Whisper audio listener started | model=%s sample_rate=%s device=%s vad=%s",
-                cfg.whisper_model,
-                cfg.sample_rate,
-                cfg.mic_device,
-                cfg.vad_aggressiveness,
-            )
-        except Exception as exc:
-            logger.warning("Failed to start Whisper audio listener: %s", exc)
-            whisper_listener = None
+            from microbrain.utils.whisper_audio import WhisperAudioListener, WhisperAudioConfig
+        except Exception:
+            logger.exception("Voice mode requested but Whisper audio deps are missing.")
+            WhisperAudioListener = None
+
+        if WhisperAudioListener is None:
+            logger.warning("Voice disabled: missing Whisper/VAD dependencies.")
+        else:
+            try:
+                whisper_listener = WhisperAudioListener(...)  # TODO: fill args
+                whisper_listener.start()
+                logger.info(
+                    "Whisper audio listener started | model=%s sample_rate=%s device=%s vad=%s",
+                    cfg.whisper_model,
+                    cfg.sample_rate,
+                    cfg.mic_device,
+                    cfg.vad_aggressiveness,
+                )
+            except Exception as exc:
+                logger.warning("Failed to start Whisper audio listener: %s", exc)
+                whisper_listener = None
 
     # Start the orchestrator
     await orch.start()
+
+    # ------------------------------------------------------------------
+    # Heartbeat: drive "time passing" so neurons can act without external input
+    # ------------------------------------------------------------------
+    async def _clock_tick_loop():
+        # low rate by default; enough to drive boredom/babble without spam
+        while True:
+            await asyncio.sleep(0.5)
+            await orch.push_event(
+                "clock/tick",
+                {"ts": time.time()},
+                meta={"source": "system", "channel": "internal"},
+            )
+
+    asyncio.create_task(_clock_tick_loop())
 
     if cfg.voice:
         logger.info("Voice mode active … REPL disabled …")
@@ -322,7 +320,9 @@ async def main_async(cfg: AppConfig):
     else:
         logger.info("Starting text REPL …")
         while True:
-            prompt = input("you> ").strip()
+            # IMPORTANT: don't block the asyncio loop (lets clock/tick + background outputs run)
+            raw = await asyncio.to_thread(input, "you> ")
+            prompt = (raw or "").strip()
             if not prompt:
                 continue
 

@@ -53,7 +53,7 @@ class HRMObserverNeuron(BaseNeuron):
         if topic == "percept/text":
             if isinstance(payload, dict):
                 text = str(payload.get("text", "")).strip()
-                role = str(payload.get("source", "user"))
+                role = "user"
             else:
                 text = str(payload).strip()
                 role = "user"
@@ -78,13 +78,38 @@ class HRMObserverNeuron(BaseNeuron):
             self.debug("no_hrm_core_found")
             return []
 
+        #Internal ECHO cancelation for "Experience."
+        if text.startswith("[echo:"):
+            return []
+
         # ------------------------------
         # Create a new HRM node
         # ------------------------------
         try:
-            node = hrm.observe(text, role=role)
-            self.debug("hrm_node_created", idx=node.idx, role=role, text_preview=text[:40])
+            node = hrm.observe(text, role=role, meta=event.meta)
         except Exception as exc:
+            # DO NOT swallow this; it is why you "see input but no node"
+            self.debug(
+                "hrm_observe_error",
+                error=repr(exc),
+                role=role,
+                text_preview=text[:80],
+                meta=event.meta,
+            )
+
+        self.debug(
+            "hrm_node_created",
+            idx=getattr(node, "idx", None),
+            role=role,
+            text_preview=text[:80],
+        )
+
+        # Expose last HRM node index so other neurons can query neighbors
+        if getattr(node, "idx", None) is not None:
+            await ctx.set_kv("hrm:last_idx", node.idx)
+            self.debug("hrm_last_idx_set", idx=node.idx)
+        else:
+            self.debug("hrm_node_missing_idx", role=role, text_preview=text[:80])
             return []
 
         self.debug(
