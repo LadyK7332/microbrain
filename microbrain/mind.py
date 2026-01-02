@@ -217,11 +217,29 @@ async def main_async(cfg: AppConfig):
     #
     # If you pass --model none (or off), we run "babble backend" instead of an LLM.
     model_name = (cfg.model or "").strip().lower()
-    if model_name in ("none", "off", "babble"):
-        orch.kv_store["llm:generate"] = babble_generate
+
+    backend_generate = babble_generate if model_name in ("none", "off", "babble") else llm_generate
+    if backend_generate is babble_generate:
         logger.warning("LLM disabled; using babble backend for cognition output.")
-    else:
-        orch.kv_store["llm:generate"] = llm_generate
+
+    def generate_with_state(prompt: str, meta: dict | None = None):
+        m = dict(meta or {})
+
+        # Pull boredom+attention gates from orchestrator state
+        boredom = orch.kv_store.get("drive:boredom", {})
+        if isinstance(boredom, dict):
+            m["boredom_active"] = bool(boredom.get("active", False))
+        else:
+            m["boredom_active"] = bool(orch.kv_store.get("drive:boredom_active", False))
+
+        m["allow_babble"] = bool(orch.kv_store.get("attention:allow_babble", True))
+
+        out = backend_generate(prompt, m)
+        logger.debug("babble_probe", extra={"boredom_active": m.get("boredom_active"), "allow_babble": m.get("allow_babble"), "out_len": len(out or ""), "prompt_len": len(prompt or "")})
+        return out
+
+
+    orch.kv_store["llm:generate"] = generate_with_state
 
     # --- Optional: Whisper mic listener -> percept/audio events ---
     whisper_listener = None  # will hold WhisperAudioListener if voice is enabled

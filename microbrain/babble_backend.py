@@ -23,6 +23,13 @@ async def babble_generate(prompt: str, meta: Dict[str, Any]) -> str:
     Produces short "babble" text so the cognition pipeline can be exercised
     without any external LLM.
     """
+        # Gate babble strictly: only when boredom is active AND attention allows it
+    boredom_active = bool(meta.get("boredom_active", False))
+    allow_babble = bool(meta.get("allow_babble", False))
+    if not (boredom_active and allow_babble):
+        return ""
+
+
     # Make it stable-ish per event, but still lively.
     seed = int(time.time() * 1000) ^ hash(prompt[:120])
     rng = random.Random(seed)
