@@ -54,6 +54,54 @@ class AttentionControllerNeuron(BaseNeuron):
         )
 
         # ------------------------------
+        # Curiosity refractory pause (negative feedback -> quiet gap)
+        # ------------------------------
+        if event.topic == "curiosity/adjust":
+            payload = event.payload or {}
+            if not isinstance(payload, dict):
+                return []
+
+            pause_s = float(payload.get("pause_s", 0.0) or 0.0)
+            if pause_s <= 0.0:
+                return []
+
+            now = time.time()
+
+            state: Dict[str, Any] = await self.load_state(
+                ctx,
+                "attention_state",
+                default={
+                    "salience": 0.3,
+                    "focus_signature": None,
+                    "focus_age": 0,
+                    "external_hold_ms": 4000,
+                    "last_external_ts": time.time(),
+                    "allow_babble": False,
+                    "prev_allow_babble": None,
+                    "cooldown_until": 0.0,
+                },
+            )
+
+            current_cd = float(state.get("cooldown_until", 0.0) or 0.0)
+            new_cd = max(current_cd, now + pause_s)
+
+            state["cooldown_until"] = new_cd
+            state["last_external_ts"] = now
+            state["allow_babble"] = False
+
+            await ctx.set_kv("attention:allow_babble", False)
+            await ctx.set_kv("attention:focus_target", "external")
+            await self.save_state(ctx, "attention_state", state)
+
+            self.debug(
+                "attention_cooldown_set",
+                pause_s=pause_s,
+                cooldown_until=new_cd,
+                reason=str(payload.get("reason", "")),
+            )
+            return []
+
+        # ------------------------------
         # Step 4.1: Heartbeat-driven attention gate
         # ------------------------------
         if event.topic == "clock/tick":
@@ -64,16 +112,24 @@ class AttentionControllerNeuron(BaseNeuron):
                     "salience": 0.3,
                     "focus_signature": None,
                     "focus_age": 0,
-
-                    # Step 4.1: external-vs-internal speech gate
                     "external_hold_ms": 4000,
                     "last_external_ts": time.time(),
                     "allow_babble": False,
                     "prev_allow_babble": None,
+                    "cooldown_until": 0.0,
                 },
             )
 
             now = time.time()
+
+            cooldown_until = float(state.get("cooldown_until", 0.0) or 0.0)
+            if now < cooldown_until:
+                state["allow_babble"] = False
+                await ctx.set_kv("attention:allow_babble", False)
+                await ctx.set_kv("attention:focus_target", "external")
+                await self.save_state(ctx, "attention_state", state)
+                return []
+
             hold_ms = int(state.get("external_hold_ms", 4000))
             last_ext = float(state.get("last_external_ts", now))
             elapsed_ms = (now - last_ext) * 1000.0
@@ -98,12 +154,12 @@ class AttentionControllerNeuron(BaseNeuron):
             await self.save_state(ctx, "attention_state", state)
             return []
 
-        # Only treat certain topics as attentional "ticks"
+        # Only treat certain topics as attentional updates
         if event.topic not in ("percept/text", "percept/vision", "act/speech"):
             return []
 
         payload = event.payload or {}
-        if not isinstance(payload, dict):
+        if not isinstance(payload, dict):closing
             return []
 
         # Extract a rough "content" string to fingerprint
@@ -133,10 +189,7 @@ class AttentionControllerNeuron(BaseNeuron):
             boredom_high = bool(boredom.get("high", False))
 
         # Clamp boredom to [0,1] for safety
-        if boredom_level < 0.0:
-            boredom_level = 0.0
-        elif boredom_level > 1.0:
-            boredom_level = 1.0
+        boredom_level = max(0.0, min(1.0, boredom_level))
 
         # ------------------------------
         # Load prior attention state
@@ -148,16 +201,17 @@ class AttentionControllerNeuron(BaseNeuron):
                 "salience": 0.3,
                 "focus_signature": None,
                 "focus_age": 0,
-
-                # Step 4.1: external-vs-internal speech gate
                 "external_hold_ms": 4000,
                 "last_external_ts": time.time(),
                 "allow_babble": False,
                 "prev_allow_babble": None,
+                "cooldown_until": 0.0,
             },
         )
 
-        # Attention Gating
+        # ------------------------------
+        # Attention gating (percept/speech updates)
+        # ------------------------------
         now = time.time()
 
         # Best-effort source extraction
@@ -173,18 +227,17 @@ class AttentionControllerNeuron(BaseNeuron):
         if src in {"cli", "mic"}:
             state["last_external_ts"] = now
 
+        cooldown_until = float(state.get("cooldown_until", 0.0) or 0.0)
         hold_ms = int(state.get("external_hold_ms", 4000))
         last_ext = float(state.get("last_external_ts", now))
         elapsed_ms = (now - last_ext) * 1000.0
 
-        allow_babble = elapsed_ms >= float(hold_ms)
+        allow_babble = False if now < cooldown_until else (elapsed_ms >= float(hold_ms))
         state["allow_babble"] = allow_babble
 
-        # Publish to global KV so other neurons can consult it
         await ctx.set_kv("attention:allow_babble", allow_babble)
         await ctx.set_kv("attention:focus_target", "internal" if allow_babble else "external")
 
-        # Optional: only log when the gate flips
         prev = state.get("prev_allow_babble", None)
         if prev is None or bool(prev) != bool(allow_babble):
             state["prev_allow_babble"] = allow_babble
@@ -197,7 +250,6 @@ class AttentionControllerNeuron(BaseNeuron):
                 src=src,
             )
 
-
         salience = float(state.get("salience", 0.3) or 0.3)
         prev_sig = state.get("focus_signature", None)
         focus_age = int(state.get("focus_age", 0) or 0)
@@ -207,50 +259,31 @@ class AttentionControllerNeuron(BaseNeuron):
         # ------------------------------
         is_novel = False
         if prev_sig is None:
-            # First-ever focus
             is_novel = True
         elif focus_signature != prev_sig:
             is_novel = True
 
         if is_novel:
-            # New focus: reset age
             focus_age = 0
         else:
-            # Same focus: age increases
             focus_age += 1
 
         # ------------------------------
         # Update salience based on novelty + boredom
         # ------------------------------
-        # Baseline salience clamped to [0, 1]
-        if salience < 0.0:
-            salience = 0.0
-        elif salience > 1.0:
-            salience = 1.0
+        salience = max(0.0, min(1.0, salience))
 
         if is_novel:
-            # Novel stimuli: boost salience.
-            # Stronger boost if boredom is high (bored mind reacts strongly to novelty).
             novelty_boost = 0.20 + 0.40 * boredom_level  # in [0.2, 0.6]
             salience = salience + novelty_boost
         else:
-            # No novelty: allow salience to decay.
-            # If boredom is already high, we decay more slowly
-            # (mind is "clinging" to rare stimuli).
             base_decay = 0.04
-            # When boredom is low, decay faster; when high, decay slower.
             decay = base_decay + 0.10 * (1.0 - boredom_level)  # ~[0.04, 0.14]
             salience = salience - decay
 
-        # Clamp salience again
-        if salience < 0.0:
-            salience = 0.0
-        elif salience > 1.0:
-            salience = 1.0
+        salience = max(0.0, min(1.0, salience))
 
-        # ------------------------------
         # Persist updated state
-        # ------------------------------
         state.update(
             {
                 "salience": salience,
@@ -260,10 +293,8 @@ class AttentionControllerNeuron(BaseNeuron):
         )
         await self.save_state(ctx, "attention_state", state)
 
-        # Also publish a KV so others can quickly read it
         await ctx.set_kv("affect:global_salience", salience)
 
-        # Log for debug visibility
         self.debug(
             "updated_attention",
             topic=event.topic,
@@ -274,9 +305,6 @@ class AttentionControllerNeuron(BaseNeuron):
             focus_age=focus_age,
         )
 
-        # ------------------------------
-        # Emit an affect/salience event for interested neurons
-        # ------------------------------
         salience_event = Event(
             topic="affect/salience",
             payload={
@@ -299,6 +327,7 @@ def build_neurons(orchestrator: Orchestrator):
         name=NEURON_NAME,
         subscribed_topics=[
             "clock/tick",
+            "curiosity/adjust",
             "percept/text",
             "percept/vision",  # safe even if not yet used
             "act/speech",

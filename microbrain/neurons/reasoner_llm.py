@@ -49,16 +49,27 @@ class LLMReasonerNeuron(BaseNeuron):
         hrm_last_idx = await ctx.get_kv("hrm:last_idx", None)
 
         payload = event.payload
+
+        # Back-compat: allow raw string payloads (older emitters)
+        if isinstance(payload, str):
+            payload = {"text": payload}
+
+        # Back-compat: allow {"prompt": "..."} from earlier variants
         if not isinstance(payload, dict) or "text" not in payload:
-            # We only know how to handle normalized percept payloads
             await ctx.log_warn(
                 f"[{self.name}] Unexpected payload for reason/request",
-                payload_type=str(type(payload)),
+                payload_type=str(type(event.payload)),
             )
             return []
+        
+        raw_meta: Dict[str, Any] = payload.get("raw_meta", {}) or {}
+        mode = raw_meta.get("mode") or (event.meta or {}).get("mode")
 
-        text: str = str(payload.get("text", "")).strip()
-        if not text:
+        text_raw = str(payload.get("text", "") or "")
+        text: str = text_raw.strip()
+
+        # Allow empty text ONLY for autonomous babble mode
+        if not text and mode != "babble":
             await ctx.log_debug(
                 f"[{self.name}] Empty percept text, ignoring",
                 topic=event.topic,
@@ -375,7 +386,7 @@ def build_neurons(orchestrator: Orchestrator):
     """
     Auto-loader hook.
 
-    The neuron_loader will call this and register the neuron.
+    The neuron_loader will call this and register neurons.
     """
     cfg = NeuronConfig(
         name="llm_reasoner",
