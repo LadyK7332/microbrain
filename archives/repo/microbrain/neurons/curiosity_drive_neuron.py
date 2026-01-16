@@ -291,64 +291,6 @@ class CuriosityDriveNeuron(BaseNeuron):
             "voice_online": voice_online,
         }
 
-        llm_enabled = bool(await ctx.get_kv("llm:enabled", False))
-        if not llm_enabled:
-            # LLM is disabled: generate a short babble line and speak it directly to the UI.
-            try:
-                from microbrain.babble_backend import babble_generate
-            except Exception as e:
-                self.debug("babble_backend_missing", err=str(e))
-                return []
-
-            prompt = (
-                "Generate one short sentence of curious babble. "
-                "Keep it under 12 words."
-            )
-            meta2 = {
-                "boredom_active": True,
-                "allow_babble": True,
-                "source": "curiosity_drive",
-                "boost": boost,
-                "mimic": {
-                    "unigrams": await ctx.get_kv("mimic:unigrams", {}) or {},
-                    "bigrams": await ctx.get_kv("mimic:bigrams", {}) or {},
-                    "recent_phrases": await ctx.get_kv("mimic:recent_phrases", []) or [],
-                    "last_user_text": await ctx.get_kv("mimic:last_user_text", "") or "",
-                },
-            }
-
-            babble = (await babble_generate(prompt, meta2)).strip()
-            if not babble:
-                return []
-
-            # Persist curiosity state before speaking
-            state.update(
-                {
-                    "ticks_since_last": ticks_since_last,
-                    "internal_thought_id": internal_thought_id,
-                    "last_fire_ts": last_fire_ts,
-                }
-            )
-            await self.save_state(ctx, "curiosity_state", state)
-
-            self.debug(
-                "curiosity_babble_said",
-                text=babble,
-                boredom_level=boredom_level,
-                target_interval=target_interval,
-                internal_thought_id=internal_thought_id,
-            )
-
-            return [
-                Event(
-                    topic="act/speech",
-                    payload={"text": babble, "channel": "repl", "style": "assistant"},
-                    source=self.name,
-                    meta={"kind": "curiosity_babble"},
-                )
-            ]
-
-
         internal_event = Event(
             topic="reason/request",
             payload={
@@ -393,7 +335,7 @@ def build_neurons(orchestrator: Orchestrator):
             "percept/vision",
             "act/speech",
         ],
-        output_topics=["reason/request", "act/speech"],
+        output_topics=["reason/request"],
         priority=-9,  # after boredom, before more "outward" behaviors if needed
     )
     yield CuriosityDriveNeuron(cfg)

@@ -1,0 +1,412 @@
+from __future__ import annotations
+
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+from microbrain.orchestrator.neuron_base import BaseNeuron, NeuronConfig, Event
+from microbrain.orchestrator.orchestrator import Orchestrator
+
+NEURON_NAME = Path(__file__).stem
+
+
+class RecollectionNeuron(BaseNeuron):
+    """
+    Recollection / memory search neuron (v2).
+
+    Listens on:
+        - "memory/recollect"
+
+    Emits:
+        - "reason/request"  (for LLMReasonerNeuron)
+
+    Behavior v2:
+      - Takes a natural-language recollection query (e.g. "remember that funny thing
+        about jaguars you said early last week?").
+      - Uses HRM to create a temporary query node and then find nearest neighbors.
+      - Optionally biases neighbors using temporal tags stored on HRM nodes:
+          - node.day_index
+          - node.week_index
+          - node.local_weekday
+      - Collects a few of the most relevant past text nodes.
+      - Builds a prompt asking the reasoning core to "remember" and paraphrase
+        what it likely said or meant back then.
+      - Instructs the LLM to prefer honesty ("I'm not sure") over fabrication if
+        nothing matches well.
+    """
+
+    async def process(self, event: Event, ctx) -> Iterable[Event]:
+        # --- debug roll call (only active when --debug is passed) ----
+        self.debug(
+            "received",
+            topic=event.topic,
+            payload=event.payload,
+            source=event.source,
+            meta=event.meta,
+        )
+
+        payload = event.payload
+        if not isinstance(payload, dict):
+            await ctx.log_warn(
+                f"[{self.name}] Unexpected payload for memory/recollect",
+                payload_type=str(type(payload)),
+            )
+            return []
+
+        query_text = str(payload.get("query_text", "") or "").strip()
+        raw_user_text = str(payload.get("raw_user_text", "") or "").strip()
+        channel = str(payload.get("channel", "default"))
+        source = str(payload.get("source", "user"))
+        raw_meta: Dict[str, Any] = payload.get("raw_meta", {}) or {}
+
+        if not query_text and raw_user_text:
+            query_text = raw_user_text
+
+        if not query_text:
+            await ctx.log_debug(
+                f"[{self.name}] Empty recollection query; nothing to do",
+                channel=channel,
+            )
+            return []
+
+        # Optional time hint: infer from user phrasing ("yesterday", "last week", etc.)
+        time_hint = self._extract_time_hint(raw_user_text or query_text)
+
+        # Try to get HRM core
+        hrm = await ctx.get_kv("hrm:core", None)
+        if hrm is None:
+            # No HRM available; fall back to simple "I don't remember" via reasoner.
+            prompt = (
+                "The user asked you to remember something from earlier, but your "
+                "long-term memory system (HRM) is not available right now. "
+                "Explain gently that you can't reliably recall older details at the moment."
+            )
+
+            reason_payload = {
+                "text": prompt,
+                "source": "system",
+                "channel": channel,
+                "raw_meta": {
+                    "mode": "recollection_fallback",
+                    "raw_user_text": raw_user_text,
+                    "query_text": query_text,
+                    "time_hint": time_hint,
+                    "raw_meta": raw_meta,
+                },
+            }
+
+            return [Event(
+                topic="reason/request",
+                payload=reason_payload,
+                source=self.name,
+                correlation_id=event.correlation_id,
+                meta={"kind": "recollection_fallback"},
+            )]
+
+        # ------------------------------
+        # Build a temporary HRM query node & find neighbors
+        # ------------------------------
+        try:
+            query_node = hrm.observe(query_text, role="recollection_query")
+        except Exception as exc:
+            await ctx.log_error(
+                f"[{self.name}] Error creating HRM query node",
+                exception=str(exc),
+            )
+            query_node = None
+
+        memory_snippets: List[str] = []
+        neighbor_debug: List[Dict[str, Any]] = []
+
+        if query_node is not None:
+            try:
+                # Pull a bigger set, then re-rank with time bias
+                base_neighbors: List[Tuple[int, float]] = hrm.neighbors(
+                    query_node.idx, k=24
+                )
+            except Exception as exc:
+                await ctx.log_error(
+                    f"[{self.name}] Error getting HRM neighbors",
+                    exception=str(exc),
+                )
+                base_neighbors = []
+
+            # Compute time bias if possible
+            biased_neighbors: List[Tuple[int, float]] = []
+            today_day_index = int(time.time() // 86400)
+
+            for idx, weight in base_neighbors:
+                try:
+                    node = hrm.get_node(idx)
+                except Exception:
+                    node = None
+
+                if not node:
+                    continue
+
+                # Default: no bias
+                effective_weight = weight
+                in_window = False
+
+                if time_hint is not None:
+                    in_window = self._node_matches_time_hint(
+                        node=node,
+                        hint=time_hint,
+                        today_day_index=today_day_index,
+                    )
+
+                    # Simple scheme:
+                    #  - if in window: boost slightly
+                    #  - if not in window: slight penalty
+                    if in_window:
+                        effective_weight *= 1.4
+                    else:
+                        effective_weight *= 0.85
+
+                biased_neighbors.append((idx, effective_weight))
+                neighbor_debug.append(
+                    {
+                        "idx": idx,
+                        "base_weight": weight,
+                        "effective_weight": effective_weight,
+                        "in_window": in_window,
+                    }
+                )
+
+            # Sort by effective weight, highest first
+            biased_neighbors.sort(key=lambda t: t[1], reverse=True)
+
+            # Collect top few memory snippets
+            for idx, eff_weight in biased_neighbors:
+                try:
+                    node = hrm.get_node(idx)
+                except Exception:
+                    node = None
+                if not node:
+                    continue
+
+                text_j = getattr(node, "text", "") or ""
+                text_j = str(text_j).strip()
+                if not text_j:
+                    continue
+
+                if len(text_j) > 220:
+                    text_j = text_j[:220] + "..."
+
+                memory_snippets.append(f"- {text_j}")
+                if len(memory_snippets) >= 5:
+                    break
+
+        # ------------------------------
+        # Build recollection prompt
+        # ------------------------------
+        prompt_lines: List[str] = []
+
+        prompt_lines.append(
+            "The user is asking you to remember something you said or did in the past."
+        )
+        if raw_user_text:
+            prompt_lines.append(
+                f"User's recollection request (verbatim): {raw_user_text}"
+            )
+        else:
+            prompt_lines.append(
+                f"User's recollection request (parsed): {query_text}"
+            )
+        prompt_lines.append("")
+
+        if time_hint is not None:
+            prompt_lines.append(
+                f"Timeframe (interpreted from the user's phrasing): {time_hint}"
+            )
+            prompt_lines.append("")
+
+        if memory_snippets:
+            prompt_lines.append(
+                "Here are some of your most relevant past thoughts or messages, "
+                "retrieved from your long-term memory (HRM):"
+            )
+            prompt_lines.extend(memory_snippets)
+        else:
+            prompt_lines.append(
+                "No clearly matching memories could be found in your long-term memory."
+            )
+
+        prompt_lines.append("")
+        prompt_lines.append(
+            "Based on this, try to remember and explain what you probably said or meant. "
+            "If nothing matches well, be honest that you don't clearly remember, "
+            "rather than inventing details."
+        )
+        prompt_lines.append(
+            "Keep it brief (3–6 sentences) and speak in first person as MicroBrain."
+        )
+
+        prompt = "\n".join(prompt_lines)
+
+        await ctx.log_debug(
+            f"[{self.name}] Built recollection prompt",
+            channel=channel,
+            has_memories=bool(memory_snippets),
+            num_memories=len(memory_snippets),
+            time_hint=time_hint,
+        )
+
+        reason_payload: Dict[str, Any] = {
+            "text": prompt,
+            "source": "system",
+            "channel": channel,
+            "raw_meta": {
+                "mode": "recollection",
+                "raw_user_text": raw_user_text,
+                "query_text": query_text,
+                "time_hint": time_hint,
+                "neighbor_debug": neighbor_debug[:10],  # small sample
+                "raw_meta": raw_meta,
+            },
+        }
+
+        reason_event = Event(
+            topic="reason/request",
+            payload=reason_payload,
+            source=self.name,
+            correlation_id=event.correlation_id,
+            meta={"kind": "recollection_request"},
+        )
+
+        return [reason_event]
+
+    # ------------------------------------------------------------------
+    # Time hint extraction
+    # ------------------------------------------------------------------
+    def _extract_time_hint(self, text: str) -> Optional[str]:
+        """
+        Very simple phrase-to-hint mapping.
+        Returns a small string label like "yesterday", "last_week", "early_last_week", etc.
+        """
+        lowered = (text or "").lower()
+        if not lowered:
+            return None
+
+        # Order matters: more specific phrases first
+        if "early last week" in lowered:
+            return "early_last_week"
+        if "late last week" in lowered:
+            return "late_last_week"
+        if "last week" in lowered:
+            return "last_week"
+        if "yesterday" in lowered:
+            return "yesterday"
+        if "last night" in lowered:
+            return "last_night"
+        if "this morning" in lowered:
+            return "this_morning"
+        if "earlier today" in lowered or "earlier this day" in lowered:
+            return "earlier_today"
+        if "today" in lowered:
+            return "today"
+
+        # Add more phrases as needed over time
+        return None
+
+    # ------------------------------------------------------------------
+    # Time window matching against node tags
+    # ------------------------------------------------------------------
+    def _node_matches_time_hint(
+        self,
+        node: Any,
+        hint: str,
+        today_day_index: int,
+    ) -> bool:
+        """
+        Decide whether a given HRM node falls into the interpreted time window
+        for the given hint. We use the node's day_index/week_index/local_weekday
+        if present; otherwise, we can't match.
+        """
+        day_index = getattr(node, "day_index", None)
+        week_index = getattr(node, "week_index", None)
+        local_weekday = getattr(node, "local_weekday", None)
+
+        # If we don't have any time tags, we can't say it matches.
+        if day_index is None and week_index is None:
+            return False
+
+        # Compute some basics from today.
+        current_day_index = today_day_index
+        current_week_index = current_day_index // 7
+
+        # Helper to check day range
+        def in_day_range(start_offset: int, end_offset: int) -> bool:
+            if day_index is None:
+                return False
+            start = current_day_index + start_offset
+            end = current_day_index + end_offset
+            return start <= day_index <= end
+
+        # Helper to check exact week
+        def in_week_offset(offset: int) -> bool:
+            if week_index is None:
+                return False
+            target_week = current_week_index + offset
+            return week_index == target_week
+
+        # Interpret hints. These are approximate by design.
+        if hint == "yesterday":
+            return in_day_range(-1, -1)
+
+        if hint == "today":
+            return in_day_range(0, 0)
+
+        if hint == "earlier_today":
+            if not in_day_range(0, 0):
+                return False
+            # Could refine later with local_hour; for now, "same day" is enough.
+            return True
+
+        if hint == "last_night":
+            # Approximate: either late yesterday or very early today.
+            if in_day_range(-1, -1):
+                return True
+            return in_day_range(0, 0)
+
+        if hint == "this_morning":
+            if not in_day_range(0, 0):
+                return False
+            # Optional: we could check local_hour < 12 if present.
+            local_hour = getattr(node, "local_hour", None)
+            if local_hour is None:
+                return True
+            return local_hour < 12
+
+        if hint == "last_week":
+            return in_week_offset(-1)
+
+        if hint == "early_last_week":
+            if not in_week_offset(-1):
+                return False
+            # Early part ~ Mon-Wed
+            if local_weekday is None:
+                return True
+            return local_weekday in (0, 1, 2)
+
+        if hint == "late_last_week":
+            if not in_week_offset(-1):
+                return False
+            # Late part ~ Thu-Sun
+            if local_weekday is None:
+                return True
+            return local_weekday in (3, 4, 5, 6)
+
+        # Unknown hint -> don't match
+        return False
+
+
+def build_neurons(orchestrator: Orchestrator):
+    cfg = NeuronConfig(
+        name=NEURON_NAME,
+        subscribed_topics=["memory/recollect"],
+        output_topics=["reason/request"],
+        priority=8,  # runs after router/introspect, before general chatter if needed
+    )
+    yield RecollectionNeuron(cfg)

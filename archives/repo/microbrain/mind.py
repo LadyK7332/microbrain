@@ -151,39 +151,11 @@ def _resolve_memdir(arg_memdir: str | None) -> str:
     CLI > MB_MEMDIR env > default ./memory
     """
     if arg_memdir:
-        resolved = arg_memdir
-    else:
-        env_memdir = os.getenv("MB_MEMDIR")
-        if env_memdir:
-            resolved = env_memdir
-        else:
-            resolved = str(Path.cwd() / "memory")
-
-    base = Path(resolved)
-    # Ensure base + expected child folders exist
-    child_dirs = [
-        "_trash",
-        "backup",
-        "emotion",
-        "motion",
-        "sight",
-        "sound",
-        "state",
-        "synapse",
-        "thought",
-        "touch",
-    ]
-
-    try:
-        base.mkdir(parents=True, exist_ok=True)
-        for d in child_dirs:
-            (base / d).mkdir(parents=True, exist_ok=True)
-    except Exception as e:
-        logger.exception("Failed to ensure memdir layout at %s: %s", base, e)
-        raise
-
-    logger.info("Resolved memdir: %s", str(base))
-    return str(base)
+        return arg_memdir
+    env_memdir = os.getenv("MB_MEMDIR")
+    if env_memdir:
+        return env_memdir
+    return str(Path.cwd() / "memory")
 
 
 def _resolve_model_path(arg_model: str | None) -> str:
