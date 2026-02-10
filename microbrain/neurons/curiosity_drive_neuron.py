@@ -179,7 +179,7 @@ class CuriosityDriveNeuron(BaseNeuron):
             await self.save_state(ctx, "curiosity_state", state)
             return []
         # Hard throttle: even if ticks line up, don't spam internal thoughts too fast.
-        min_fire_gap_s = 2.0
+        min_fire_gap_s = 3.0
         if (now - last_fire_ts) < min_fire_gap_s:
             state.update(
                 {
@@ -205,7 +205,7 @@ class CuriosityDriveNeuron(BaseNeuron):
         curiosity_text = None
 
         # Feedback-driven micro-probe: after a user correction, ask a smaller question.
-        micro_probe = (boost > 0.0)
+        micro_probe = (boost > 0.0) and (event.topic in ("clock/tick", "percept/text"))
         if micro_probe:
             node_text = ""
             if hrm is not None and isinstance(hrm_last_idx, int):
@@ -228,7 +228,7 @@ class CuriosityDriveNeuron(BaseNeuron):
                 curiosity_text = "Noted. What should I do differently? Reply in 1 short sentence."
 
             # Spend some boost so we don't keep probing forever
-            new_boost = max(0.0, boost * 0.6)  # or: boost - 0.15
+            new_boost = 0.0
             await ctx.set_kv("curiosity:boost", new_boost)
             self.debug("curiosity_boost_spent", before=boost, after=new_boost)
 
@@ -252,7 +252,17 @@ class CuriosityDriveNeuron(BaseNeuron):
             except Exception:
                 node = None
 
-            node_text = ""
+            # Walk backwards to the most recent USER node so we don't quote our own assistant output.
+            if node is not None and getattr(node, "role", "") != "user":
+                for back in range(1, 25):
+                    try:
+                        cand = hrm.get_node(hrm_last_idx - back)
+                    except Exception:
+                        cand = None
+                    if cand is not None and getattr(cand, "role", "") == "user":
+                        node = cand
+                        break
+
             if node is not None:
                 node_text = getattr(node, "text", "") or ""
                 node_text = str(node_text).strip()
