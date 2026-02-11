@@ -318,6 +318,36 @@ class CuriosityDriveNeuron(BaseNeuron):
                 "Generate one short sentence of curious babble. "
                 "Keep it under 12 words."
             )
+
+            # If this session has no mimic seed yet, borrow the latest USER turn
+            # from persistent episodic memory so babble can pick up where we left off.
+            last_user_text = (await ctx.get_kv("mimic:last_user_text", "") or "").strip()
+            if not last_user_text:
+                mem_store = await ctx.get_kv("memory:store", None)
+                if mem_store is not None:
+                    try:
+                        epi_hits = mem_store.last_episodic(n=12) or []
+                    except Exception:
+                        epi_hits = []
+                    for it in reversed(epi_hits):
+                        if not isinstance(it, dict):
+                            continue
+                        meta_i = it.get("meta") or {}
+                        if meta_i.get("control"):
+                            continue
+                        if str(meta_i.get("role", "")) == "system":
+                            continue
+                        kind_i = str(meta_i.get("kind", "") or "")
+                        if kind_i.startswith("reinforcement"):
+                            continue
+                        t_i = str(it.get("text", "") or "").strip()
+                        if not t_i:
+                            continue
+                        if t_i.startswith("USER:"):
+                            cand = t_i.split("USER:", 1)[1].strip()
+                            if cand:
+                                last_user_text = cand
+                                break
             meta2 = {
                 "boredom_active": True,
                 "allow_babble": True,
