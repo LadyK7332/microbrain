@@ -79,6 +79,10 @@ class CuriosityDriveNeuron(BaseNeuron):
         #  - and the attention controller allows internal speech (no recent external stimulus)
         #  - and we're not in a feedback pause window
         allow_babble = bool(await ctx.get_kv("attention:allow_babble", True))
+        r_pending = bool(await ctx.get_kv("control:r_pending", False))
+        if r_pending:
+            # /r menu is open; stay quiet until user resolves it.
+            return []
         gate_open = allow_babble and (not in_feedback_cooldown) and (boredom_active or boost > 0.0)
         if not gate_open:
             state.update(

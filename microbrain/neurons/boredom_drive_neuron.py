@@ -69,17 +69,17 @@ class BoredomDriveNeuron(BaseNeuron):
         dt = max(0.0, now - last_tick_ts)
 
         # Any external activity counts as stimulation: reset the "external silence" timer
-        if event.topic in ("percept/text", "percept/vision", "act/speech"):
+        if event.topic in ("percept/text", "percept/vision"):
             last_external_ts = now
             # small immediate drop on stimulation (prevents instant babble loops)
-            level = max(0.0, level - 0.15)
+            level = max(0.0, level - 0.08)
 
         idle = (now - last_external_ts) > 2.0  # grace window (gives humans a chance)
         if event.topic == "clock/tick":
             if idle:
-                level += dt * 0.01   # ~100s to go 0→1.0 if totally idle
+                level += dt * 0.07   # ~9s (3 ticks) to hit active (~0.6) at 3s tick interval
             else:
-                level -= dt * 0.02   # recovers faster when engaged
+                level -= dt * 0.05   # recovers faster when engaged
 
         # clamp
         level = max(0.0, min(1.0, level))

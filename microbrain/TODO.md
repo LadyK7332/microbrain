@@ -8,7 +8,7 @@ Effective order for key settings:
    - `--llama-backend` / `--vulkan`
    - `--voice`, `--whisper-model-path`, `--mic-device`
    - `--tts-voice`, `--tts-rate`, `--tts-volume`
-   - `--log-level`
+   - `--log-level` DEBUG ""
 
 2. **Environment variables**
    - `MB_LLAMA_MODEL`       → default model path if `--model` not given

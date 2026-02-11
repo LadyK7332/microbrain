@@ -99,6 +99,62 @@ class LLMReasonerNeuron(BaseNeuron):
         await self.save_state(ctx, "recent_utterances", history)
 
         # ------------------------------
+        # 1.5) Baseline persistent memory recall (journals)
+        # ------------------------------
+        mem_store = await ctx.get_kv("memory:store", None)
+        sem_hits: List[Dict[str, Any]] = []
+        epi_hits: List[Dict[str, Any]] = []
+        memory_block_lines: List[str] = []
+
+        if mem_store is not None and text:
+            try:
+                sem_hits = mem_store.search_semantic(text, k=5) or []
+            except Exception:
+                sem_hits = []
+            try:
+                epi_hits = mem_store.last_episodic(n=3) or []
+            except Exception:
+                epi_hits = []
+
+        def _mem_ok(it: Dict[str, Any]) -> bool:
+            meta_i = it.get("meta") or {}
+            if meta_i.get("control"):
+                return False
+            if str(meta_i.get("role", "")) == "system":
+                return False
+            kind_i = str(meta_i.get("kind", "") or "")
+            if kind_i.startswith("reinforcement"):
+                return False
+            return True
+
+        sem_hits = [it for it in sem_hits if _mem_ok(it)]
+        epi_hits = [it for it in epi_hits if _mem_ok(it)]
+
+        if sem_hits:
+            memory_block_lines.append("Relevant memory (semantic matches):")
+            for it in sem_hits:
+                meta_i = it.get("meta") or {}
+                role_i = str(meta_i.get("role", "") or "")
+                t_i = str(it.get("text", "") or "").replace("\\n", " ").strip()
+                if len(t_i) > 220:
+                    t_i = t_i[:220] + "…"
+                if role_i:
+                    memory_block_lines.append(f"- ({role_i}) {t_i}")
+                else:
+                    memory_block_lines.append(f"- {t_i}")
+
+        if epi_hits:
+            if memory_block_lines:
+                memory_block_lines.append("")
+            memory_block_lines.append("Recent episodes:")
+            for it in epi_hits:
+                t_i = str(it.get("text", "") or "").replace("\\n", " ").strip()
+                if len(t_i) > 220:
+                    t_i = t_i[:220] + "…"
+                memory_block_lines.append(f"- {t_i}")
+
+
+        # ------------------------------
         # 2) Build LLM prompt
         # ------------------------------
         prompt_lines: List[str] = []
@@ -276,6 +332,15 @@ class LLMReasonerNeuron(BaseNeuron):
                 pass
 
         prompt_lines.append("")
+        # --- Persistent journal recall (across sessions) ---
+        if memory_block_lines:
+            prompt_lines.append("")
+            prompt_lines.append(
+                "Persistent memory hints from journals (don’t quote verbatim unless asked):"
+            )
+            prompt_lines.extend(memory_block_lines)
+            prompt_lines.append("")
+
         prompt_lines.append("Recent context:")
         for line in history:
             prompt_lines.append(f"- {line}")

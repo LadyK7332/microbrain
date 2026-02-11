@@ -40,6 +40,12 @@ class MemoryLoggerNeuron(BaseNeuron):
         topic = event.topic
         payload = event.payload
 
+        # Skip control/system helper messages (menus, debug UI, etc.)
+        # These are useful operationally, but should not be stored as long-term memory.
+        if (event.meta or {}).get("control"):
+            return []
+
+
         # Normalize text + role depending on topic
         text: str = ""
         role: str = "user"
@@ -72,13 +78,20 @@ class MemoryLoggerNeuron(BaseNeuron):
         # --- Write to MemoryStore ------------------------------------------------
         try:
             if mem_store is not None:
+                # Preserve meta so recall can filter system/control noise later
+                meta_base: Dict[str, Any] = {"role": role}
+                if event.meta:
+                    for k in ("kind", "control", "channel", "source"):
+                        if k in event.meta:
+                            meta_base[k] = event.meta[k]
+
                 if topic == "percept/text":
                     # Old Agent.step only wrote episodic for user input
-                    mem_store.add_episodic(f"USER: {text}", {"role": role})
+                    mem_store.add_episodic(f"USER: {text}", meta_base)
                 elif topic == "act/speech":
                     # Old Agent.step wrote both semantic + episodic for assistant
-                    mem_store.add_semantic(text, {"role": role})
-                    mem_store.add_episodic(f"ASSISTANT: {text}", {"role": role})
+                    mem_store.add_semantic(text, meta_base)
+                    mem_store.add_episodic(f"ASSISTANT: {text}", meta_base)
         except Exception as e:
             # Keep logging failures from killing the brain
             self.debug("mem_store_error", error=str(e))

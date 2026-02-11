@@ -44,6 +44,10 @@ class HRMObserverNeuron(BaseNeuron):
         if topic not in ("percept/text", "act/speech"):
             return []
 
+        # Skip system/control messages (menus, debug, etc.)
+        if event.meta.get("control"):
+            return []
+
         # ------------------------------
         # Normalize text + role
         # ------------------------------
