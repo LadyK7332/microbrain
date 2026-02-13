@@ -79,7 +79,7 @@ class MemoryLoggerNeuron(BaseNeuron):
         try:
             if mem_store is not None:
                 # Preserve meta so recall can filter system/control noise later
-                meta_base: Dict[str, Any] = {"role": role}
+                meta_base: Dict[str, Any] = {"role": role, "schema_ver": 2}
                 if event.meta:
                     for k in ("kind", "control", "channel", "source"):
                         if k in event.meta:

@@ -227,12 +227,70 @@ class MemoryStore:
 
         # Load existing items (if any)
         for row in self.sem_file.read_all():
+            row = self._ensure_memory_schema(row)
             self.semantic.append(row)
             if self.dim is None and row.get("vec"):
                 self.dim = len(row["vec"])
 
         for row in self.epi_file.read_all():
+            row = self._ensure_memory_schema(row)
             self.episodic.append(row)
+
+
+    def _ensure_memory_schema(self, item: dict) -> dict:
+        """
+        Ensure stable schema keys exist for future multi-sense tagging.
+        This does NOT assert the senses exist yet; it only pre-creates empty slots.
+        """
+        if not isinstance(item, dict):
+            return {"schema_ver": 2, "text": str(item), "meta": {"schema_ver": 2}, "ts": time.time(),
+                    "senses_present": {"vision": False, "audio": False, "touch": False, "proprio": False},
+                    "senses": {"vision": [], "audio": [], "touch": [], "proprio": []},
+                    "sense_tags": {"vision": {"labels": [], "emb_ref": None, "assets": []},
+                                   "audio": {"labels": [], "emb_ref": None, "assets": []},
+                                   "touch": {"labels": [], "emb_ref": None, "assets": []},
+                                   "proprio": {"labels": [], "emb_ref": None, "assets": []}},
+                    "salience": {"score": 0.0, "valence": 0.0, "satisfaction": 0.0, "arousal": 0.0,
+                                 "reinforce_sum": 0.0, "reinforce_count": 0, "last_reinforced_ts": None}
+                    }
+
+        # Schema upgrade (non-destructive): ensure we are at least v2
+        try:
+            if int(item.get("schema_ver", 0) or 0) < 2:
+                item["schema_ver"] = 2
+        except Exception:
+            item["schema_ver"] = 2
+
+        meta = item.setdefault("meta", {})
+        if isinstance(meta, dict):
+            try:
+                if int(meta.get("schema_ver", 0) or 0) < 2:
+                    meta["schema_ver"] = 2
+            except Exception:
+                meta["schema_ver"] = 2
+
+        # Predeclare multi-sense slots (empty for now)
+        sp = item.setdefault("senses_present", {})
+        s = item.setdefault("senses", {})
+        st = item.setdefault("sense_tags", {})
+
+        for ch in ("vision", "audio", "touch", "proprio"):
+            sp.setdefault(ch, False)
+            s.setdefault(ch, [])
+            st.setdefault(ch, {"labels": [], "emb_ref": None, "assets": []})
+
+        # Predeclare salience/valence channels (empty defaults for now)
+        sal = item.setdefault("salience", {})
+        if isinstance(sal, dict):
+            sal.setdefault("score", 0.0)
+            sal.setdefault("valence", 0.0)
+            sal.setdefault("satisfaction", 0.0)
+            sal.setdefault("arousal", 0.0)
+            sal.setdefault("reinforce_sum", 0.0)
+            sal.setdefault("reinforce_count", 0)
+            sal.setdefault("last_reinforced_ts", None)
+
+        return item
 
     def add_semantic(self, text: str, meta: dict | None = None):
         # Try Ollama embeddings first; if unavailable, fall back to local
@@ -248,11 +306,13 @@ class MemoryStore:
             self.dim = len(vec)
 
         item = {"text": text, "vec": vec, "meta": meta or {}, "ts": time.time()}
+        item = self._ensure_memory_schema(item)
         self.semantic.append(item)
         self.sem_file.append(item)
 
     def add_episodic(self, text: str, meta: dict | None = None):
         item = {"text": text, "meta": meta or {}, "ts": time.time()}
+        item = self._ensure_memory_schema(item)
         self.episodic.append(item)
         self.epi_file.append(item)
 

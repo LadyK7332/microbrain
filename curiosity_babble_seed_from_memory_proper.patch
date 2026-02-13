@@ -1,0 +1,298 @@
+diff --git a/microbrain/neurons/curiosity_drive_neuron.py b/microbrain/neurons/curiosity_drive_neuron.py
+--- a/microbrain/neurons/curiosity_drive_neuron.py
++++ b/microbrain/neurons/curiosity_drive_neuron.py
+@@ -1,6 +1,8 @@
+ from __future__ import annotations
+
+ 
+
+ import time
+
++import json
+
++import re
+
+ from pathlib import Path
+
+ from typing import Iterable
+
+ 
+
+@@ -8,6 +10,80 @@
+ from microbrain.orchestrator.orchestrator import Orchestrator
+
+ 
+
+ NEURON_NAME = Path(__file__).stem
+
++
+
++
+
++def _tail_text_lines(path: Path, max_lines: int = 400, max_bytes: int = 512 * 1024) -> list[str]:
+
++    """Read the last ~N lines of a text file efficiently (best-effort)."""
+
++    try:
+
++        with path.open("rb") as f:
+
++            f.seek(0, 2)
+
++            size = f.tell()
+
++            start = max(0, size - max_bytes)
+
++            f.seek(start)
+
++            chunk = f.read().decode("utf-8", errors="replace")
+
++    except Exception:
+
++        return []
+
++    lines = chunk.splitlines()
+
++    # If we started mid-file, the first line may be partial.
+
++    if size > max_bytes and lines:
+
++        lines = lines[1:]
+
++    if len(lines) > max_lines:
+
++        lines = lines[-max_lines:]
+
++    return lines
+
++
+
++
+
++_TOKEN_RE = re.compile(r"[A-Za-z0-9']+|[.,!?;:]")
+
++def _tokenize_simple(text: str) -> list[str]:
+
++    return _TOKEN_RE.findall((text or "").lower())
+
++
+
++
+
++def _build_ngrams_from_text(text: str) -> tuple[dict[str, int], dict[str, int]]:
+
++    toks = [t for t in _tokenize_simple(text) if t]
+
++    unigrams: dict[str, int] = {}
+
++    bigrams: dict[str, int] = {}
+
++    for t in toks:
+
++        unigrams[t] = int(unigrams.get(t, 0)) + 1
+
++    for a, b in zip(toks, toks[1:]):
+
++        key = f"{a}|{b}"
+
++        bigrams[key] = int(bigrams.get(key, 0)) + 1
+
++    return unigrams, bigrams
+
++
+
++
+
++def _seed_text_from_memdir(memdir: Path) -> str:
+
++    """Try to find a reasonable seed string from episodic/semantic memory files."""
+
++    # 1) Prefer the most recent USER utterance from episodic.jsonl
+
++    epi = memdir / "episodic.jsonl"
+
++    for line in reversed(_tail_text_lines(epi, max_lines=600)) if epi.exists() else []:
+
++        try:
+
++            obj = json.loads(line)
+
++        except Exception:
+
++            continue
+
++        t = str(obj.get("text", "") or "").strip()
+
++        if t.startswith("USER:"):
+
++            cand = t.split("USER:", 1)[1].strip()
+
++            if cand:
+
++                return cand
+
++
+
++    # 2) Fallback: pick a recent semantic line that isn't an echo/debug blob
+
++    sem = memdir / "semantic.jsonl"
+
++    for line in reversed(_tail_text_lines(sem, max_lines=800)) if sem.exists() else []:
+
++        try:
+
++            obj = json.loads(line)
+
++        except Exception:
+
++            continue
+
++        t = str(obj.get("text", "") or "").strip()
+
++        if not t:
+
++            continue
+
++        if t.startswith("[echo:") or "echo_neuron" in t:
+
++            continue
+
++        # Heuristic: require some spaces and mostly letters/numbers
+
++        if " " not in t:
+
++            continue
+
++        letters = sum(ch.isalnum() for ch in t)
+
++        if letters / max(1, len(t)) < 0.55:
+
++            continue
+
++        return t[:240]
+
++    return ""
+
+ 
+
+ 
+
+ class CuriosityDriveNeuron(BaseNeuron):
+
+@@ -318,20 +394,53 @@
+                 "Generate one short sentence of curious babble. "
+
+                 "Keep it under 12 words."
+
+             )
+
++
+
++            # If mimic corpus is empty, seed it from persistent memory (episodic/semantic)
+
++            unigrams = await ctx.get_kv("mimic:unigrams", {}) or {}
+
++            bigrams = await ctx.get_kv("mimic:bigrams", {}) or {}
+
++            recent_phrases = await ctx.get_kv("mimic:recent_phrases", []) or []
+
++            last_user_text = (await ctx.get_kv("mimic:last_user_text", "") or "").strip()
+
++
+
++            if (not last_user_text) and (not unigrams) and (not bigrams):
+
++                try:
+
++                    from microbrain.utils.memdir import resolve_memdir_ctx
+
++                    memdir = await resolve_memdir_ctx(ctx)
+
++                    seed = _seed_text_from_memdir(memdir)
+
++                    if seed:
+
++                        last_user_text = seed
+
++                        await ctx.set_kv("mimic:last_user_text", last_user_text)
+
++                except Exception as e:
+
++                    self.debug("memory_seed_failed", err=str(e))
+
++
+
++            # Bootstrap ngrams from the seed so babble_backend can do word-walk (not pure syllables)
+
++            if last_user_text and (not unigrams or not bigrams):
+
++                uni2, bi2 = _build_ngrams_from_text(last_user_text)
+
++                if uni2:
+
++                    unigrams = uni2
+
++                    await ctx.set_kv("mimic:unigrams", unigrams)
+
++                if bi2:
+
++                    bigrams = bi2
+
++                    await ctx.set_kv("mimic:bigrams", bigrams)
+
++
+
++            prompt2 = prompt
+
++            if last_user_text:
+
++                # babble_backend also looks for USER: lines in the prompt
+
++                prompt2 = f"USER: {last_user_text}\n" + prompt
+
++
+
+             meta2 = {
+
+                 "boredom_active": True,
+
+                 "allow_babble": True,
+
+                 "source": "curiosity_drive",
+
+                 "boost": boost,
+
+                 "mimic": {
+
+-                    "unigrams": await ctx.get_kv("mimic:unigrams", {}) or {},
+
+-                    "bigrams": await ctx.get_kv("mimic:bigrams", {}) or {},
+
+-                    "recent_phrases": await ctx.get_kv("mimic:recent_phrases", []) or [],
+
+-                    "last_user_text": await ctx.get_kv("mimic:last_user_text", "") or "",
+
++                    "unigrams": unigrams,
+
++                    "bigrams": bigrams,
+
++                    "recent_phrases": recent_phrases,
+
++                    "last_user_text": last_user_text,
+
+                 },
+
+             }
+
+ 
+
+-            babble = (await babble_generate(prompt, meta2)).strip()
+
++            babble = (await babble_generate(prompt2, meta2)).strip()
+
+             if not babble:
+
+                 return []
+
+ 
+

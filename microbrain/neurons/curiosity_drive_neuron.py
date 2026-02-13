@@ -319,14 +319,18 @@ class CuriosityDriveNeuron(BaseNeuron):
                 "Keep it under 12 words."
             )
 
-            # If this session has no mimic seed yet, borrow the latest USER turn
-            # from persistent episodic memory so babble can pick up where we left off.
+            # Pull current mimic corpus
+            unigrams = await ctx.get_kv("mimic:unigrams", {}) or {}
+            bigrams = await ctx.get_kv("mimic:bigrams", {}) or {}
+            recent_phrases = await ctx.get_kv("mimic:recent_phrases", []) or []
             last_user_text = (await ctx.get_kv("mimic:last_user_text", "") or "").strip()
+
+            # Cold-start: if we have no seed yet, borrow the most recent USER turn from persistent episodic memory
             if not last_user_text:
                 mem_store = await ctx.get_kv("memory:store", None)
                 if mem_store is not None:
                     try:
-                        epi_hits = mem_store.last_episodic(n=12) or []
+                        epi_hits = mem_store.last_episodic(n=25) or []
                     except Exception:
                         epi_hits = []
                     for it in reversed(epi_hits):
@@ -335,32 +339,58 @@ class CuriosityDriveNeuron(BaseNeuron):
                         meta_i = it.get("meta") or {}
                         if meta_i.get("control"):
                             continue
-                        if str(meta_i.get("role", "")) == "system":
-                            continue
-                        kind_i = str(meta_i.get("kind", "") or "")
-                        if kind_i.startswith("reinforcement"):
-                            continue
+                        role_i = str(meta_i.get("role", "") or "")
                         t_i = str(it.get("text", "") or "").strip()
                         if not t_i:
                             continue
+
+                        # tolerate "USER:" prefixed formats too
                         if t_i.startswith("USER:"):
-                            cand = t_i.split("USER:", 1)[1].strip()
-                            if cand:
-                                last_user_text = cand
-                                break
+                            t_i = t_i.split("USER:", 1)[1].strip()
+                            role_i = "user"
+
+                        if role_i == "user" and t_i:
+                            last_user_text = t_i
+                            break
+
+            # If corpus is empty, bootstrap basic ngrams from the seed so babble isn't pure syllables
+            if last_user_text and (not unigrams or not bigrams):
+                cleaned = "".join(ch.lower() if (ch.isalnum() or ch == "'") else " " for ch in last_user_text)
+                toks = [t for t in cleaned.split() if t]
+
+                if toks and not unigrams:
+                    unigrams = {}
+                    for t in toks:
+                        unigrams[t] = int(unigrams.get(t, 0)) + 1
+                    await ctx.set_kv("mimic:unigrams", unigrams)
+
+                if len(toks) > 1 and not bigrams:
+                    bigrams = {}
+                    for a, b in zip(toks, toks[1:]):
+                        k = f"{a}|{b}"
+                        bigrams[k] = int(bigrams.get(k, 0)) + 1
+                    await ctx.set_kv("mimic:bigrams", bigrams)
+
+                await ctx.set_kv("mimic:last_user_text", last_user_text)
+
+            # babble_backend also keys off USER: lines in the prompt
+            prompt2 = prompt
+            if last_user_text:
+                prompt2 = f"USER: {last_user_text}\n" + prompt
+
             meta2 = {
                 "boredom_active": True,
                 "allow_babble": True,
                 "source": "curiosity_drive",
                 "boost": boost,
                 "mimic": {
-                    "unigrams": await ctx.get_kv("mimic:unigrams", {}) or {},
-                    "bigrams": await ctx.get_kv("mimic:bigrams", {}) or {},
-                    "recent_phrases": await ctx.get_kv("mimic:recent_phrases", []) or [],
-                    "last_user_text": await ctx.get_kv("mimic:last_user_text", "") or "",
+                    "unigrams": unigrams,
+                    "bigrams": bigrams,
+                    "recent_phrases": recent_phrases,
+                    "last_user_text": last_user_text,
                 },
             }
-
+            
             babble = (await babble_generate(prompt, meta2)).strip()
             if not babble:
                 return []
