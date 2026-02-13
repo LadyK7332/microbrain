@@ -90,8 +90,18 @@ class MemoryLoggerNeuron(BaseNeuron):
                     mem_store.add_episodic(f"USER: {text}", meta_base)
                 elif topic == "act/speech":
                     # Old Agent.step wrote both semantic + episodic for assistant
-                    mem_store.add_semantic(text, meta_base)
-                    mem_store.add_episodic(f"ASSISTANT: {text}", meta_base)
+                    sal = None
+                    if str(meta_base.get("kind", "") or "") == "curiosity_babble":
+                        # Mandatory negative bias for random chatter unless later reinforced
+                        sal = {
+                            "score": 0.0,
+                            "valence": -0.15,
+                            "satisfaction": -0.25,
+                            "arousal": 0.05,
+                        }
+
+                    mem_store.add_semantic(text, meta_base, salience=sal)
+                    mem_store.add_episodic(f"ASSISTANT: {text}", meta_base, salience=sal)
         except Exception as e:
             # Keep logging failures from killing the brain
             self.debug("mem_store_error", error=str(e))

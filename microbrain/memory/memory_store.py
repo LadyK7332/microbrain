@@ -292,7 +292,7 @@ class MemoryStore:
 
         return item
 
-    def add_semantic(self, text: str, meta: dict | None = None):
+    def add_semantic(self, text: str, meta: dict | None = None, salience: dict | None = None):
         # Try Ollama embeddings first; if unavailable, fall back to local
         try:
             if self.embedder:
@@ -306,12 +306,16 @@ class MemoryStore:
             self.dim = len(vec)
 
         item = {"text": text, "vec": vec, "meta": meta or {}, "ts": time.time()}
+        if salience is not None:
+            item["salience"] = salience
         item = self._ensure_memory_schema(item)
-        self.semantic.append(item)
+        self.semantic.append(item)        
         self.sem_file.append(item)
 
-    def add_episodic(self, text: str, meta: dict | None = None):
+    def add_episodic(self, text: str, meta: dict | None = None, salience: dict | None = None):
         item = {"text": text, "meta": meta or {}, "ts": time.time()}
+        if salience is not None:
+            item["salience"] = salience
         item = self._ensure_memory_schema(item)
         self.episodic.append(item)
         self.epi_file.append(item)
