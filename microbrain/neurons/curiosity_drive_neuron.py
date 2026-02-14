@@ -64,6 +64,27 @@ class CuriosityDriveNeuron(BaseNeuron):
         )
         in_feedback_cooldown = now < feedback_cooldown_until
 
+        # Post-user-input quiet window:
+        # After percept/text (UI/user/minecraft/etc), suppress curiosity/babble for N seconds.
+        # If more input arrives, extend the window. Also extend after an assistant reply so the
+        # quiet window effectively starts *after* the reply, not at keypress-time.
+        user_pause_s = float(await ctx.get_kv("curiosity:user_pause_s", 8.0) or 8.0)
+
+        if event.topic == "percept/text":
+            src = str((event.payload or {}).get("source", "") or "")
+            if src not in ("assistant", "system", "mb"):
+                prev_until = float(await ctx.get_kv("curiosity:user_quiet_until", 0.0) or 0.0)
+                await ctx.set_kv("curiosity:user_quiet_until", max(prev_until, now + user_pause_s))
+
+        elif event.topic == "act/speech":
+            # Any non-curiosity speech counts as a "reply" — hold off babble right after.
+            if event.source != self.name:
+                prev_until = float(await ctx.get_kv("curiosity:user_quiet_until", 0.0) or 0.0)
+                await ctx.set_kv("curiosity:user_quiet_until", max(prev_until, now + user_pause_s))
+
+        user_quiet_until = float(await ctx.get_kv("curiosity:user_quiet_until", 0.0) or 0.0)
+        in_user_quiet = now < user_quiet_until
+
         # Read boredom drive state (optional; defaults to "not bored")
         boredom = await ctx.get_kv("drive:boredom", None)
         boredom_level = 0.0
@@ -83,7 +104,14 @@ class CuriosityDriveNeuron(BaseNeuron):
         if r_pending:
             # /r menu is open; stay quiet until user resolves it.
             return []
-        gate_open = allow_babble and (not in_feedback_cooldown) and (boredom_active or boost > 0.0)
+        
+        gate_open = (
+            allow_babble
+            and (not in_feedback_cooldown)
+            and (not in_user_quiet)
+            and (boredom_active or boost > 0.0)
+        )
+
         if not gate_open:
             state.update(
                 {
@@ -96,6 +124,8 @@ class CuriosityDriveNeuron(BaseNeuron):
             await self.save_state(ctx, "curiosity_state", state)
             self.debug(
                 "curiosity_gate_closed",
+                in_user_quiet=in_user_quiet,
+                user_quiet_until=user_quiet_until,
                 boredom_active=boredom_active,
                 allow_babble=allow_babble,
                 in_feedback_cooldown=in_feedback_cooldown,

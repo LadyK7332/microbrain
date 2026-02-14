@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Iterable, List
+
+from microbrain.utils.memdir import resolve_memdir_ctx
 
 from microbrain.orchestrator.neuron_base import BaseNeuron, NeuronConfig, Event
 from microbrain.orchestrator.orchestrator import Orchestrator
@@ -44,6 +48,31 @@ class LLMReasonerNeuron(BaseNeuron):
         pdna_profile = await ctx.get_kv("pdna:profile", None)
         pdna_last = await ctx.get_kv("pdna:last", None)
 
+                # Display names (for prompt shaping)
+        assistant_name = "MicroBrain"
+        try:
+            if pdna_profile is not None and getattr(pdna_profile, "name", None):
+                assistant_name = str(pdna_profile.name)
+        except Exception:
+            pass
+
+        user_name = await ctx.get_kv("profile:user_name", None)
+        if not user_name:
+            try:
+                memdir = await resolve_memdir_ctx(ctx)
+                user_profile_path = Path(memdir) / "state" / "user_profile.json"
+                if user_profile_path.exists():
+                    data = json.loads(user_profile_path.read_text(encoding="utf-8"))
+                    user_name = str(data.get("user_name", "") or "").strip() or None
+                    if user_name:
+                        await ctx.set_kv("profile:user_name", user_name)
+            except Exception:
+                pass
+
+        user_label = user_name or "User"
+        assistant_label = assistant_name or "MicroBrain"
+
+
         # Optional: HRM core and last node index for associative recall
         hrm = await ctx.get_kv("hrm:core", None)
         hrm_last_idx = await ctx.get_kv("hrm:last_idx", None)
@@ -76,8 +105,12 @@ class LLMReasonerNeuron(BaseNeuron):
             )
             return []
 
-        source = str(payload.get("source", "user"))
-        channel = str(payload.get("channel", "default"))
+        transport_source = str(payload.get("source", "user") or "user")
+        source = transport_source
+        if source not in ("user", "assistant", "system"):
+            source = "user"
+
+        channel = str(payload.get("channel", "default") or "default")
         raw_meta: Dict[str, Any] = payload.get("raw_meta", {}) or {}
 
         # ------------------------------
@@ -159,7 +192,7 @@ class LLMReasonerNeuron(BaseNeuron):
         # ------------------------------
         prompt_lines: List[str] = []
         prompt_lines.append(
-            "You are MicroBrain's reasoning core. Respond conversationally and concisely. "
+            f"You are {assistant_label}, MicroBrain's reasoning core. Respond conversationally and concisely. "
             "Keep replies short (1–4 sentences) unless the user explicitly asks for a long story or detailed explanation. "
             "Do not repeat the user's message verbatim, and avoid repeating the same sentence multiple times."
         )
@@ -345,9 +378,27 @@ class LLMReasonerNeuron(BaseNeuron):
         for line in history:
             prompt_lines.append(f"- {line}")
         prompt_lines.append("")
-        prompt_lines.append(f"User ({source}, {channel}) says: {text}")
+                # Pattern recall (spreading activation) — compact "what comes to mind"
+        recall = await ctx.get_kv("recall:last_bundle", None)
+        if isinstance(recall, dict):
+            top = recall.get("top_concepts", [])
+            if isinstance(top, list) and top:
+                prompt_lines.append("")
+                prompt_lines.append("What comes to mind (pattern recall):")
+                for item in top[:8]:
+                    if not isinstance(item, dict):
+                        continue
+                    label = str(item.get("label", "") or "")
+                    cid = str(item.get("concept_id", "") or "")
+                    score = item.get("score", 0.0)
+                    sal = item.get("salience", {}) or {}
+                    sat = sal.get("satisfaction", 0.0)
+                    # keep it short and non-spammy
+                    prompt_lines.append(f"- {label} ({cid}) score={score} sat={sat}")
+
+        prompt_lines.append(f"{user_label} says: {text}")
         prompt_lines.append("")
-        prompt_lines.append("Your reply:")
+        prompt_lines.append(f"{assistant_label} reply:")
 
         prompt = "\n".join(prompt_lines)
 
@@ -383,8 +434,11 @@ class LLMReasonerNeuron(BaseNeuron):
         # ------------------------------
         meta = {
             "source": source,
+            "transport_source": transport_source,
             "channel": channel,
             "raw_meta": raw_meta,
+            "user_name": user_label,
+            "assistant_name": assistant_label,
         }
         if crisis_mode:
             meta["crisis_mode"] = True

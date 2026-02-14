@@ -484,20 +484,46 @@ class TextRouterNeuron(BaseNeuron):
                 meta={"kind": "recollection_request"},
             )]
         # ------------------------------
-        # 2) Fast-path greetings
+        # 2) Greetings: warmup fast-path, then defer to learned behavior
         # ------------------------------
         if lowered in ("hi", "hello", "hey", "yo"):
+            # Prefer the /user display name when available
+            user_name = await ctx.get_kv("profile:user_name", None)
+            user_label = str(user_name).strip() if user_name else "there"
+
+            # Phase out canned greetings as semantic memory grows
+            mem_store = await ctx.get_kv("memory:store", None)
+            try:
+                semantic_n = len(getattr(mem_store, "semantic", [])) if mem_store else 0
+            except Exception:
+                semantic_n = 0
+
+            warmup_max = int(await ctx.get_kv("router:greet_warmup_semantic_max", 50) or 50)
+
+            if semantic_n < warmup_max:
+                await ctx.log_debug(
+                    f"[{self.name}] Handling greeting locally (warmup)",
+                    text=text,
+                    channel=channel,
+                    semantic_n=semantic_n,
+                    warmup_max=warmup_max,
+                )
+                return [self._speech(
+                    f"Hey, {user_label}! What's up?",
+                    channel=channel,
+                    style="assistant",
+                    event=event,
+                )]
+
+            # Past warmup: let the reasoner handle it (learned/personalized)
             await ctx.log_debug(
-                f"[{self.name}] Handling greeting locally",
+                f"[{self.name}] Greeting forwarded to LLM (post-warmup)",
                 text=text,
                 channel=channel,
+                semantic_n=semantic_n,
+                warmup_max=warmup_max,
             )
-            return [self._speech(
-                f"Hey, {source}! What's up?",
-                channel=channel,
-                style="assistant",
-                event=event,
-            )]
+            # fall through to default forwarding
 
         # ------------------------------
         # 3) Default: forward to LLM

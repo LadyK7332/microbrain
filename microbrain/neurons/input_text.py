@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import json
+import re
 import time
 import uuid
+from pathlib import Path
 
-from typing import Iterable, Any, Dict, List
+from typing import Iterable, Any, Dict, List, Optional
+
+
+from microbrain.utils.memdir import resolve_memdir_ctx
 
 from microbrain.orchestrator.neuron_base import BaseNeuron, NeuronConfig, Event
 from microbrain.orchestrator.orchestrator import Orchestrator
@@ -77,6 +83,13 @@ class TextInputNeuron(BaseNeuron):
         source = merged_meta.get("source", "user")
         channel = merged_meta.get("channel", "default")
 
+        # Canonicalize transport sources so "ui" doesn't become a persona/name in memory/prompts.
+        transport_source = str(source or "user")
+        if transport_source not in ("user", "assistant", "system"):
+            # UI / CLI / bridges are still the human user.
+            source = "user"
+        merged_meta["transport_source"] = transport_source
+
         # ----------------------------------------------
         # 2.5) Reinforcement snapshot latch (/r ...)
         # ----------------------------------------------
@@ -101,6 +114,24 @@ class TextInputNeuron(BaseNeuron):
                 correlation_id=event.correlation_id,
             )
 
+        # Handle /user commands here so they don't become percept/text.
+        if text_norm.startswith("/user"):
+            return await self._handle_user_command(
+                cmd_text=text_norm,
+                ctx=ctx,
+                channel=channel,
+                correlation_id=event.correlation_id,
+            )
+
+
+        # Attach current speaker identity (noun_id) for downstream binding/recall.
+        if source == "user":
+            noun_id = await ctx.get_kv("context:user_noun_id", None)
+            noun_label = await ctx.get_kv("context:user_label", None)
+            if noun_id:
+                merged_meta.setdefault("noun_id", noun_id)
+            if noun_label:
+                merged_meta.setdefault("noun_label", noun_label)
 
         # ----------------------------------------------
         # 3) Construct normalized percept payload
@@ -133,6 +164,156 @@ class TextInputNeuron(BaseNeuron):
         )
 
         return [percept_event]
+
+
+    # ------------------------------------------------------------------
+    # /user: set a preferred user display name (used by the reasoning prompt)
+    # ------------------------------------------------------------------
+    async def _handle_user_command(
+        self,
+        cmd_text: str,
+        ctx,
+        channel: str,
+        correlation_id: str,
+    ) -> List[Event]:
+        parts = cmd_text.strip().split(maxsplit=1)
+        arg = parts[1].strip() if len(parts) > 1 else ""
+
+        memdir = await resolve_memdir_ctx(ctx)
+        state_dir = Path(memdir) / "state"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        user_profile_path = state_dir / "user_profile.json"
+
+        if not arg:
+            current = await ctx.get_kv("profile:user_name", None)
+            if not current and user_profile_path.exists():
+                try:
+                    current = json.loads(user_profile_path.read_text(encoding="utf-8")).get("user_name")
+                except Exception:
+                    current = None
+
+            msg = (
+                f"User name is set to '{current}'."
+                if current
+                else "User name not set. Use `/user Hazard` (or `/user clear`)."
+            )
+            return [self._speech_control(msg, channel=channel, correlation_id=correlation_id)]
+
+        if arg.lower() in ("clear", "reset", "none", "off"):
+            await ctx.set_kv("profile:user_name", None)
+            try:
+                if user_profile_path.exists():
+                    user_profile_path.unlink()
+            except Exception:
+                pass
+            return [self._speech_control("User name cleared.", channel=channel, correlation_id=correlation_id)]
+
+        # Basic sanitation (keep it simple + safe)
+        name = arg.strip().strip('"').strip("'")
+        if len(name) > 48:
+            name = name[:48]
+
+        await ctx.set_kv("profile:user_name", name)
+
+        try:
+            user_profile_path.write_text(
+                json.dumps({"user_name": name, "ts": time.time()}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+        return [self._speech_control(f"Got it. I'll call you '{name}'.", channel=channel, correlation_id=correlation_id)]
+
+        # ------------------------------------------------------------------
+    # /user: set current speaker identity (noun_id)
+    # ------------------------------------------------------------------
+    async def _handle_user_command(
+        self,
+        cmd_text: str,
+        ctx,
+        channel: str,
+        correlation_id: str,
+    ) -> List[Event]:
+        """
+        Supported:
+          /user Hazard        -> set user label + noun_id (noun:hazard)
+          /user clear         -> clear user label + noun_id
+          /user               -> show current user label + noun_id
+        """
+        line = (cmd_text or "").strip()
+        parts = line.split(maxsplit=1)  # "/user", "<arg...>"
+
+        current_label = await ctx.get_kv("context:user_label", None)
+        current_noun = await ctx.get_kv("context:user_noun_id", None)
+
+        if len(parts) == 1:
+            label = str(current_label or "").strip() or "(unset)"
+            noun = str(current_noun or "").strip() or "(unset)"
+            msg = f"Current user: {label}  ({noun})\nUsage: /user <name>  or  /user clear"
+            return [self._speech_user_profile(msg, channel=channel, correlation_id=correlation_id)]
+
+        arg = (parts[1] or "").strip()
+        if not arg:
+            return [self._speech_user_profile("Usage: /user <name>  or  /user clear", channel=channel, correlation_id=correlation_id)]
+
+        if arg.lower() in ("clear", "reset", "none", "off"):
+            await ctx.set_kv("context:user_label", None)
+            await ctx.set_kv("context:user_noun_id", None)
+            await self._persist_user_profile(ctx, label=None, noun_id=None)
+            return [self._speech_user_profile("User identity cleared.", channel=channel, correlation_id=correlation_id)]
+
+        label = arg
+        noun_id = self._noun_id_from_label(label)
+
+        await ctx.set_kv("context:user_label", label)
+        await ctx.set_kv("context:user_noun_id", noun_id)
+        await self._persist_user_profile(ctx, label=label, noun_id=noun_id)
+
+        return [self._speech_user_profile(f"User set to: {label}  ({noun_id})", channel=channel, correlation_id=correlation_id)]
+
+    async def _persist_user_profile(self, ctx, label: Optional[str], noun_id: Optional[str]) -> None:
+        """Best-effort persistence into memdir/state/user_profile.json"""
+        try:
+            mem_store = await ctx.get_kv("memory:store", None)
+            base_dir = str(getattr(mem_store, "base_dir", "") or "")
+            if not base_dir:
+                return
+            state_dir = Path(base_dir) / "state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "speaker_noun_id": noun_id,
+                "speaker_label": label,
+                "ts": time.time(),
+                "schema_ver": 1,
+                "kind": "user_profile",
+            }
+            (state_dir / "user_profile.json").write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            return
+
+    def _noun_id_from_label(self, label: str) -> str:
+        """Convert freeform label -> stable noun_id."""
+        s = (label or "").strip().lower()
+        s = re.sub(r"\s+", "_", s)
+        s = re.sub(r"[^a-z0-9_\-\.]+", "", s)
+        s = s.strip("._-")
+        if not s:
+            s = "user"
+        return f"noun:{s}"
+
+    def _speech_user_profile(self, text: str, channel: str, correlation_id: str) -> Event:
+        return Event(
+            topic="act/speech",
+            payload={"text": text, "style": "system", "channel": channel},
+            source=self.name,
+            correlation_id=correlation_id,
+            meta={"control": True, "kind": "user_profile"},
+        )
+
 
     # ------------------------------------------------------------------
     # /r reinforcement: ephemeral snapshot menu + apply weight + clear
@@ -293,17 +474,32 @@ class TextInputNeuron(BaseNeuron):
             {"ts": time.time(), "weight": weight, "target": target, "nonce": snap.get("nonce")},
         )
 
+        reinforce_event = Event(
+            topic="control/reinforce",
+            payload={
+                "ts": time.time(),
+                "weight": weight,
+                "target_role": snap.get("role"),
+                "target": target,
+                "nonce": snap.get("nonce"),
+            },
+            source=self.name,
+            correlation_id=correlation_id,
+            meta={"control": True, "kind": "reinforcement"},
+        )
+
         # Clear snapshot + resume
         await ctx.set_kv("control:r_snapshot", None)
         await ctx.set_kv("control:r_pending", False)
         await ctx.set_kv("attention:allow_babble", True)
 
         return [
+            reinforce_event,
             self._speech_control(
                 f"Applied {weight:+d} to item #{which}. Snapshot cleared. Resuming.",
                 channel=channel,
                 correlation_id=correlation_id,
-            )
+            ),
         ]
 
     def _hrm_recent_items(self, hrm, want_role: str, n: int) -> List[Dict[str, Any]]:

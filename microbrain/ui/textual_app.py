@@ -6,8 +6,12 @@ This module is UI-only. The orchestrator integration lives in `textual_bridge.py
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Awaitable, Callable, Optional
+
+from microbrain.utils.memdir import resolve_memdir_cli
 
 from textual.app import App, ComposeResult
 from textual.containers import Vertical
@@ -64,6 +68,10 @@ class MicroBrainUI(App):
         self._send_cb = send_cb
         self._recv_q = recv_q
 
+        # Speaker labels (loaded from memdir on mount)
+        self._assistant_label = "MB"
+        self._user_label = "you"
+
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Vertical():
@@ -71,12 +79,50 @@ class MicroBrainUI(App):
             yield Input(placeholder="Type here…", id="input")
         yield Footer()
 
+    def _load_labels_from_memdir(self) -> None:
+        """Load assistant/user display labels from memdir JSON files."""
+        try:
+            memdir = resolve_memdir_cli(None)
+        except Exception:
+            memdir = Path.cwd() / "memory"
+
+        # Assistant label from PDNA profile
+        try:
+            pdna_path = memdir / "pdna_profile.json"
+            if pdna_path.exists():
+                data = json.loads(pdna_path.read_text(encoding="utf-8"))
+                name = str(data.get("name", "") or "").strip()
+                if name:
+                    self._assistant_label = name
+        except Exception:
+            pass
+
+        # User label from /user persistent profile (optional)
+        try:
+            user_path = memdir / "state" / "user_profile.json"
+            if user_path.exists():
+                data = json.loads(user_path.read_text(encoding="utf-8"))
+                uname = str(data.get("user_name", "") or "").strip()
+                if uname:
+                    self._user_label = uname
+        except Exception:
+            pass
+
+        # Tiny sanitization so Textual markup can't get weird
+        self._assistant_label = self._assistant_label.replace("[", "(").replace("]", ")")
+        self._user_label = self._user_label.replace("[", "(").replace("]", ")")
+
     async def on_mount(self) -> None:
         # Poll for inbound messages without blocking the UI loop.
         self.set_interval(0.05, self._drain_recv_queue)
 
         # A tiny hello so it's obvious the UI started.
-        self.query_one("#log", RichLog).write("[b]MicroBrain UI online.[/b]  (/quit to close)")
+        self._load_labels_from_memdir()
+
+        # A tiny hello so it's obvious the UI started.
+        self.query_one("#log", RichLog).write(
+            f"[b]{self._assistant_label} UI online.[/b]  (/quit to close)"
+        )
 
     async def _drain_recv_queue(self) -> None:
         if self._recv_q is None:
@@ -99,7 +145,7 @@ class MicroBrainUI(App):
                 text = payload
 
             if msg.topic == "act/speech" and text is not None:
-                log.write(f"[cyan]mb>[/cyan] {text}")
+                log.write(f"[cyan]{self._assistant_label}>[/cyan] {text}")
             else:
                 # Keep it lightweight; show topic and a short payload preview.
                 preview = str(payload)
@@ -114,7 +160,16 @@ class MicroBrainUI(App):
             return
 
         log = self.query_one("#log", RichLog)
-        log.write(f"[green]you>[/green] {text}")
+        
+        # Local UI label update for /user so it feels immediate (no restart needed)
+        if text.lower().startswith("/user "):
+            new_name = text.split(" ", 1)[1].strip().strip('"').strip("'")
+            if new_name and new_name.lower() not in ("clear", "reset", "none", "off"):
+                self._user_label = new_name.replace("[", "(").replace("]", ")")
+            elif new_name.lower() in ("clear", "reset", "none", "off"):
+                self._user_label = "you"
+
+        log.write(f"[green]{self._user_label}>[/green] {text}")
 
         # Local quit command so you can always bail out, even if neurons are weird.
         if text.lower() in {"/quit", "/exit"}:

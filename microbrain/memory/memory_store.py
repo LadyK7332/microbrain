@@ -339,9 +339,31 @@ class MemoryStore:
         except Exception:
             qv = _local_embed(query)
 
-        scored = [(self._cosine(qv, it["vec"]), it) for it in self.semantic]
+        scored = []
+        for it in self.semantic:
+            sim = self._cosine(qv, it.get("vec", []))
+            sal = it.get("salience") or {}
+            try:
+                satisfaction = float(sal.get("satisfaction", 0.0) or 0.0)
+            except Exception:
+                satisfaction = 0.0
+            try:
+                valence = float(sal.get("valence", 0.0) or 0.0)
+            except Exception:
+                valence = 0.0
+            try:
+                score = float(sal.get("score", 0.0) or 0.0)
+            except Exception:
+                score = 0.0
+
+            # Salience shaping:
+            # - unreinforced babble has negative satisfaction, so it sinks a bit
+            # - reinforced items (positive satisfaction) rise
+            adj = sim + (0.30 * satisfaction) + (0.10 * valence) + (0.10 * score)
+            scored.append((adj, sim, it))
+
         scored.sort(key=lambda x: -x[0])
-        return [it for _, it in scored[:k]]
+        return [it for _, __, it in scored[:k]]
 
     def last_episodic(self, n: int = 3) -> list[dict]:
         return self.episodic[-n:]
