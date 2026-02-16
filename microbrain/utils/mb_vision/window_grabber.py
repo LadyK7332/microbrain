@@ -46,6 +46,19 @@ def list_windows() -> list[WindowInfo]:
                 continue
             if w.width <= 0 or w.height <= 0:
                 continue
+
+            # Skip minimized windows (often report -32000/-32000 and can crash mss grabs)
+            try:
+                if bool(getattr(w, "isMinimized", False)):
+                    continue
+            except Exception:
+                pass
+            try:
+                if int(w.left) <= -32000 and int(w.top) <= -32000:
+                    continue
+            except Exception:
+                pass
+
             # Some windows return negative coords briefly; allow but clamp later on grab.
             wins.append(WindowInfo(title=title, left=int(w.left), top=int(w.top), width=int(w.width), height=int(w.height)))
         except Exception:
@@ -83,18 +96,46 @@ def grab_bgr(rect: dict[str, int]):
     import mss
     import numpy as np
 
-    # Clamp width/height to sane values
-    mon = {
-        "left": int(rect.get("left", 0)),
-        "top": int(rect.get("top", 0)),
-        "width": max(1, int(rect.get("width", 1))),
-        "height": max(1, int(rect.get("height", 1))),
-    }
+    left = int(rect.get("left", 0))
+    top = int(rect.get("top", 0))
+    width = max(1, int(rect.get("width", 1)))
+    height = max(1, int(rect.get("height", 1)))
+
+    # Minimized / invalid coords guard (prevents native crash)
+    if left <= -32000 and top <= -32000:
+        raise ValueError("window appears minimized/invalid (left/top ~ -32000)")
 
     with mss.mss() as sct:
-        img = np.array(sct.grab(mon))  # BGRA
-        frame = img[:, :, :3]          # BGR
-        return frame
+        vb = sct.monitors[0]  # virtual desktop (multi-monitor safe)
+        vleft = int(vb.get("left", 0))
+        vtop = int(vb.get("top", 0))
+        vright = vleft + int(vb.get("width", 0))
+        vbottom = vtop + int(vb.get("height", 0))
+
+        if vright <= vleft or vbottom <= vtop:
+            raise ValueError(f"invalid virtual desktop bounds: {vb!r}")
+
+        # Intersect requested rect with virtual desktop bounds
+        right = left + width
+        bottom = top + height
+
+        ileft = max(vleft, left)
+        itop = max(vtop, top)
+        iright = min(vright, right)
+        ibottom = min(vbottom, bottom)
+
+        if iright <= ileft or ibottom <= itop:
+            raise ValueError(f"capture rect outside virtual desktop: rect={rect!r} virtual={vb!r}")
+
+        mon = {"left": ileft, "top": itop, "width": int(iright - ileft), "height": int(ibottom - itop)}
+
+        with mss.mss() as sct:
+            try:
+                img = np.array(sct.grab(mon))  # BGRA
+            except Exception as e:
+                return None  # caller should log + skip this tick
+            frame = img[:, :, :3]          # BGR
+            return frame
 
 
 def save_jpeg(frame_bgr, out_path: str, quality: int = 85) -> None:

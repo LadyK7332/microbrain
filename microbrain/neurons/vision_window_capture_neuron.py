@@ -81,12 +81,40 @@ class VisionWindowCaptureNeuron(BaseNeuron):
             self.debug("vision_preview_set", enabled=False)
             return []
         if action == "select":
+            # Prefer cached window payload (prevents re-enumeration hangs/crashes)
+            win = payload.get("window", None)
+            if isinstance(win, dict) and isinstance(win.get("rect"), dict):
+                title = str(win.get("title", "") or "")
+                rect_in = win.get("rect") or {}
+                rect = {
+                    "left": int(rect_in.get("left", 0)),
+                    "top": int(rect_in.get("top", 0)),
+                    "width": int(rect_in.get("width", 1)),
+                    "height": int(rect_in.get("height", 1)),
+                }
+                await ctx.set_kv(
+                    "vision:window",
+                    {
+                        "title": title,
+                        "rect": rect,
+                        "ts": time.time(),
+                    },
+                )
+                self.debug("vision_selected", title=title, rect=rect, mode="cached")
+                return []
+
+            # Fallback: old selector behavior
             selector = str(payload.get("selector", "") or "").strip()
+            if not selector:
+                self.debug("vision_select_failed", selector=selector, reason="no selector/window")
+                return []
+
             wins = list_windows()
             chosen = pick_window(wins, selector)
             if not chosen:
                 self.debug("vision_select_failed", selector=selector, count=len(wins))
                 return []
+
             await ctx.set_kv(
                 "vision:window",
                 {
@@ -95,7 +123,7 @@ class VisionWindowCaptureNeuron(BaseNeuron):
                     "ts": time.time(),
                 },
             )
-            self.debug("vision_selected", title=chosen.title, rect=chosen.rect)
+            self.debug("vision_selected", title=chosen.title, rect=chosen.rect, mode="selector")
             return []
 
         if action == "list":
@@ -164,7 +192,11 @@ class VisionWindowCaptureNeuron(BaseNeuron):
         try:
             frame = grab_bgr(rect)
         except Exception as e:
-            self.debug("vision_capture_error", err=repr(e))
+            self.debug("vision_capture_error", err=repr(e), rect=rect)
+            return []
+
+        if frame is None:
+            self.debug("vision_capture_empty", rect=rect)
             return []
 
         h, w = frame.shape[:2]

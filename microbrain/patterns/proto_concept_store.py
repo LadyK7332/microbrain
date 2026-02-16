@@ -48,7 +48,7 @@ class ProtoConceptStore:
         self.memdir.mkdir(parents=True, exist_ok=True)
 
         self.modality = str(modality or "vision")
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()  # re-entrant: assign() -> best_match()
         self._log = JSONLStore(str(self.memdir / "proto_concepts.jsonl"))
 
         self._protos: dict[str, ProtoConcept] = {}

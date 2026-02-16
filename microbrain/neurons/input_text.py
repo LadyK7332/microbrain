@@ -123,6 +123,24 @@ class TextInputNeuron(BaseNeuron):
                 correlation_id=event.correlation_id,
             )
 
+        # Handle /vision commands here so they don't become percept/text (babble can't see them).
+        if text_norm.startswith("/vision"):
+            return await self._handle_vision_command(
+                cmd_text=text_norm,
+                ctx=ctx,
+                channel=channel,
+                correlation_id=event.correlation_id,
+            )
+
+        # Handle /focus commands here so they don't become percept/text (babble can't see them).
+        if text_norm.startswith("/focus"):
+            return await self._handle_focus_command(
+                cmd_text=text_norm,
+                ctx=ctx,
+                channel=channel,
+                correlation_id=event.correlation_id,
+            )
+
 
         # Attach current speaker identity (noun_id) for downstream binding/recall.
         if source == "user":
@@ -304,6 +322,249 @@ class TextInputNeuron(BaseNeuron):
         if not s:
             s = "user"
         return f"noun:{s}"
+
+        # ------------------------------------------------------------------
+    # /vision: control vision capture without generating percept/text
+    # ------------------------------------------------------------------
+    async def _handle_vision_command(
+        self,
+        cmd_text: str,
+        ctx,
+        channel: str,
+        correlation_id: str,
+    ) -> List[Event]:
+        line = (cmd_text or "").strip()
+        parts = line.split(maxsplit=2)  # "/vision", "<subcmd>", "<rest...>"
+
+        if len(parts) == 1:
+            return [self._speech_control(
+                "Usage: /vision list | /vision select <n|title> | /vision on|off | /vision preview on|off",
+                channel=channel,
+                correlation_id=correlation_id,
+            )]
+
+        subcmd = (parts[1] or "").strip().lower()
+        rest = (parts[2] or "").strip() if len(parts) > 2 else ""
+
+        if subcmd == "list":
+            try:
+                from microbrain.utils.mb_vision.window_grabber import list_windows
+                wins = list_windows()
+
+                # Cache list for /vision select so capture neuron doesn't re-enumerate
+                try:
+                    await ctx.set_kv(
+                        "vision:windows_last",
+                        [{"title": w.title, "rect": w.rect} for w in wins],
+                    )
+                except Exception:
+                    pass
+
+            except Exception as e:
+                return [self._speech_control(
+                    f"Vision list failed: {e!r}",
+                    channel=channel,
+                    correlation_id=correlation_id,
+                )]
+
+            if not wins:
+                return [self._speech_control(
+                    "No windows found.",
+                    channel=channel,
+                    correlation_id=correlation_id,
+                )]
+
+            lines = ["Windows:"]
+            for i, w in enumerate(wins[:25]):
+                title = w.title
+                if len(title) > 80:
+                    title = title[:77] + "..."
+                lines.append(f"  [{i}] {title} ({w.width}x{w.height})")
+            if len(wins) > 25:
+                lines.append(f"...and {len(wins) - 25} more")
+            lines.append("Pick one with: /vision select <index|title_substring>")
+
+            return [self._speech_control(
+                "\n".join(lines),
+                channel=channel,
+                correlation_id=correlation_id,
+            )]
+
+        if subcmd == "select":
+            if not rest:
+                return [self._speech_control(
+                    "Usage: /vision select <index|title_substring>",
+                    channel=channel,
+                    correlation_id=correlation_id,
+                )]
+            # Prefer selecting from cached /vision list (avoids a second window enumeration)
+            chosen = None
+            try:
+                cached = await ctx.get_kv("vision:windows_last", None)
+                if isinstance(cached, list) and cached:
+                    # index select
+                    if rest.isdigit():
+                        idx = int(rest)
+                        if 0 <= idx < len(cached):
+                            chosen = cached[idx]
+                    else:
+                        low = rest.lower()
+                        for row in cached:
+                            if isinstance(row, dict) and low in str(row.get("title", "")).lower():
+                                chosen = row
+                                break
+            except Exception:
+                chosen = None
+
+            if chosen and isinstance(chosen, dict):
+                return [
+                    Event(
+                        topic="control/vision",
+                        payload={"action": "select", "selector": rest, "window": chosen},
+                        source=self.name,
+                        correlation_id=correlation_id,
+                        meta={"control": True, "kind": "vision_control"},
+                    ),
+                    self._speech_control(
+                        f"Selected window (cached): {chosen.get('title','')!r}",
+                        channel=channel,
+                        correlation_id=correlation_id,
+                    ),
+                ]
+
+            # Fallback: let vision capture neuron resolve selector
+            return [
+                Event(
+                    topic="control/vision",
+                    payload={"action": "select", "selector": rest},
+                    source=self.name,
+                    correlation_id=correlation_id,
+                    meta={"control": True, "kind": "vision_control"},
+                ),
+                self._speech_control(
+                    f"Selecting window: {rest!r}",
+                    channel=channel,
+                    correlation_id=correlation_id,
+                ),
+            ]
+
+        if subcmd in ("on", "off"):
+            return [
+                Event(
+                    topic="control/vision",
+                    payload={"action": subcmd},
+                    source=self.name,
+                    correlation_id=correlation_id,
+                    meta={"control": True, "kind": "vision_control"},
+                ),
+                self._speech_control(
+                    f"Vision {subcmd}.",
+                    channel=channel,
+                    correlation_id=correlation_id,
+                ),
+            ]
+
+        if subcmd == "preview":
+            if rest.lower() in ("on", "off"):
+                act = "preview_on" if rest.lower() == "on" else "preview_off"
+                return [
+                    Event(
+                        topic="control/vision",
+                        payload={"action": act},
+                        source=self.name,
+                        correlation_id=correlation_id,
+                        meta={"control": True, "kind": "vision_control"},
+                    ),
+                    self._speech_control(
+                        f"Vision preview {rest.lower()}.",
+                        channel=channel,
+                        correlation_id=correlation_id,
+                    ),
+                ]
+            return [self._speech_control(
+                "Usage: /vision preview on|off",
+                channel=channel,
+                correlation_id=correlation_id,
+            )]
+
+        return [self._speech_control(
+            "Unknown /vision subcommand. Try: list, select, on, off, preview on|off",
+            channel=channel,
+            correlation_id=correlation_id,
+        )]
+
+    # ------------------------------------------------------------------
+    # /focus: set vision reticle focus (normalized 0..1), no percept/text
+    # ------------------------------------------------------------------
+    async def _handle_focus_command(
+        self,
+        cmd_text: str,
+        ctx,
+        channel: str,
+        correlation_id: str,
+    ) -> List[Event]:
+        line = (cmd_text or "").strip()
+        parts = line.split()
+
+        if len(parts) == 1:
+            return [self._speech_control(
+                "Usage: /focus center | /focus <x> <y> (normalized 0..1)",
+                channel=channel,
+                correlation_id=correlation_id,
+            )]
+
+        if len(parts) == 2 and parts[1].lower() == "center":
+            return [
+                Event(
+                    topic="control/focus",
+                    payload={"action": "center"},
+                    source=self.name,
+                    correlation_id=correlation_id,
+                    meta={"control": True, "kind": "vision_focus"},
+                ),
+                self._speech_control(
+                    "Focus set to center.",
+                    channel=channel,
+                    correlation_id=correlation_id,
+                ),
+            ]
+
+        if len(parts) >= 3:
+            try:
+                x = float(parts[1])
+                y = float(parts[2])
+            except Exception:
+                return [self._speech_control(
+                    "Usage: /focus <x> <y> (numbers, normalized 0..1)",
+                    channel=channel,
+                    correlation_id=correlation_id,
+                )]
+
+            # clamp
+            x = max(0.0, min(1.0, x))
+            y = max(0.0, min(1.0, y))
+
+            return [
+                Event(
+                    topic="control/focus",
+                    payload={"action": "set", "x": x, "y": y},
+                    source=self.name,
+                    correlation_id=correlation_id,
+                    meta={"control": True, "kind": "vision_focus"},
+                ),
+                self._speech_control(
+                    f"Focus set to ({x:.3f}, {y:.3f}).",
+                    channel=channel,
+                    correlation_id=correlation_id,
+                ),
+            ]
+
+        return [self._speech_control(
+            "Usage: /focus center | /focus <x> <y> (normalized 0..1)",
+            channel=channel,
+            correlation_id=correlation_id,
+        )]
+
 
     def _speech_user_profile(self, text: str, channel: str, correlation_id: str) -> Event:
         return Event(
