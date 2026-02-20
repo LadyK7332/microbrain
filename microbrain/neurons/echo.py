@@ -15,15 +15,28 @@ class EchoNeuron(BaseNeuron):
             source=event.source,
             meta=event.meta,
         )
-        
+
+        # Echo only human-meaningful text (prevents "JSON toxin" / meta leakage)
+        if isinstance(event.payload, dict):
+            safe_text = event.payload.get("text") or event.payload.get("message") or ""
+        else:
+            safe_text = event.payload
+
+        if not isinstance(safe_text, str):
+            safe_text = str(safe_text)
+
+        safe_text = safe_text.strip()
+        if not safe_text:
+            return []
+
         reply = Event(
             topic="act/speech",
-            payload=f"[echo:{self.name}] {event.payload}",
+            payload=safe_text,
             source=self.name,
             correlation_id=event.correlation_id,
+            meta={"kind": "echo"},
         )
         return [reply]
-
 
 def build_neurons(orchestrator: Orchestrator):
     cfg = NeuronConfig(

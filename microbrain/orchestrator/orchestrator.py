@@ -177,14 +177,34 @@ class Orchestrator:
     # Public API to feed external events (e.g. UI, Minecraft, sensors)
     # ------------------------------------------------------------------
 
-    async def push_event(self, topic: str, payload: Any, meta: Dict[str, Any] = None) -> None:
-        """
-        External system entry point.
+    async def push_event(
+        self,
+        topic: str,
+        payload: Any,
+        meta: Dict[str, Any] | None = None,
+        *,
+        source: str = "",
+        correlation_id: str | None = None,
+    ) -> None:
+        """External system entry point.
+
+        Optional knobs:
+        - source: set Event.source (helps attribution in logs/neurons)
+        - correlation_id: propagate a request/response trace across the bus
         """
         if meta is None:
             meta = {}
 
-        ev = Event(topic=topic, payload=payload, meta=meta)
+        kwargs: Dict[str, Any] = {
+            "topic": topic,
+            "payload": payload,
+            "source": source,
+            "meta": meta,
+        }
+        if correlation_id:
+            kwargs["correlation_id"] = correlation_id
+
+        ev = Event(**kwargs)
         self._queue_event(ev)
 
     # ------------------------------------------------------------------
