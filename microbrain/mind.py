@@ -211,8 +211,6 @@ async def main_async(cfg: AppConfig):
 
     # Build orchestrator runtime
     orch = Orchestrator()
-    if getattr(cfg, "ui", "repl") == "webui":
-        orch.kv_store["attention:allow_babble"] = False
     vosk_listener = None  # will hold VoskAudioListener if voice is enabled
 
    # Optional: voice sink for speech output

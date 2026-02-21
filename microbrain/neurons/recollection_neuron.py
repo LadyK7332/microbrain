@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import re
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -72,6 +74,9 @@ class RecollectionNeuron(BaseNeuron):
 
         # Optional time hint: infer from user phrasing ("yesterday", "last week", etc.)
         time_hint = self._extract_time_hint(raw_user_text or query_text)
+
+        # Optional context cues: modality / window / mood / novelty (best-effort)
+        context_cues = self._extract_context_cues(raw_user_text or query_text, raw_meta)
 
         # Try to get HRM core
         hrm = await ctx.get_kv("hrm:core", None)
@@ -164,6 +169,9 @@ class RecollectionNeuron(BaseNeuron):
                     else:
                         effective_weight *= 0.85
 
+                cue_mult = self._context_bias_multiplier(node=node, cues=context_cues)
+                effective_weight *= cue_mult
+
                 biased_neighbors.append((idx, effective_weight))
                 neighbor_debug.append(
                     {
@@ -171,6 +179,7 @@ class RecollectionNeuron(BaseNeuron):
                         "base_weight": weight,
                         "effective_weight": effective_weight,
                         "in_window": in_window,
+                        "cue_mult": cue_mult,
                     }
                 )
 
@@ -220,6 +229,11 @@ class RecollectionNeuron(BaseNeuron):
             prompt_lines.append(
                 f"Timeframe (interpreted from the user's phrasing): {time_hint}"
             )
+            prompt_lines.append("")
+
+        if context_cues:
+            prompt_lines.append("Context cues detected (best-effort):")
+            prompt_lines.append(json.dumps(context_cues, ensure_ascii=False))
             prompt_lines.append("")
 
         if memory_snippets:
@@ -306,9 +320,81 @@ class RecollectionNeuron(BaseNeuron):
             return "earlier_today"
         if "today" in lowered:
             return "today"
+        if "breakfast" in lowered:
+            return "breakfast"
 
         # Add more phrases as needed over time
         return None
+    
+    # ------------------------------------------------------------------
+    # Context cue extraction + bias
+    # ------------------------------------------------------------------
+    def _extract_context_cues(self, text: str, raw_meta: Dict[str, Any]) -> Dict[str, Any]:
+        cues: Dict[str, Any] = {}
+
+        lowered = (text or "").lower()
+
+        # Modality cues (best-effort keyword sniffing)
+        modalities: List[str] = []
+        if any(k in lowered for k in ("see", "look", "screen", "window", "image", "picture", "vision")):
+            modalities.append("vision")
+        if any(k in lowered for k in ("hear", "audio", "sound", "voice", "said", "music")):
+            modalities.append("audio")
+        if any(k in lowered for k in ("touch", "feel", "tactile", "grip", "pressure")):
+            modalities.append("touch")
+        if modalities:
+            cues["modalities"] = sorted(set(modalities))
+
+        # Window/app hint from raw_meta (if present)
+        for k in ("window_title", "app", "application", "window"):
+            v = raw_meta.get(k)
+            if isinstance(v, str) and v.strip():
+                cues["window_hint"] = v.strip()
+                break
+
+        # Mood hint (lightweight; only if explicitly mentioned)
+        for mood in ("happy", "sad", "angry", "anxious", "calm", "excited"):
+            if mood in lowered:
+                cues["mood_hint"] = mood
+                break
+
+        # Novelty cue
+        if any(k in lowered for k in ("new", "first time", "never", "novel")):
+            cues["novelty_hint"] = True
+
+        return cues
+
+    def _context_bias_multiplier(self, node: Any, cues: Dict[str, Any]) -> float:
+        if not cues:
+            return 1.0
+
+        mult = 1.0
+
+        # If modality cues exist, reward nodes whose tags/role/topic mention them.
+        modalities = cues.get("modalities")
+        if isinstance(modalities, list) and modalities:
+            node_role = str(getattr(node, "role", "") or "").lower()
+            node_topic = str(getattr(node, "topic", "") or "").lower()
+            node_mod = str(getattr(node, "modality", "") or "").lower()
+
+            matched = any(m in node_role or m in node_topic or m == node_mod for m in modalities)
+            mult *= 1.20 if matched else 0.95
+
+        # Window hint (only if node exposes it)
+        win = cues.get("window_hint")
+        if isinstance(win, str) and win:
+            node_win = str(getattr(node, "window_title", "") or getattr(node, "window", "") or "")
+            if node_win and win.lower() in node_win.lower():
+                mult *= 1.15
+
+        # Mood hint (only if node exposes it)
+        mood = cues.get("mood_hint")
+        node_mood = getattr(node, "mood", None)
+        if isinstance(mood, str) and mood and node_mood is not None:
+            if str(node_mood).lower() == mood:
+                mult *= 1.10
+
+        return mult
 
     # ------------------------------------------------------------------
     # Time window matching against node tags
@@ -370,15 +456,14 @@ class RecollectionNeuron(BaseNeuron):
                 return True
             return in_day_range(0, 0)
 
-        if hint == "this_morning":
+        if hint == "breakfast":
             if not in_day_range(0, 0):
                 return False
-            # Optional: we could check local_hour < 12 if present.
             local_hour = getattr(node, "local_hour", None)
             if local_hour is None:
                 return True
-            return local_hour < 12
-
+            return local_hour < 11
+        
         if hint == "last_week":
             return in_week_offset(-1)
 

@@ -8,6 +8,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Protocol, Callabl
 from .event_bus import EventBus
 from .neuron_base import BaseNeuron, Event, NeuronConfig
 from microbrain.core.attention_controller import AttentionController
+from microbrain.policy.policy_engine import PolicyEngine
 
 # =====================================================================================
 # Logging backend placeholder (upgradable later)
@@ -100,6 +101,11 @@ class Orchestrator:
         # Pipes & storage
         self.bus = EventBus()
         self.kv_store: Dict[str, Any] = {}
+
+        # Policy engine (hard veto / review gates)
+        self.policy = PolicyEngine()
+        self.kv_store["policy:engine"] = self.policy
+        self.kv_store["policy:last_decision"] = None
 
         # Attention gate for external vs internal speech
         self.attention = AttentionController()
@@ -231,9 +237,44 @@ class Orchestrator:
                 self.attention.observe_event(event)
                 self.attention.update_allow_babble()
 
+                # Policy gate (acts as the "digital conscience" choke point)
+                decision = self.policy.evaluate_event(event)
+                self.kv_store["policy:last_decision"] = decision.to_dict()
+
+                if decision.status == "veto":
+                    await self.ctx.log_warn(
+                        "Policy veto",
+                        topic=event.topic,
+                        rule_id=decision.rule_id,
+                        reason=decision.reason,
+                        source=event.source,
+                    )
+                    continue
+
+                if decision.status == "needs_review":
+                    await self.ctx.log_info(
+                        "Policy needs review",
+                        topic=event.topic,
+                        rule_id=decision.rule_id,
+                        reason=decision.reason,
+                        source=event.source,
+                    )
+                    # Block the action; optionally emit a safe speech notice for external channels
+                    if event.topic.startswith("act/") and event.topic != "act/speech":
+                        self._queue_event(
+                            Event(
+                                topic="act/speech",
+                                payload={"text": f"[policy] Paused: {decision.reason} ({decision.rule_id})", "style": "system"},
+                                source="policy_engine",
+                                correlation_id=event.correlation_id,
+                                meta={"kind": "policy_notice"},
+                            )
+                        )
+                    continue
+
                 # Dispatch through EventBus
                 new_events = await self.bus.dispatch(event)
-
+                
                 # Feed results back into event queue
                 for ev in new_events:
                     self._queue_event(ev)
