@@ -58,18 +58,6 @@ class SpeechOutputNeuron(BaseNeuron):
             else:
                 print(text)
 
-        # --- WebUI reply bridge --------------------------------------------
-        # If a WebUI request is waiting on this correlation_id, fulfill it.
-        try:
-            waiters = await ctx.get_kv("webui:reply_futures", None)
-            if isinstance(waiters, dict):
-                fut = waiters.pop(event.correlation_id, None)
-                if fut is not None and hasattr(fut, "done") and not fut.done():
-                    fut.set_result(text)
-        except Exception:
-            # Never let UI bridging break speech output.
-            pass
-
         # --- Optional TTS -----------------------------------------------------
         try:
             enabled = await ctx.get_kv("tts:enabled", False)

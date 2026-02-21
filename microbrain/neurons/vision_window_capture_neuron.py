@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import time
+import threading
+from queue import Queue, Empty
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -35,6 +37,13 @@ class VisionWindowCaptureNeuron(BaseNeuron):
     Emits:
       - percept/vision payload {ts, frame_id, data_ref, width, height, format, window}
     """
+    PREVIEW_WINDOW = "MB Vision Preview"
+
+    def __init__(self, config: NeuronConfig):
+        super().__init__(config)
+        self._preview_q: Queue = Queue(maxsize=1)  # drop-old, keep-latest
+        self._preview_stop = threading.Event()
+        self._preview_thread: threading.Thread | None = None
 
     async def process(self, event: Event, ctx) -> Iterable[Event]:
         self.debug(
@@ -249,21 +258,71 @@ class VisionWindowCaptureNeuron(BaseNeuron):
             )
         ]
 
-    def _preview_show(self, frame_bgr) -> None:
+    def _ensure_preview_thread(self) -> None:
+        if self._preview_thread and self._preview_thread.is_alive():
+            return
+        self._preview_stop.clear()
+        t = threading.Thread(target=self._preview_worker, daemon=True)
+        self._preview_thread = t
+        t.start()
+
+    def _preview_worker(self) -> None:
         try:
             import cv2
         except Exception:
             return
-        cv2.imshow("MB Vision Preview", frame_bgr)
-        cv2.waitKey(1)
+
+        # Keep a window alive and pump events here, not on the Textual/async thread.
+        try:
+            cv2.namedWindow(self.PREVIEW_WINDOW, cv2.WINDOW_NORMAL)
+        except Exception:
+            pass
+
+        last = None
+        while not self._preview_stop.is_set():
+            try:
+                # Try to grab newest frame; if none, still pump waitKey.
+                last = self._preview_q.get(timeout=0.05)
+            except Empty:
+                pass
+
+            if last is not None:
+                try:
+                    cv2.imshow(self.PREVIEW_WINDOW, last)
+                except Exception:
+                    # If window dies, don't take down MB
+                    last = None
+
+            # Pump window events. Keep this thread responsive.
+            try:
+                cv2.waitKey(1)
+            except Exception:
+                break
+
+        # Cleanup
+        try:
+            cv2.destroyWindow(self.PREVIEW_WINDOW)
+        except Exception:
+            pass
+
+    def _preview_show(self, frame_bgr) -> None:
+        self._ensure_preview_thread()
+
+        # drop-old / keep-latest so we never backlog
+        try:
+            if self._preview_q.full():
+                _ = self._preview_q.get_nowait()
+        except Exception:
+            pass
+        try:
+            self._preview_q.put_nowait(frame_bgr)
+        except Exception:
+            pass
 
     def _preview_close(self) -> None:
-        try:
-            import cv2
-            cv2.destroyWindow("MB Vision Preview")
-        except Exception:
-            return
-
+        self._preview_stop.set()
+        # Don't hard-join; keep shutdown non-blocking for Textual
+        self._preview_thread = None
 
 def build_neurons(orchestrator: Orchestrator) -> Iterable[BaseNeuron]:
     cfg = NeuronConfig(

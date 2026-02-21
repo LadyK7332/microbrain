@@ -67,13 +67,9 @@ def build_arg_parser():
     p.add_argument("--voice", action="store_true")
     p.add_argument("--mic-device", type=int, default=None)
     p.add_argument("--sample-rate", type=int, default=16000)
-    p.add_argument("--ui", choices=["repl", "textual", "webui"], default="repl")
-    p.add_argument("--webui-host", default=os.getenv("MB_WEBUI_HOST", "0.0.0.0"))
-    p.add_argument("--webui-port", type=int, default=int(os.getenv("MB_WEBUI_PORT", "8008")))
-    p.add_argument("--webui-api-key", default=os.getenv("MB_WEBUI_API_KEY", "microbrain-dev-key"))
-    p.add_argument("--webui-reply-timeout", type=float, default=float(os.getenv("MB_WEBUI_REPLY_TIMEOUT", "2.0")))
+    p.add_argument("--ui", choices=["repl", "textual"], default="repl")
     p.add_argument("--whisper-model", default="small.en")
-    p.add_argument("--vad-aggressiveness", type=int, default=2)
+    p.add_argument("--vad-aggressiveness", type=int, default=2)    
     p.add_argument("--tts-voice", default=None)
     p.add_argument("--tts-rate", type=int, default=170)
     p.add_argument("--tts-volume", type=float, default=1.0)
@@ -416,21 +412,6 @@ async def main_async(cfg: AppConfig):
 
     asyncio.create_task(_clock_tick_loop())
 
-    # ------------------------------------------------------------------
-    # WebUI mode: run an OpenAI-compatible adapter for Open WebUI
-    # ------------------------------------------------------------------
-    if getattr(cfg, "ui", "repl") == "webui":
-        from microbrain.ui.webui_adapter import run_webui_adapter
-
-        await run_webui_adapter(
-            orch,
-            host=getattr(cfg, "webui_host", "0.0.0.0"),
-            port=int(getattr(cfg, "webui_port", 8008)),
-            api_key=getattr(cfg, "webui_api_key", "microbrain-dev-key"),
-            reply_timeout_sec=float(getattr(cfg, "webui_reply_timeout", 2.0)),
-        )
-        return
-
     if cfg.voice:
         logger.info("Voice mode active … REPL disabled …")
         while True:
@@ -500,13 +481,6 @@ def main():
         llm_model=args.llm_model,
         ui=getattr(args, "ui", "repl"),
     )
-
-    # WebUI runtime knobs (kept out of AppConfig to avoid widening config surface)
-    cfg.webui_host = getattr(args, "webui_host", "0.0.0.0")
-    cfg.webui_port = getattr(args, "webui_port", 8008)
-    cfg.webui_api_key = getattr(args, "webui_api_key", "microbrain-dev-key")
-    cfg.webui_reply_timeout = getattr(args, "webui_reply_timeout", 2.0)
-
 
     asyncio.run(main_async(cfg))
 
