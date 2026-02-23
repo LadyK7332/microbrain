@@ -123,6 +123,15 @@ class TextInputNeuron(BaseNeuron):
                 correlation_id=event.correlation_id,
             )
 
+        # Handle /power commands here so they don't become percept/text.
+        if text_norm.startswith("/power"):
+            return await self._handle_power_command(
+                cmd_text=text_norm,
+                ctx=ctx,
+                channel=channel,
+                correlation_id=event.correlation_id,
+            )
+        
         # Handle /vision commands here so they don't become percept/text (babble can't see them).
         if text_norm.startswith("/vision"):
             return await self._handle_vision_command(
@@ -565,6 +574,121 @@ class TextInputNeuron(BaseNeuron):
             correlation_id=correlation_id,
         )]
 
+    # ------------------------------------------------------------------
+    # /power: simulated battery + sleep/charge gate controls
+    # ------------------------------------------------------------------
+    async def _handle_power_command(
+        self,
+        cmd_text: str,
+        ctx,
+        channel: str,
+        correlation_id: str,
+    ) -> List[Event]:
+        line = (cmd_text or "").strip()
+        parts = line.split(maxsplit=2)  # "/power", "<subcmd>", "<rest...>"
+
+        state = await ctx.get_kv("power:state", None)
+        if not isinstance(state, dict):
+            state = {"pct": 100.0, "charging": False, "sleep": False}
+
+        if len(parts) == 1:
+            msg = (
+                f"power: {float(state.get('pct', 100.0)):.1f}% | "
+                f"charging={bool(state.get('charging', False))} | "
+                f"sleep={bool(state.get('sleep', False))} | "
+                f"entropy_allowed={bool(await ctx.get_kv('entropy:allowed', False))}\n"
+                "Usage:\n"
+                "  /power status\n"
+                "  /power pct <0-100>\n"
+                "  /power charging on|off\n"
+                "  /power sleep on|off"
+            )
+            return [self._speech_control(msg, channel=channel, correlation_id=correlation_id)]
+
+        subcmd = (parts[1] or "").strip().lower()
+        rest = (parts[2] or "").strip() if len(parts) > 2 else ""
+
+        if subcmd in ("status", "state"):
+            msg = (
+                f"power: {float(state.get('pct', 100.0)):.1f}% | "
+                f"charging={bool(state.get('charging', False))} | "
+                f"sleep={bool(state.get('sleep', False))} | "
+                f"entropy_allowed={bool(await ctx.get_kv('entropy:allowed', False))}"
+            )
+            return [self._speech_control(msg, channel=channel, correlation_id=correlation_id)]
+
+        if subcmd == "pct":
+            try:
+                v = float(rest)
+            except Exception:
+                return [self._speech_control("Usage: /power pct <0-100>", channel=channel, correlation_id=correlation_id)]
+            v = max(0.0, min(100.0, v))
+
+            # Immediately persist state so /power status reflects it right away
+            state["pct"] = v
+            state["last_ts"] = time.time()
+            await ctx.set_kv("power:state", state)
+            await ctx.set_kv("power:battery_pct", float(state.get("pct", 100.0)))
+            await ctx.set_kv("entropy:allowed", bool(state.get("charging", False) and state.get("sleep", False)))
+
+            return [
+                Event(
+                    topic="control/power",
+                    payload={"set_pct": v},
+                    source=self.name,
+                    correlation_id=correlation_id,
+                    meta={"control": True, "kind": "power_control"},
+                ),
+                self._speech_control(f"Set battery to {v:.1f}%.", channel=channel, correlation_id=correlation_id),
+            ]
+        
+        if subcmd == "charging":
+            if rest.lower() not in ("on", "off", "true", "false", "1", "0"):
+                return [self._speech_control("Usage: /power charging on|off", channel=channel, correlation_id=correlation_id)]
+            val = rest.lower() in ("on", "true", "1")
+
+            # Immediately persist state so /power status reflects it right away
+            state["charging"] = val
+            state["last_ts"] = time.time()
+            await ctx.set_kv("power:state", state)
+            await ctx.set_kv("power:battery_pct", float(state.get("pct", 100.0)))
+            await ctx.set_kv("entropy:allowed", bool(state.get("charging", False) and state.get("sleep", False)))
+
+            return [
+                Event(
+                    topic="control/power",
+                    payload={"charging": val},
+                    source=self.name,
+                    correlation_id=correlation_id,
+                    meta={"control": True, "kind": "power_control"},
+                ),
+                self._speech_control(f"Charging {'on' if val else 'off'}.", channel=channel, correlation_id=correlation_id),
+            ]
+        
+        if subcmd == "sleep":
+            if rest.lower() not in ("on", "off", "true", "false", "1", "0"):
+                return [self._speech_control("Usage: /power sleep on|off", channel=channel, correlation_id=correlation_id)]
+            val = rest.lower() in ("on", "true", "1")
+
+            # Immediately persist state so /power status reflects it right away
+            state["sleep"] = val
+            state["last_ts"] = time.time()
+            await ctx.set_kv("power:state", state)
+            await ctx.set_kv("power:battery_pct", float(state.get("pct", 100.0)))
+            await ctx.set_kv("entropy:allowed", bool(state.get("charging", False) and state.get("sleep", False)))
+
+            return [
+                Event(
+                    topic="control/power",
+                    payload={"sleep": val},
+                    source=self.name,
+                    correlation_id=correlation_id,
+                    meta={"control": True, "kind": "power_control"},
+                ),
+                self._speech_control(f"Sleep {'on' if val else 'off'}.", channel=channel, correlation_id=correlation_id),
+            ]
+        
+        return [self._speech_control("Unknown /power subcommand. Try: status, pct, charging, sleep", channel=channel, correlation_id=correlation_id)]
 
     def _speech_user_profile(self, text: str, channel: str, correlation_id: str) -> Event:
         return Event(
