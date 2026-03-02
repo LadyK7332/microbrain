@@ -15,6 +15,7 @@ class AudioCortexNeuron(BaseNeuron):
 
     Listens on:
         - "percept/audio"
+        - "percept/audio_utterance"
 
     Expected payload shape from an external STT / audio daemon:
 
@@ -45,7 +46,7 @@ class AudioCortexNeuron(BaseNeuron):
             meta=event.meta,
         )
 
-        if event.topic != "percept/audio":
+        if event.topic not in ("percept/audio", "percept/audio_utterance"):
             return []
 
         payload = event.payload or {}
@@ -109,7 +110,7 @@ class AudioCortexNeuron(BaseNeuron):
 def build_neurons(orchestrator: Orchestrator):
     cfg = NeuronConfig(
         name=NEURON_NAME,
-        subscribed_topics=["percept/audio"],
+        subscribed_topics=["percept/audio", "percept/audio_utterance"],
         output_topics=["percept/text"],
         # Priority: early, so text router / attention see it quickly.
         priority=1,

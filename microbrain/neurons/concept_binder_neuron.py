@@ -75,7 +75,7 @@ class ConceptBinderNeuron(BaseNeuron):
                         ctx=ctx,
                     )
 
-        elif event.topic in ("percept/vision", "percept/audio", "percept/touch"):
+        elif event.topic in ("percept/vision", "percept/audio", "percept/audio_pcm", "percept/touch"):
             # Keep only the latest item per channel (cheap STM)
             recents[event.topic] = {
                 "ts": now,

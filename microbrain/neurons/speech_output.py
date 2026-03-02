@@ -72,7 +72,6 @@ class SpeechOutputNeuron(BaseNeuron):
                     self._tts_cfg = cfg_tuple
 
                 self._tts.say(text)
-                self._tts.runAndWait()
         except Exception as exc:
             if is_debug_enabled():
                 print(f"[SPEECH:TTS_ERROR] {exc!r}")

@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import asyncio
@@ -12,7 +12,6 @@ from microbrain.utils.memdir import resolve_memdir_cli, ensure_child_dirs
 
 logger = logging.getLogger(__name__)
 
-from microbrain.voice.tts import TTS
 from microbrain.config import AppConfig
 from microbrain.memory.emotional_journal import EmotionJournal
 from microbrain.memory.memory_store import MemoryStore
@@ -70,9 +69,11 @@ def build_arg_parser():
     p.add_argument("--ui", choices=["repl", "textual"], default="repl")
     p.add_argument("--whisper-model", default="small.en")
     p.add_argument("--vad-aggressiveness", type=int, default=2)    
-    p.add_argument("--tts-voice", default=None)
-    p.add_argument("--tts-rate", type=int, default=170)
-    p.add_argument("--tts-volume", type=float, default=1.0)
+    
+    p.add_argument("--tts", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--tts-voice", default="Zira")
+    p.add_argument("--tts-rate", type=int, default=155)
+    p.add_argument("--tts-volume", type=float, default=0.9)
     p.add_argument(
         "--log-level",
         default="WARNING",
@@ -213,20 +214,12 @@ async def main_async(cfg: AppConfig):
     orch = Orchestrator()
     vosk_listener = None  # will hold VoskAudioListener if voice is enabled
 
-   # Optional: voice sink for speech output
-    if cfg.voice:
-        try:
-            tts = TTS(
-                rate=cfg.tts_rate,
-                volume=cfg.tts_volume,
-                preferred=cfg.tts_voice or "",
-            )
-            orch.kv_store["voice:tts"] = tts
-            logger.info("Voice mode enabled (pyttsx3)")
-        except Exception as exc:
-            logger.error("Failed to initialize TTS; continuing without voice", exc_info=exc)
-            orch.kv_store["voice:tts"] = None
-            cfg.voice = False
+    # TTS output is independent from mic/STT. Configure the speech_output neuron via KV.
+    orch.kv_store["tts:enabled"] = bool(getattr(cfg, "tts_enabled", True))
+    orch.kv_store["tts:voice"] = getattr(cfg, "tts_voice", "Zira")
+    orch.kv_store["tts:rate"] = int(getattr(cfg, "tts_rate", 155))
+    orch.kv_store["tts:volume"] = float(getattr(cfg, "tts_volume", 0.9))
+
 
     # --- Persistent memory wiring (MemoryStore + EmotionJournal) ---
     mem_store = MemoryStore(
@@ -379,7 +372,67 @@ async def main_async(cfg: AppConfig):
             logger.warning("Voice disabled: missing Whisper/VAD dependencies.")
         else:
             try:
-                whisper_listener = WhisperAudioListener(...)  # TODO: fill args
+                def _schedule(topic: str, payload: dict, meta: dict | None = None) -> None:
+                    m = dict(meta or {})
+                    loop.call_soon_threadsafe(
+                        lambda: asyncio.create_task(
+                            orch.push_event(
+                                topic,
+                                payload,
+                                meta=m,
+                                source="whisper",
+                            )
+                        )
+                    )
+
+                def _on_transcript(text: str) -> None:
+                    audio_payload = {
+                        "text": text,
+                        "confidence": None,
+                        "speaker": "user",
+                        "channel": "repl",
+                        "raw_meta": {
+                            "input_modality": "audio",
+                            "source": "mic",
+                            "device_index": cfg.mic_device,
+                        },
+                    }
+                    _schedule("percept/audio", audio_payload)
+
+                def _on_utterance(text: str, pcm_bytes: bytes, sample_rate: int) -> None:
+                    utt_payload = {
+                        "text": text,
+                        "pcm_bytes": pcm_bytes,
+                        "sample_rate": int(sample_rate),
+                        "channels": 1,
+                        "speaker": "user",
+                        "channel": "repl",
+                        "raw_meta": {
+                            "input_modality": "audio",
+                            "source": "mic",
+                            "device_index": cfg.mic_device,
+                        },
+                    }
+                    _schedule("percept/audio_utterance", utt_payload)
+
+                def _on_dbg(msg: str) -> None:
+                    logger.debug("%s", msg)
+
+                wcfg = WhisperAudioConfig(
+                    model_name=str(getattr(cfg, "whisper_model", "small.en") or "small.en"),
+                    device_index=getattr(cfg, "mic_device", None),
+                    sample_rate=int(getattr(cfg, "sample_rate", 16000) or 16000),
+                    vad_aggressiveness=int(getattr(cfg, "vad_aggressiveness", 2) or 2),
+                    raw_only=False,
+                )
+
+                whisper_listener = WhisperAudioListener(
+                    wcfg,
+                    on_transcript=_on_transcript,
+                    on_debug=_on_dbg,
+                    on_audio_raw=None,
+                    on_utterance=_on_utterance,
+                )
                 whisper_listener.start()
                 logger.info(
                     "Whisper audio listener started | model=%s sample_rate=%s device=%s vad=%s",
@@ -410,18 +463,12 @@ async def main_async(cfg: AppConfig):
 
     asyncio.create_task(_clock_tick_loop())
 
-    if cfg.voice:
-        logger.info("Voice mode active … REPL disabled …")
-        while True:
-            await asyncio.sleep(0.1)
-
-    else:
-        logger.info("Starting text REPL …")
-        if getattr(cfg, "ui", "repl") == "textual":
+    logger.info("Starting text REPL …")
+    if getattr(cfg, "ui", "repl") == "textual":
             from microbrain.ui.textual_bridge import run_textual_frontend
             await run_textual_frontend(orch)
             return
-        while True:
+    while True:
             # IMPORTANT: don't block the asyncio loop (lets clock/tick + background outputs run)
             raw = await asyncio.to_thread(input, "you> ")
             prompt = (raw or "").strip()
@@ -441,9 +488,12 @@ def main():
     # NEW: flip the global neuron debug flag based on CLI
     set_debug_enabled(getattr(args, "debug", False))
 
+    # If --debug is on, default log level should be DEBUG unless explicitly overridden.
+    if getattr(args, "debug", False) and (getattr(args, "log_level", "WARNING").upper() == "WARNING"):
+        args.log_level = "DEBUG"
+
     # Resolve memdir once so logging/memory/debug-tail all agree.
     args.memdir = _resolve_memdir(getattr(args, "memdir", None))
-
     if getattr(args, "debug_tail", False):
         if not getattr(args, "debug", False):
             raise SystemExit("--debug-tail requires --debug")
@@ -470,6 +520,7 @@ def main():
         mic_device=args.mic_device,
         sample_rate=args.sample_rate,
         vad_aggressiveness=args.vad_aggressiveness,        
+        tts_enabled=args.tts,
         tts_voice=args.tts_voice,
         tts_rate=args.tts_rate,
         tts_volume=args.tts_volume,

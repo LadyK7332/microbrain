@@ -96,11 +96,13 @@ class WhisperAudioListener:
         on_transcript: Callable[[str], None],
         on_debug: Optional[Callable[[str], None]] = None,
         on_audio_raw: Optional[Callable[[bytes, int], None]] = None,
+        on_utterance: Optional[Callable[[str, bytes, int], None]] = None,
     ) -> None:
         self.cfg = cfg
         self.on_transcript = on_transcript
         self.on_debug = on_debug
         self.on_audio_raw = on_audio_raw
+        self.on_utterance = on_utterance
 
         # capture rate = device/native rate if provided; otherwise fall back
         self._capture_rate = int(self.cfg.device_sample_rate or self.cfg.sample_rate)
@@ -300,4 +302,9 @@ class WhisperAudioListener:
         text = " ".join(parts).strip()
         if text:
             self._dbg(f"[whisper_audio] heard: {text}")
+            if self.on_utterance:
+                try:
+                    self.on_utterance(text, pcm, self.cfg.sample_rate)
+                except Exception as e:
+                    self._dbg(f"[whisper_audio] on_utterance error: {e}")
             self.on_transcript(text)

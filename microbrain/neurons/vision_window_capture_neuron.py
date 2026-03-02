@@ -209,6 +209,35 @@ class VisionWindowCaptureNeuron(BaseNeuron):
             return []
 
         h, w = frame.shape[:2]
+
+        # Preview overlay (never saved; only displayed)
+        preview = bool(await ctx.get_kv("vision:preview", False))
+        if preview:
+            focus_xy = await ctx.get_kv("vision:focus_xy", {"x": 0.5, "y": 0.5})
+            try:
+                prev = frame.copy()
+                draw_focus_reticle(prev, focus_xy)
+                self._preview_show(prev)
+            except Exception as e:
+                self.debug("vision_preview_error", err=repr(e))
+
+        # Frame-write gating (prevents saving hundreds of near-identical frames)
+        save_mode = str(await ctx.get_kv("vision:save_mode", "gated") or "gated").lower().strip()
+        dupe_thresh = float(await ctx.get_kv("vision:dupe_thresh", 0.06) or 0.06)   # 0..1 (dHash ratio)
+        max_stale_s = float(await ctx.get_kv("vision:max_stale_s", 20.0) or 20.0)   # force-save occasionally
+
+        cur_hash = self._dhash64(frame)
+        last_hash = int(await self.load_state(ctx, "last_saved_dhash", 0) or 0)
+        last_save_ts = float(await self.load_state(ctx, "last_saved_frame_ts", 0.0) or 0.0)
+
+        dist = (cur_hash ^ last_hash).bit_count() if last_hash else 64
+        ratio = dist / 64.0
+        stale = (last_save_ts <= 0.0) or ((now - last_save_ts) >= max_stale_s)
+
+        if save_mode == "gated" and (not stale) and last_hash and ratio < dupe_thresh:
+            self.debug("vision_frame_skip_duplicate", ratio=ratio, dupe_thresh=dupe_thresh, stale=stale)
+            return []
+
         frame_id = int(await self.load_state(ctx, "frame_id", 0) or 0) + 1
         await self.save_state(ctx, "frame_id", frame_id)
 
@@ -216,24 +245,37 @@ class VisionWindowCaptureNeuron(BaseNeuron):
         base = Path(memdir) / "sight" / "frames"
         base.mkdir(parents=True, exist_ok=True)
 
-        out_path = base / f"frame-{frame_id:06d}.jpg"
+        if save_mode == "latest":
+            out_path = base / "latest.jpg"
+        else:
+            out_path = base / f"frame-{frame_id:06d}.jpg"
+
         try:
             save_jpeg(frame, str(out_path))
         except Exception as e:
             self.debug("vision_save_error", err=repr(e), path=str(out_path))
             return []
 
-        # Preview overlay (never saved; only displayed)
-        preview = bool(await ctx.get_kv("vision:preview", False))
-        if preview:
-            focus_xy = await ctx.get_kv("vision:focus_xy", {"x": 0.5, "y": 0.5})
+        await self.save_state(ctx, "last_saved_dhash", int(cur_hash))
+        await self.save_state(ctx, "last_saved_frame_ts", now)
+
+        # Optional: keep frames dir bounded even in "all" mode
+        frames_keep = await ctx.get_kv("vision:frames_keep", 500)
+        try:
+            frames_keep = int(frames_keep)
+        except Exception:
+            frames_keep = 500
+        if save_mode != "latest" and frames_keep > 0:
             try:
-                # Copy so we don't mutate the saved frame variable (we already wrote file)
-                prev = frame.copy()
-                draw_focus_reticle(prev, focus_xy)
-                self._preview_show(prev)
-            except Exception as e:
-                self.debug("vision_preview_error", err=repr(e))
+                files = sorted(base.glob("frame-*.jpg"))
+                if len(files) > frames_keep:
+                    for p in files[: len(files) - frames_keep]:
+                        try:
+                            p.unlink()
+                        except Exception:
+                            pass
+            except Exception:
+                pass
 
         payload = {
             "ts": now,
@@ -257,6 +299,36 @@ class VisionWindowCaptureNeuron(BaseNeuron):
                 meta={"kind": "vision_frame", "sensor": "window"},
             )
         ]
+
+    @staticmethod
+    def _dhash64(frame_bgr) -> int:
+        """
+        Cheap perceptual hash (64-bit). Works well for 'is this basically the same frame?' gating.
+        """
+        import numpy as np
+
+        h, w = frame_bgr.shape[:2]
+        size = 8  # yields 8x8 comparisons => 64 bits
+
+        # grayscale (uint16 avoids overflow)
+        gray = (
+            frame_bgr[:, :, 0].astype(np.uint16)
+            + frame_bgr[:, :, 1].astype(np.uint16)
+            + frame_bgr[:, :, 2].astype(np.uint16)
+        ) // 3
+
+        ys = ((np.arange(size) + 0.5) * h / size).astype(int)
+        xs = ((np.arange(size + 1) + 0.5) * w / (size + 1)).astype(int)
+        ys = np.clip(ys, 0, h - 1)
+        xs = np.clip(xs, 0, w - 1)
+
+        sample = gray[ys[:, None], xs[None, :]]  # (8, 9)
+        diff = sample[:, 1:] > sample[:, :-1]    # (8, 8) bool
+
+        bits = 0
+        for b in diff.flatten():
+            bits = (bits << 1) | int(b)
+        return bits
 
     def _ensure_preview_thread(self) -> None:
         if self._preview_thread and self._preview_thread.is_alive():

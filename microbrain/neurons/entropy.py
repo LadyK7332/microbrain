@@ -95,12 +95,28 @@ class EntropyNeuron(BaseNeuron):
                 "concept_token",
                 "noun_concept",
                 "concept_noun",
+
+                # grounded perception bindings
                 "sense_concept",
                 "concept_sense",
+
+                # atom/structure edges (new)
+                "ent_isa",
+                "isa_ent",
+                "ent_prop",
+                "prop_ent",
+                "concept_isa",
+                "concept_sub",
+                "prop_attr",
+                "attr_prop",
+                "prop_value",
+                "value_prop",
+
+                # outcomes/safety
                 "concept_outcome",
                 "outcome_concept",
             ]
-
+            
         top_k = _safe_int(await ctx.get_kv("entropy:top_k_per_src", 80), 80)
         max_updates = _safe_int(await ctx.get_kv("entropy:max_updates", 200), 200)
 
@@ -114,8 +130,23 @@ class EntropyNeuron(BaseNeuron):
 
         grounded_edge_types = await ctx.get_kv("entropy:grounded_edge_types", None)
         if not isinstance(grounded_edge_types, list):
-            grounded_edge_types = ["sense_concept", "concept_sense"]
+            grounded_edge_types = [
+                "sense_concept",
+                "concept_sense",
 
+                # atom/structure edges (should persist longer than pure lexical)
+                "ent_isa",
+                "isa_ent",
+                "ent_prop",
+                "prop_ent",
+                "concept_isa",
+                "concept_sub",
+                "prop_attr",
+                "attr_prop",
+                "prop_value",
+                "value_prop",
+            ]
+            
         top_k_lexical = _safe_int(await ctx.get_kv("entropy:top_k_lexical", 50), 50)
         top_k_grounded = _safe_int(await ctx.get_kv("entropy:top_k_grounded", 120), 120)
 

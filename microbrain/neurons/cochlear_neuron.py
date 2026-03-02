@@ -78,7 +78,7 @@ class CochlearNeuron(BaseNeuron):
       }
 
     Emits:
-      - `percept/audio` with canonical 16kHz mono int16 PCM
+      - `percept/audio_pcm` with canonical 16kHz mono int16 PCM
       - `affect/audio_energy` with RMS/peak/clipping + rates
     """
 
@@ -149,9 +149,9 @@ class CochlearNeuron(BaseNeuron):
             }
         )
 
-        # Canonical percept/audio for downstream VAD/Whisper/etc.
+        # Canonical percept/audio_pcm for downstream VAD/Whisper/etc.
         e_audio = Event(
-            topic="percept/audio",
+            topic="percept/audio_pcm",
             payload={
                 "pcm_bytes": out_bytes,
                 "sample_rate": dst_sr,
@@ -190,7 +190,7 @@ def activate() -> Iterable[BaseNeuron]:
     cfg = NeuronConfig(
         name=NEURON_NAME,
         subscribed_topics=["percept/audio_raw"],
-        output_topics=["percept/audio", "affect/audio_energy"],
+        output_topics=["percept/audio_pcm", "affect/audio_energy"],
         priority=15,
     )
 

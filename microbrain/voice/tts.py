@@ -53,6 +53,22 @@ class TTS:
         except Exception:
             return []
 
-    def say(self, text: str):
+
+def save_to_file(self, text: str, out_path: str) -> None:
+    """Save synthesized speech to a WAV file."""
+    self.engine.save_to_file(text, out_path)
+    self.engine.runAndWait()
+
+    def say(self, text: str, auto_run: bool = True):
         self.engine.say(text)
+        if auto_run:
+            self.engine.runAndWait()
+
+    def runAndWait(self):
         self.engine.runAndWait()
+
+    def stop(self):
+        try:
+            self.engine.stop()
+        except Exception:
+            pass

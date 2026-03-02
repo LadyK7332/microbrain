@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 
+from microbrain.utils.memdir import resolve_memdir_cli
+
 
 @dataclass
 class AppConfig:
@@ -19,12 +21,12 @@ class AppConfig:
     sample_rate: int = 16000
     whisper_model: str = "small.en"     # faster-whisper model name
     vad_aggressiveness: int = 2         # 0..3 (more aggressive = fewer false positives)
-    voice: bool = False
-    tts_voice: str | None = None
-    tts_rate: int = 170
-    tts_volume: float = 1.0
+    voice: bool = False  # mic/STT input
+    tts_enabled: bool = True
+    tts_voice: str | None = "Zira"
+    tts_rate: int = 155
+    tts_volume: float = 0.9
     log_level: str = "INFO"
-    voice: bool = False
     ui: str = "repl"  # repl | textual
 
     def __post_init__(self) -> None:
