@@ -1,3 +1,5 @@
+import hashlib
+import time
 from typing import Any, Dict, Iterable
 
 from microbrain.orchestrator.neuron_base import BaseNeuron, NeuronConfig, Event
@@ -60,7 +62,7 @@ class SpeechOutputNeuron(BaseNeuron):
 
         # --- Optional TTS -----------------------------------------------------
         try:
-            enabled = await ctx.get_kv("tts:enabled", False)
+            enabled = await ctx.get_kv("tts:enabled", True)
             if enabled and channel in ("repl", "default", "cli"):
                 voice = await ctx.get_kv("tts:voice", None)
                 rate = await ctx.get_kv("tts:rate", 155)
@@ -71,8 +73,22 @@ class SpeechOutputNeuron(BaseNeuron):
                     self._tts = TTS(rate=int(rate), volume=float(volume), preferred=voice or "")
                     self._tts_cfg = cfg_tuple
 
+                # Mark what we are about to speak (helps detect self-echo on the mic).
+                try:
+                    sha_text = hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()
+                    await ctx.set_kv("tts:last_spoken", {"ts": time.time(), "text": text, "sha1_text": sha_text})
+                    # Briefly mute text-ingestion from ears to prevent response loops.
+                    est_s = max(0.6, len(text) / 14.0)
+                    await ctx.set_kv("ears:mute_until", time.time() + est_s + 0.25)
+                except Exception:
+                    pass
+
                 self._tts.say(text)
         except Exception as exc:
+            try:
+                await ctx.log_warn(f"[speech_output] TTS error: {exc!r}", topic=event.topic)
+            except Exception:
+                pass
             if is_debug_enabled():
                 print(f"[SPEECH:TTS_ERROR] {exc!r}")
 

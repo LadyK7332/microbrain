@@ -78,7 +78,7 @@ class CochlearNeuron(BaseNeuron):
       }
 
     Emits:
-      - `percept/audio_pcm` with canonical 16kHz mono int16 PCM
+      - `percept/audio` with canonical 16kHz mono int16 PCM
       - `affect/audio_energy` with RMS/peak/clipping + rates
     """
 

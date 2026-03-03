@@ -1,5 +1,6 @@
 import pyttsx3
 
+
 class TTS:
     """
     Offline TTS using Windows SAPI via pyttsx3.
@@ -26,16 +27,16 @@ class TTS:
             if pref:
                 for v in voices:
                     name = (getattr(v, "name", "") or "").lower()
-                    # heuristic: prefer English female if present
                     if pref in name:
                         self.engine.setProperty("voice", v.id)
                         self.chosen_voice = v
                         break
+
             # If no match and we want a feminine voice, try common female voices by name
             if not self.chosen_voice and pref:
-                for tag in ("female", "zira", "aria", "susan", "eva"):
+                for tag in ("female", "zira", "aria", "susan", "eva", "hazel"):
                     for v in voices:
-                        if tag in (v.name or "").lower():
+                        if tag in (getattr(v, "name", "") or "").lower():
                             self.engine.setProperty("voice", v.id)
                             self.chosen_voice = v
                             break
@@ -53,11 +54,10 @@ class TTS:
         except Exception:
             return []
 
-
-def save_to_file(self, text: str, out_path: str) -> None:
-    """Save synthesized speech to a WAV file."""
-    self.engine.save_to_file(text, out_path)
-    self.engine.runAndWait()
+    def save_to_file(self, text: str, out_path: str) -> None:
+        """Save synthesized speech to a WAV file. (Does not play it.)"""
+        self.engine.save_to_file(text, out_path)
+        self.engine.runAndWait()
 
     def say(self, text: str, auto_run: bool = True):
         self.engine.say(text)

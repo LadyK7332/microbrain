@@ -220,6 +220,9 @@ async def main_async(cfg: AppConfig):
     orch.kv_store["tts:rate"] = int(getattr(cfg, "tts_rate", 155))
     orch.kv_store["tts:volume"] = float(getattr(cfg, "tts_volume", 0.9))
 
+    # Debug-only by default: do not parrot user input unless explicitly enabled.
+    orch.kv_store["echo:enabled"] = bool(getattr(cfg, "debug", False) and getattr(cfg, "echo", False))
+
 
     # --- Persistent memory wiring (MemoryStore + EmotionJournal) ---
     mem_store = MemoryStore(
@@ -463,12 +466,18 @@ async def main_async(cfg: AppConfig):
 
     asyncio.create_task(_clock_tick_loop())
 
-    logger.info("Starting text REPL …")
-    if getattr(cfg, "ui", "repl") == "textual":
+    if cfg.voice:
+        logger.info("Voice mode active … REPL disabled …")
+        while True:
+            await asyncio.sleep(0.1)
+
+    else:
+        logger.info("Starting text REPL …")
+        if getattr(cfg, "ui", "repl") == "textual":
             from microbrain.ui.textual_bridge import run_textual_frontend
             await run_textual_frontend(orch)
             return
-    while True:
+        while True:
             # IMPORTANT: don't block the asyncio loop (lets clock/tick + background outputs run)
             raw = await asyncio.to_thread(input, "you> ")
             prompt = (raw or "").strip()

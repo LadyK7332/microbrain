@@ -15,7 +15,6 @@ class AudioCortexNeuron(BaseNeuron):
 
     Listens on:
         - "percept/audio"
-        - "percept/audio_utterance"
 
     Expected payload shape from an external STT / audio daemon:
 
@@ -41,7 +40,11 @@ class AudioCortexNeuron(BaseNeuron):
         self.debug(
             "received",
             topic=event.topic,
-            payload=event.payload,
+            payload=(
+                {**event.payload, "pcm_bytes": f"<bytes {len(event.payload.get('pcm_bytes', b''))}>"}
+                if isinstance(event.payload, dict) and 'pcm_bytes' in event.payload
+                else event.payload
+            ),
             source=event.source,
             meta=event.meta,
         )

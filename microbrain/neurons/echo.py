@@ -16,6 +16,12 @@ class EchoNeuron(BaseNeuron):
             meta=event.meta,
         )
 
+        # Default OFF: echo is for debug/calibration only.
+        # Enable by setting KV: echo:enabled = True
+        echo_enabled = bool(await ctx.get_kv("echo:enabled", False))
+        if not echo_enabled:
+            return []
+
         # Echo only human-meaningful text (prevents "JSON toxin" / meta leakage)
         if isinstance(event.payload, dict):
             safe_text = event.payload.get("text") or event.payload.get("message") or ""
