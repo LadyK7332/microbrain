@@ -169,7 +169,8 @@ class AudioEngramNeuron(BaseNeuron):
         tts_wav = ""
         tts_fp: list[float] | None = None
         # Optional babysitter reference clip (won't play out loud; saved to file)
-        tts_enabled = bool(await ctx.get_kv("audio:tts_reference_enabled", True))
+        # Default OFF so it does not fight the live speech engine in-process.
+        tts_enabled = bool(await ctx.get_kv("audio:tts_reference_enabled", False))
         if label and tts_enabled:
             try:
                 tts_dir = self._memdir / "audio" / "snippets" / "tts" / label

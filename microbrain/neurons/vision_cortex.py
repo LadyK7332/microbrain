@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import time
 from typing import Any, Dict, Iterable, List, Optional
 
 from microbrain.orchestrator.neuron_base import BaseNeuron, NeuronConfig, Event
@@ -91,26 +92,52 @@ class VisionCortexNeuron(BaseNeuron):
             text_preview=vision_text[:80],
         )
 
-        # Optional: emit a small debug speech so we can see it working
-        echo_event = Event(
-            topic="act/speech",
-            payload={
-                "text": f"(Noted a visual scene: {vision_text})",
-                "channel": "cli",
-                "style": "system",
+        await ctx.set_kv(
+            "vision:last_summary",
+            {
+                "ts": time.time(),
+                "text": vision_text,
+                "objects": [str(o) for o in objects[:16]],
+                "source": event.source,
             },
-            source=self.name,
-            correlation_id=event.correlation_id,
         )
 
-        return [echo_event]
+        emit_internal = bool(await ctx.get_kv("vision:emit_internal_notes", True))
+        speak_observations = bool(await ctx.get_kv("vision:speak_observations", False))
+
+        out: List[Event] = []
+        if emit_internal:
+            out.append(
+                Event(
+                    topic="reason/output",
+                    payload={"text": f"visual note: {vision_text}"},
+                    source=self.name,
+                    correlation_id=event.correlation_id,
+                    meta={"channel": "thought", "kind": "vision_note", "lobe": "vision"},
+                )
+            )
+        if speak_observations:
+            out.append(
+                Event(
+                    topic="act/speech",
+                    payload={
+                        "text": f"(Noted a visual scene: {vision_text})",
+                        "channel": "cli",
+                        "style": "system",
+                    },
+                    source=self.name,
+                    correlation_id=event.correlation_id,
+                )
+            )
+
+        return out
 
 
 def build_neurons(orchestrator: Orchestrator):
     cfg = NeuronConfig(
         name=NEURON_NAME,
         subscribed_topics=["percept/vision"],
-        output_topics=["act/speech"],
+        output_topics=["reason/output", "act/speech"],
         priority=4,  # after raw percepts, before higher-level reasoning
     )
     yield VisionCortexNeuron(cfg)

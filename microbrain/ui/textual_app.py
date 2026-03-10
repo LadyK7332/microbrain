@@ -23,6 +23,7 @@ class UIMessage:
     topic: str
     payload: object
     source: str = ""
+    meta: dict | None = None
 
 
 SendCallback = Callable[[str], Awaitable[None]]
@@ -63,10 +64,12 @@ class MicroBrainUI(App):
         *,
         send_cb: Optional[SendCallback] = None,
         recv_q: Optional[asyncio.Queue[UIMessage]] = None,
+        memdir: Optional[str] = None,
     ) -> None:
         super().__init__()
         self._send_cb = send_cb
         self._recv_q = recv_q
+        self._memdir = memdir
 
         # Speaker labels (loaded from memdir on mount)
         self._assistant_label = "MB"
@@ -82,7 +85,7 @@ class MicroBrainUI(App):
     def _load_labels_from_memdir(self) -> None:
         """Load assistant/user display labels from memdir JSON files."""
         try:
-            memdir = resolve_memdir_cli(None)
+            memdir = Path(self._memdir) if self._memdir else resolve_memdir_cli(None)
         except Exception:
             memdir = Path.cwd() / "memory"
 
@@ -144,8 +147,23 @@ class MicroBrainUI(App):
             elif isinstance(payload, str):
                 text = payload
 
-            if msg.topic == "act/speech" and text is not None:
+            meta = msg.meta or {}
+            channel = str(meta.get("channel", "") or "")
+            payload_channel = str(payload.get("channel", "") or "") if isinstance(payload, dict) else ""
+            payload_source = str(payload.get("source", "") or "") if isinstance(payload, dict) else ""
+            raw_meta = payload.get("raw_meta", {}) if isinstance(payload, dict) and isinstance(payload.get("raw_meta"), dict) else {}
+            transport_source = str(raw_meta.get("transport_source", raw_meta.get("source", "")) or "")
+            effective_channel = payload_channel or channel
+            effective_source = payload_source or transport_source
+
+            if msg.topic == "act/speech" and effective_channel == "thought" and text is not None:
+                log.write(f"[magenta]thought>[/magenta] {text}")
+            elif msg.topic == "act/speech" and text is not None:
                 log.write(f"[cyan]{self._assistant_label}>[/cyan] {text}")
+            elif msg.topic == "reason/output" and text is not None:
+                log.write(f"[magenta]thought>[/magenta] {text}")
+            elif msg.topic == "reason/request" and effective_source == "internal" and text is not None:
+                log.write(f"[magenta]think?[/magenta] {text}")
             else:
                 # Keep it lightweight; show topic and a short payload preview.
                 preview = str(payload)

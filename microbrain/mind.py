@@ -21,6 +21,7 @@ from microbrain.utils.logging_setup import configure_logging
 from microbrain.orchestrator.orchestrator import Orchestrator
 from microbrain.orchestrator.neuron_loader import auto_register_neurons
 from microbrain.orchestrator.debug_utils import set_debug_enabled
+from microbrain.ipc.token import ensure_token_file
 WhisperAudioListener = None
 WhisperAudioConfig = None
 from microbrain.utils.mic_probe_runtime import list_input_devices, probe_rms
@@ -74,6 +75,18 @@ def build_arg_parser():
     p.add_argument("--tts-voice", default="Zira")
     p.add_argument("--tts-rate", type=int, default=155)
     p.add_argument("--tts-volume", type=float, default=0.9)
+    p.add_argument(
+        "--mouth-backend",
+        default="auto",
+        choices=["auto", "ipc", "local", "none"],
+        help="Speech transport: auto prefers IPC briefly after spoken input, otherwise local TTS.",
+    )
+    p.add_argument(
+        "--spoken-reply-bias-ttl",
+        type=float,
+        default=45.0,
+        help="Seconds that recent spoken input biases replies toward IPC in auto mouth mode.",
+    )
     p.add_argument(
         "--log-level",
         default="WARNING",
@@ -212,6 +225,7 @@ async def main_async(cfg: AppConfig):
 
     # Build orchestrator runtime
     orch = Orchestrator()
+    orch.kv_store["ui:mode"] = ui_mode
     vosk_listener = None  # will hold VoskAudioListener if voice is enabled
 
     # TTS output is independent from mic/STT. Configure the speech_output neuron via KV.
@@ -219,9 +233,59 @@ async def main_async(cfg: AppConfig):
     orch.kv_store["tts:voice"] = getattr(cfg, "tts_voice", "Zira")
     orch.kv_store["tts:rate"] = int(getattr(cfg, "tts_rate", 155))
     orch.kv_store["tts:volume"] = float(getattr(cfg, "tts_volume", 0.9))
+    orch.kv_store["mouth:enabled"] = True
+    orch.kv_store["mouth:local_fallback"] = True
+    
+    # Legacy echo helper is default OFF so spoken input is not parroted back.
+    orch.kv_store.setdefault("echo:enabled", False)
+    ensure_token_file(Path(cfg.memdir) / "ipc_token.txt")
+    orch.kv_store["speech:transport_mode"] = getattr(cfg, "mouth_backend", "auto")
+    orch.kv_store["speech:default_transport"] = "local"
+    orch.kv_store["speech:audio_preferred_transport"] = "ipc"
+    orch.kv_store["speech:audio_bias_ttl_s"] = float(getattr(cfg, "spoken_reply_bias_ttl_s", 45.0))
+    orch.kv_store.setdefault("interaction:last_input", {})
+    ensure_token_file(Path(cfg.memdir) / "ipc_token.txt")
 
-    # Debug-only by default: do not parrot user input unless explicitly enabled.
-    orch.kv_store["echo:enabled"] = bool(getattr(cfg, "debug", False) and getattr(cfg, "echo", False))
+
+    # Power schedule / sleep controls (OFF unless explicitly enabled).
+    orch.kv_store.setdefault("power:sleep", False)
+    orch.kv_store.setdefault("power:sleep_idle_s", 20.0)      # seconds since last external input
+    orch.kv_store.setdefault("power:sleep_period_s", 30.0)    # seconds between consolidation cycles
+    orch.kv_store.setdefault("power:sleep_kick", False)
+
+    # Charging + schedule window (for future HW triggers)
+    orch.kv_store.setdefault("power:charging", False)
+    orch.kv_store.setdefault("power:state", "active")         # active|charge
+    orch.kv_store.setdefault("power:timezone", "America/Chicago")
+    orch.kv_store.setdefault("power:charge_window_start", "22:00")
+    orch.kv_store.setdefault("power:charge_window_end", "06:00")
+    orch.kv_store.setdefault("power:schedule_enabled", True)
+    orch.kv_store.setdefault("power:schedule_period_s", 10.0) # seconds between schedule checks
+    orch.kv_store.setdefault("power:autosleep_on_charge", True)
+    orch.kv_store.setdefault("power:last_external_ts", 0.0)
+    orch.kv_store.setdefault("power:idle_enabled", True)
+    orch.kv_store.setdefault("power:idle_after_s", 60.0)          # seconds idle before entering idle state
+    orch.kv_store.setdefault("power:idle_cpu_threshold", 15.0)    # CPU% threshold (best effort; psutil if available)
+    orch.kv_store.setdefault("power:busy_count", 0)
+    orch.kv_store.setdefault("power:busy", False)
+
+    # Evidence recorder / hazard gating (split raw streams; OFF unless armed).
+    orch.kv_store.setdefault("er:enabled", True)
+    orch.kv_store.setdefault("er:armed", False)
+    orch.kv_store.setdefault("er:manual_hold", False)
+    orch.kv_store.setdefault("er:session_id", "")
+    orch.kv_store.setdefault("er:session_dir", "")
+    orch.kv_store.setdefault("er:preroll_s", 20.0)
+    orch.kv_store.setdefault("er:postroll_s", 30.0)
+    orch.kv_store.setdefault("er:hazard_threshold", 3)
+    orch.kv_store.setdefault("er:capture_text", True)
+    orch.kv_store.setdefault("er:last_trigger_ts", 0.0)
+    orch.kv_store.setdefault("er:last_reason", "")
+    orch.kv_store.setdefault("er:last_level", 0)
+    orch.kv_store.setdefault("er:last_source", "")
+    orch.kv_store.setdefault("er:audio_enabled", True)
+    orch.kv_store.setdefault("er:visual_enabled", True)
+
 
 
     # --- Persistent memory wiring (MemoryStore + EmotionJournal) ---
@@ -466,6 +530,12 @@ async def main_async(cfg: AppConfig):
 
     asyncio.create_task(_clock_tick_loop())
 
+    if getattr(cfg, "ui", "repl") == "textual":
+        logger.info("Starting Textual UI …")
+        from microbrain.ui.textual_bridge import run_textual_frontend
+        await run_textual_frontend(orch, memdir=cfg.memdir)
+        return
+
     if cfg.voice:
         logger.info("Voice mode active … REPL disabled …")
         while True:
@@ -473,10 +543,6 @@ async def main_async(cfg: AppConfig):
 
     else:
         logger.info("Starting text REPL …")
-        if getattr(cfg, "ui", "repl") == "textual":
-            from microbrain.ui.textual_bridge import run_textual_frontend
-            await run_textual_frontend(orch)
-            return
         while True:
             # IMPORTANT: don't block the asyncio loop (lets clock/tick + background outputs run)
             raw = await asyncio.to_thread(input, "you> ")
@@ -538,6 +604,8 @@ def main():
         llm=args.llm,
         llm_model=args.llm_model,
         ui=getattr(args, "ui", "repl"),
+        mouth_backend=getattr(args, "mouth_backend", "auto"),
+        spoken_reply_bias_ttl_s=float(getattr(args, "spoken_reply_bias_ttl", 45.0)),
     )
 
     asyncio.run(main_async(cfg))

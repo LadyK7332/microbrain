@@ -15,7 +15,6 @@ from faster_whisper import WhisperModel
 @dataclass
 class WhisperAudioConfig:
     model_name: str = "small.en"
-    beam_size: int = 5
     device_index: Optional[int] = None
 
     # Target SR for VAD + Whisper (keep 16000 for best compatibility)
@@ -290,7 +289,7 @@ class WhisperAudioListener:
         segments, info = self._model.transcribe(
             audio,
             language="en",
-            beam_size=int(getattr(self.cfg, 'beam_size', 5) or 5),
+            beam_size=1,
             vad_filter=False,
         )
 
@@ -308,6 +307,4 @@ class WhisperAudioListener:
                     self.on_utterance(text, pcm, self.cfg.sample_rate)
                 except Exception as e:
                     self._dbg(f"[whisper_audio] on_utterance error: {e}")
-                # Avoid double emission: when on_utterance is used, the caller already has the transcript.
-                return
             self.on_transcript(text)

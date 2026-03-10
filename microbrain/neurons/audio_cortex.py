@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import time
 from typing import Any, Dict, Iterable, Optional
 
 from microbrain.orchestrator.neuron_base import BaseNeuron, NeuronConfig, Event
@@ -68,26 +69,86 @@ class AudioCortexNeuron(BaseNeuron):
             )
             return []
 
+        # Only finalized utterances should become percept/text. The broader
+        # percept/audio event often carries the same transcription and causes
+        # duplicate forwarding into the bus.
+        if event.topic == "percept/audio":
+            await ctx.log_debug(
+                f"[{self.name}] Ignoring percept/audio for text forwarding; utterance path owns STT ingress",
+                topic=event.topic,
+                text_preview=raw_text[:80],
+            )
+            return []
+
+        # Suppress likely self-echo from MB's own recent speech before we
+        # convert the utterance into percept/text.
+        try:
+            mute_until = float(await ctx.get_kv("ears:mute_until", 0.0) or 0.0)
+            last_spoken = await ctx.get_kv("tts:last_spoken", {}) or {}
+            now = time.time()
+
+            if mute_until and now < mute_until:
+                await ctx.log_debug(
+                    f"[{self.name}] Suppressing likely self-echo during mute window",
+                    text_preview=raw_text[:80],
+                )
+                return []
+
+            if isinstance(last_spoken, dict):
+                last_text = str(last_spoken.get("text", "") or "").strip().lower()
+                last_ts = float(last_spoken.get("ts", 0.0) or 0.0)
+                if last_text and last_text == raw_text.lower() and (now - last_ts) <= 8.0:
+                    await ctx.log_debug(
+                        f"[{self.name}] Suppressing confirmed self-echo match",
+                        text_preview=raw_text[:80],
+                    )
+                    return []
+        except Exception:
+            pass
+
         confidence = payload.get("confidence", None)
         speaker = payload.get("speaker", "user")
         channel = str(payload.get("channel", "repl"))
 
+        # Spoken interaction should bias MB toward spoken replies for a short
+        # while, but the core reasoner should remain transport-agnostic.
+        try:
+            ttl_s = float(await ctx.get_kv("speech:audio_bias_ttl_s", 45.0) or 45.0)
+            now = time.time()
+            await ctx.set_kv(
+                "interaction:last_input",
+                {
+                    "ts": now,
+                    "source": "user",
+                    "transport_source": "mic",
+                    "channel": channel,
+                    "modality": "audio",
+                    "text": raw_text[:160],
+                    "spoken_bias_until": now + max(0.0, ttl_s),
+                },
+            )
+        except Exception:
+            pass
+
         raw_meta: Dict[str, Any] = payload.get("raw_meta", {}) or {}
-        # Tag that this came from mic/audio, not typed CLI
+        # Spoken input is semantically from the user, transported by mic/audio.
         raw_meta.update(
             {
                 "input_modality": "audio",
                 "speaker": speaker,
                 "stt_confidence": confidence,
-                "source": "mic",
+                "transport_source": "mic",
+                "source": "user",
                 "channel": channel,
+                "sensor_lobe": "audio",
+                "adapter": self.name,
             }
         )
 
         # Build normalized text percept payload
         text_payload: Dict[str, Any] = {
             "text": raw_text,
-            "source": "mic",
+            "source": "user",
             "channel": channel,
             "raw_meta": raw_meta,
         }

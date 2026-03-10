@@ -40,6 +40,11 @@ class CuriosityDriveNeuron(BaseNeuron):
         if event.topic not in ("clock/tick", "percept/text", "percept/vision", "act/speech"):
             return []
 
+        # Legacy curiosity mode is now opt-in. The initiative threshold neuron
+        # is the default arbiter for autonomous thought / outward clarification.
+        if not bool(await ctx.get_kv("initiative:legacy_curiosity", False)):
+            return []
+
         # Load curiosity internal state (persists across runs)
         state = await self.load_state(
             ctx,

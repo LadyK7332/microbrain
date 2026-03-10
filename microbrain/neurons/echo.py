@@ -16,10 +16,8 @@ class EchoNeuron(BaseNeuron):
             meta=event.meta,
         )
 
-        # Default OFF: echo is for debug/calibration only.
-        # Enable by setting KV: echo:enabled = True
-        echo_enabled = bool(await ctx.get_kv("echo:enabled", False))
-        if not echo_enabled:
+        # Legacy debug helper only. Default OFF so MB does not parrot the user back.
+        if not bool(await ctx.get_kv("echo:enabled", False)):
             return []
 
         # Echo only human-meaningful text (prevents "JSON toxin" / meta leakage)

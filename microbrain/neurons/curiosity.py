@@ -19,6 +19,11 @@ class CuriosityNeuron(BaseNeuron):
         if event.topic != "clock/tick":
             return []
 
+        # Legacy curiosity mode is now opt-in. The initiative threshold neuron
+        # owns autonomous reflection by default so MB stays constrained/objective.
+        if not bool(await ctx.get_kv("initiative:legacy_curiosity", False)):
+            return []
+
         boredom = await ctx.get_kv("drive:boredom", {})
         level = float(boredom.get("level", 0.0) or 0.0)
         active = bool(boredom.get("active", False))

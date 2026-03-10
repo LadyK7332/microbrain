@@ -75,11 +75,9 @@ class ConceptBinderNeuron(BaseNeuron):
                         ctx=ctx,
                     )
 
-        elif event.topic in ("percept/vision", "percept/audio", "percept/audio_utterance", "percept/touch"):
+        elif event.topic in ("percept/vision", "percept/audio", "percept/touch"):
             # Keep only the latest item per channel (cheap STM)
-            # Treat audio_utterance as audio for binding purposes.
-            key = "percept/audio" if event.topic == "percept/audio_utterance" else event.topic
-            recents[key] = {
+            recents[event.topic] = {
                 "ts": now,
                 "payload": event.payload,
                 "source": event.source,

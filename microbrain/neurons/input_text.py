@@ -90,6 +90,23 @@ class TextInputNeuron(BaseNeuron):
             source = "user"
         merged_meta["transport_source"] = transport_source
 
+        # Record recent interaction mode so speech output can choose an adapter
+        # without forcing the reasoner to know about transport details.
+        try:
+            await ctx.set_kv(
+                "interaction:last_input",
+                {
+                    "ts": time.time(),
+                    "source": source,
+                    "transport_source": transport_source,
+                    "channel": channel,
+                    "modality": "text",
+                    "text": text_norm[:160],
+                },
+            )
+        except Exception:
+            pass
+
         # ----------------------------------------------
         # 2.5) Reinforcement snapshot latch (/r ...)
         # ----------------------------------------------

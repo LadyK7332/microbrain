@@ -28,6 +28,8 @@ class AppConfig:
     tts_volume: float = 0.9
     log_level: str = "INFO"
     ui: str = "repl"  # repl | textual
+    mouth_backend: str = "auto"  # auto | ipc | local | none
+    spoken_reply_bias_ttl_s: float = 45.0
 
     def __post_init__(self) -> None:
         # Canonical memdir for all subsystems (logging, memory, tools, future files).
