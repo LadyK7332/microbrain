@@ -46,6 +46,33 @@ class EngramConsolidatorNeuron(BaseNeuron):
         if event.topic != "clock/tick":
             return []
 
+        now = time.time()
+        sleep_active = bool(await ctx.get_kv("power:sleep", False))
+        charging_active = bool(await ctx.get_kv("power:charging", False))
+        power_state = str(await ctx.get_kv("power:state", "") or "")
+
+        # Maintenance-only: only run when the organism is actually parked.
+        if not sleep_active or not charging_active:
+            return []
+        if power_state and power_state not in ("charge", "charging", "sleep_charge"):
+            return []
+
+        sleep_set_ts = _safe_float(await ctx.get_kv("power:sleep_last_set_ts", 0.0), 0.0)
+        charge_set_ts = _safe_float(
+            await ctx.get_kv("power:charging_last_set_ts", await ctx.get_kv("power:charging_last_event_ts", 0.0)),
+            0.0,
+        )
+        settle_s = _safe_float(await ctx.get_kv("engram:settle_after_sleep_charge_s", 300.0), 300.0)
+        since_sleep = (now - sleep_set_ts) if sleep_set_ts > 0 else 1e9
+        since_charge = (now - charge_set_ts) if charge_set_ts > 0 else 1e9
+        if since_sleep < settle_s or since_charge < settle_s:
+            return []
+
+        min_interval_s = _safe_float(await ctx.get_kv("engram:min_interval_s", 900.0), 900.0)
+        last_completed_ts = _safe_float(await self.load_state(ctx, "last_completed_ts", 0.0), 0.0)
+        if last_completed_ts > 0 and (now - last_completed_ts) < min_interval_s:
+            return []
+
         memdir = await resolve_memdir_ctx(ctx, fallback=r"Z:\memory")
         syn_path = memdir / "synapses.jsonl"
         concepts_dir = memdir / "concepts"
@@ -58,6 +85,26 @@ class EngramConsolidatorNeuron(BaseNeuron):
         if not syn_path.exists():
             return []
 
+        offset = _safe_int(await self.load_state(ctx, "syn_offset", 0), 0)
+        min_pending_bytes = _safe_int(await ctx.get_kv("engram:min_pending_bytes", 256), 256)
+
+        try:
+            current_size = _safe_int(syn_path.stat().st_size, 0)
+        except Exception:
+            current_size = 0
+
+        pending_bytes = max(0, current_size - offset)
+        if pending_bytes < min_pending_bytes:
+            return []
+
+        await ctx.log_info(
+            f"[{self.name}] consolidation started",
+            pending_bytes=pending_bytes,
+            sleep_active=sleep_active,
+            charging_active=charging_active,
+        )
+        run_started = time.time()
+
         promote_w = _safe_float(await ctx.get_kv("engram:edge_promote_w", 0.30), 0.30)
         max_lines = _safe_int(await ctx.get_kv("engram:max_lines", 500), 500)
 
@@ -68,7 +115,6 @@ class EngramConsolidatorNeuron(BaseNeuron):
 
         announce = bool(await ctx.get_kv("engram:announce", False))
 
-        offset = _safe_int(await self.load_state(ctx, "syn_offset", 0), 0)
         promoted: Dict[str, Any] = await self.load_state(ctx, "promoted", default={}) or {}
         if not isinstance(promoted, dict):
             promoted = {}
@@ -162,6 +208,26 @@ class EngramConsolidatorNeuron(BaseNeuron):
                 await self.save_state(ctx, "syn_offset", new_offset)
             await self.save_state(ctx, "promoted", promoted)
 
+            completed_ts = time.time()
+            runtime_s = round(completed_ts - run_started, 4)
+            await self.save_state(ctx, "last_completed_ts", completed_ts)
+            await self.save_state(
+                ctx,
+                "last_run_completed",
+                {
+                    "ts": completed_ts,
+                    "runtime_s": runtime_s,
+                    "processed_bytes": max(0, int(new_offset) - int(offset)),
+                    "promoted_count": len(outputs) if announce else 0,
+                },
+            )
+            await ctx.log_info(
+                f"[{self.name}] consolidation completed",
+                runtime_s=runtime_s,
+                processed_bytes=max(0, int(new_offset) - int(offset)),
+                promoted_count=len(outputs) if announce else 0,
+            )
+
         return outputs
 
 
@@ -171,6 +237,6 @@ def build_neurons(orchestrator):
         subscribed_topics=["clock/tick"],
         output_topics=["act/speech"],
         priority=7,
-        cooldown_sec=1.0,
+        cooldown_sec=0.0,
     )
     yield EngramConsolidatorNeuron(cfg)

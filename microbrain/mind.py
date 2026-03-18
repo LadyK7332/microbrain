@@ -67,17 +67,17 @@ def build_arg_parser():
     p.add_argument("--voice", action="store_true")
     p.add_argument("--mic-device", type=int, default=None)
     p.add_argument("--sample-rate", type=int, default=16000)
-    p.add_argument("--ui", choices=["repl", "textual"], default="repl")
+    p.add_argument("--ui", choices=["repl", "textual"], default="textual")
     p.add_argument("--whisper-model", default="small.en")
     p.add_argument("--vad-aggressiveness", type=int, default=2)    
     
-    p.add_argument("--tts", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--tts", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--tts-voice", default="Zira")
     p.add_argument("--tts-rate", type=int, default=155)
     p.add_argument("--tts-volume", type=float, default=0.9)
     p.add_argument(
         "--mouth-backend",
-        default="auto",
+        default="none",
         choices=["auto", "ipc", "local", "none"],
         help="Speech transport: auto prefers IPC briefly after spoken input, otherwise local TTS.",
     )
@@ -229,23 +229,24 @@ async def main_async(cfg: AppConfig):
     vosk_listener = None  # will hold VoskAudioListener if voice is enabled
 
     # TTS output is independent from mic/STT. Configure the speech_output neuron via KV.
-    orch.kv_store["tts:enabled"] = bool(getattr(cfg, "tts_enabled", True))
+    orch.kv_store["tts:enabled"] = bool(getattr(cfg, "tts_enabled", False))
     orch.kv_store["tts:voice"] = getattr(cfg, "tts_voice", "Zira")
     orch.kv_store["tts:rate"] = int(getattr(cfg, "tts_rate", 155))
     orch.kv_store["tts:volume"] = float(getattr(cfg, "tts_volume", 0.9))
-    orch.kv_store["mouth:enabled"] = True
-    orch.kv_store["mouth:local_fallback"] = True
+    orch.kv_store["mouth:enabled"] = False
+    orch.kv_store["mouth:local_fallback"] = False
     
     # Legacy echo helper is default OFF so spoken input is not parroted back.
     orch.kv_store.setdefault("echo:enabled", False)
-    ensure_token_file(Path(cfg.memdir) / "ipc_token.txt")
-    orch.kv_store["speech:transport_mode"] = getattr(cfg, "mouth_backend", "auto")
-    orch.kv_store["speech:default_transport"] = "local"
-    orch.kv_store["speech:audio_preferred_transport"] = "ipc"
+    mouth_backend = str(getattr(cfg, "mouth_backend", "none")).lower()
+    orch.kv_store["mouth:enabled"] = mouth_backend != "none"
+    orch.kv_store["speech:transport_mode"] = mouth_backend
+    orch.kv_store["speech:default_transport"] = "none"
+    orch.kv_store["speech:audio_preferred_transport"] = "none"
     orch.kv_store["speech:audio_bias_ttl_s"] = float(getattr(cfg, "spoken_reply_bias_ttl_s", 45.0))
     orch.kv_store.setdefault("interaction:last_input", {})
-    ensure_token_file(Path(cfg.memdir) / "ipc_token.txt")
-
+    if mouth_backend != "none":
+        ensure_token_file(Path(cfg.memdir) / "ipc_token.txt")
 
     # Power schedule / sleep controls (OFF unless explicitly enabled).
     orch.kv_store.setdefault("power:sleep", False)
@@ -286,8 +287,6 @@ async def main_async(cfg: AppConfig):
     orch.kv_store.setdefault("er:audio_enabled", True)
     orch.kv_store.setdefault("er:visual_enabled", True)
 
-
-
     # --- Persistent memory wiring (MemoryStore + EmotionJournal) ---
     mem_store = MemoryStore(
         memdir=cfg.memdir,
@@ -320,6 +319,11 @@ async def main_async(cfg: AppConfig):
 
     auto_register_neurons(orch)
 
+    if "speech_output" not in orch.neurons:
+        logger.warning("speech_output neuron did not register; act/speech will not reach IPC or local TTS.")
+    else:
+        logger.info("speech_output neuron registered.")
+
     # Provide the LLM backend used by LLMReasonerNeuron
     #
     # If you pass --model none (or off), we run "babble backend" instead of an LLM.
@@ -346,14 +350,12 @@ async def main_async(cfg: AppConfig):
         if inspect.isawaitable(out):
             out = await out
 
-
-        # IMPORTANT: if backend_generate returns a coroutine, await it
-        if asyncio.iscoroutine(out):
-            out = await out
-
         out = str(out or "")
 
-        if out:
+        # Mirror into reason/output only for genuinely internal cognition.
+        # User-facing repl/default/cli replies should stay on the speech path only.
+        meta_channel = str(m.get("channel", "") or "").lower()
+        if out and meta_channel in ("internal", "thought"):
             await orch.push_event(
                 "reason/output",
                 out,
@@ -371,16 +373,12 @@ async def main_async(cfg: AppConfig):
         )
         return out
 
-    # --- LLM wiring (opt-in) ---
-    # NOTE: llm:enabled is set earlier (before auto_register_neurons) so the llm_reasoner
-    # neuron is only registered when explicitly enabled.
+    # --- LLM/backend wiring (opt-in) ---
     if orch.kv_store.get("llm:enabled", False):
         orch.kv_store["llm:generate"] = generate_with_state
     else:
-        # Leave the key absent (or set to None). Absent is cleaner for "not installed".
         orch.kv_store.pop("llm:generate", None)
-
-
+    
     # --- Optional: Whisper mic listener -> percept/audio events ---
     whisper_listener = None  # will hold WhisperAudioListener if voice is enabled
 

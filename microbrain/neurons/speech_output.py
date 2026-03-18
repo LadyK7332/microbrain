@@ -8,8 +8,13 @@ from microbrain.orchestrator.orchestrator import Orchestrator
 from microbrain.orchestrator.debug_utils import is_debug_enabled
 from microbrain.utils.memdir import resolve_memdir_ctx
 from microbrain.ipc.file_inbox import IPCFileWriter
-from microbrain.voice.tts import TTS
 
+try:
+    from microbrain.voice.tts import TTS  # optional; only needed for local backend
+    _TTS_IMPORT_ERROR = None
+except Exception as _e:
+    TTS = None
+    _TTS_IMPORT_ERROR = repr(_e)
 
 
 class SpeechOutputNeuron(BaseNeuron):
@@ -92,6 +97,21 @@ class SpeechOutputNeuron(BaseNeuron):
         return published is not None
 
     async def _speak_local(self, ctx, text: str, voice, rate, volume) -> bool:
+        if TTS is None:
+            await ctx.set_kv(
+                "tts:last_error",
+                {
+                    "ts": time.time(),
+                    "error": f"local_tts_unavailable: {_TTS_IMPORT_ERROR}",
+                    "text": text,
+                },
+            )
+            await ctx.log_warn(
+                "[speech_output] Local TTS unavailable; speech_output still loaded, but local backend cannot speak",
+                import_error=_TTS_IMPORT_ERROR,
+            )
+            return False
+
         cfg_tuple = (voice, int(rate), float(volume))
         if self._tts is None or self._tts_cfg != cfg_tuple:
             self._tts = TTS(rate=int(rate), volume=float(volume), preferred=voice or "")
@@ -110,6 +130,15 @@ class SpeechOutputNeuron(BaseNeuron):
         return True
 
     async def process(self, event: Event, ctx) -> Iterable[Event]:
+        await ctx.set_kv(
+            "speech_output:last_seen",
+            {
+                "ts": time.time(),
+                "topic": event.topic,
+                "source": event.source,
+            },
+        )
+
         # --- debug roll call (only active when --debug is passed) ----
         self.debug(
             "received",

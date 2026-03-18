@@ -70,7 +70,7 @@ class AudioCortexNeuron(BaseNeuron):
             return []
 
         # Only finalized utterances should become percept/text. The broader
-        # percept/audio event often carries the same transcription and causes
+                # percept/audio event often carries the same transcription and causes
         # duplicate forwarding into the bus.
         if event.topic == "percept/audio":
             await ctx.log_debug(
@@ -112,6 +112,7 @@ class AudioCortexNeuron(BaseNeuron):
 
         # Spoken interaction should bias MB toward spoken replies for a short
         # while, but the core reasoner should remain transport-agnostic.
+        
         try:
             ttl_s = float(await ctx.get_kv("speech:audio_bias_ttl_s", 45.0) or 45.0)
             now = time.time()

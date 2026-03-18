@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Any, Dict
 
@@ -46,6 +46,9 @@ class PDNAProfile:
     crisis_interactions: int = 0
     affectionate_interactions: int = 0
     technical_interactions: int = 0
+
+    # Optional endocrine / modulation overrides for math-based behavior tuning.
+    hormone_overrides: Dict[str, float] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

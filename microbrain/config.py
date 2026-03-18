@@ -22,12 +22,12 @@ class AppConfig:
     whisper_model: str = "small.en"     # faster-whisper model name
     vad_aggressiveness: int = 2         # 0..3 (more aggressive = fewer false positives)
     voice: bool = False  # mic/STT input
-    tts_enabled: bool = True
+    tts_enabled: bool = False
     tts_voice: str | None = "Zira"
     tts_rate: int = 155
     tts_volume: float = 0.9
     log_level: str = "INFO"
-    ui: str = "repl"  # repl | textual
+    ui: str = "textual"  # repl | textual
     mouth_backend: str = "auto"  # auto | ipc | local | none
     spoken_reply_bias_ttl_s: float = 45.0
 

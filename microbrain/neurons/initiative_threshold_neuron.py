@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
+from microbrain.hormone import derive_ddna_modulators, merge_need_maps
 from microbrain.orchestrator.neuron_base import BaseNeuron, Event, NeuronConfig
 from microbrain.orchestrator.orchestrator import Orchestrator
 
@@ -160,6 +161,9 @@ class InitiativeThresholdNeuron(BaseNeuron):
         affect_state = await ctx.get_kv("affect:state", {}) or {}
         global_salience = await ctx.get_kv("affect:global_salience", None)
         pdna = await ctx.get_kv("pdna:profile", None)
+        ddna_mods = await ctx.get_kv("drive:ddna_modulators", None)
+        base_needs = await ctx.get_kv("drive:needs_base", {}) or {}
+        shared_hormones = await ctx.get_kv("drive:hormones", {}) or {}
         power_state = await ctx.get_kv("power:state", {}) or {}
         r_pending = bool(await ctx.get_kv("control:r_pending", False))
 
@@ -172,11 +176,18 @@ class InitiativeThresholdNeuron(BaseNeuron):
         elif isinstance(affect_state, dict):
             salience = float(affect_state.get("salience", 0.0) or 0.0)
 
-        warmth = float(getattr(pdna, "warmth", 0.6) if pdna is not None else 0.6)
+        if not isinstance(ddna_mods, dict) or not ddna_mods:
+            ddna_mods = derive_ddna_modulators(pdna)
+
         introspection = float(getattr(pdna, "introspection", 0.6) if pdna is not None else 0.6)
         focus = float(getattr(pdna, "focus", 0.6) if pdna is not None else 0.6)
         energy = float(getattr(pdna, "energy", 0.5) if pdna is not None else 0.5)
         support_level = float(getattr(pdna, "support_level", 0.7) if pdna is not None else 0.7)
+
+        expression_bias = float((ddna_mods or {}).get("expression_bias", 1.0) or 1.0)
+        restraint_bias = float((ddna_mods or {}).get("restraint_bias", 1.0) or 1.0)
+        caution_gain = float((ddna_mods or {}).get("caution_gain", 1.0) or 1.0)
+        persistence_gain = float((ddna_mods or {}).get("persistence_gain", 1.0) or 1.0)
 
         time_since_user = max(0.0, now - float(state.get("last_user_ts", now) or now))
         time_since_external = max(0.0, now - float(state.get("last_external_ts", now) or now))
@@ -198,52 +209,20 @@ class InitiativeThresholdNeuron(BaseNeuron):
             if bool(state.get("clarify_said", False)):
                 continuity_need *= 0.50
 
-        needs = {
-            "stimulation": round(stimulation_need, 4),
-            "social": round(social_need, 4),
-            "coherence": round(coherence_need, 4),
-            "continuity": round(continuity_need, 4),
-            "safety": round(stress_level, 4),
-            "salience": round(_clamp(salience), 4),
-        }
-
-        hormones = dict(state.get("hormones", {}) or {})
-        prev_arousal = float(hormones.get("arousal", 0.15) or 0.15)
-        prev_inquiry = float(hormones.get("inquiry", 0.10) or 0.10)
-        prev_affiliation = float(hormones.get("affiliation", 0.10) or 0.10)
-        prev_settling = float(hormones.get("settling", 0.80) or 0.80)
-
-        arousal = _clamp(
-            (0.72 * prev_arousal)
-            + (0.18 * salience)
-            + (0.20 * stress_level)
-            + (0.10 * stimulation_need)
-            + (0.06 * energy)
-        )
-        inquiry = _clamp(
-            (0.68 * prev_inquiry)
-            + (0.26 * coherence_need)
-            + (0.22 * continuity_need)
-            + (0.12 * stimulation_need)
-            + (0.06 * focus)
-        )
-        affiliation = _clamp(
-            (0.76 * prev_affiliation)
-            + (0.22 * social_need)
-            + (0.08 * warmth)
-        )
-        settling = _clamp(
-            (0.70 * prev_settling)
-            + (0.18 * (1.0 - stress_level))
-            + (0.08 * (1.0 - coherence_need))
+        needs = merge_need_maps(
+            base_needs,
+            {
+                "stimulation": round(stimulation_need, 4),
+                "social": round(social_need, 4),
+                "coherence": round(coherence_need, 4),
+                "continuity": round(continuity_need, 4),
+                "safety": round(stress_level, 4),
+                "salience": round(_clamp(salience), 4),
+                "novelty": round(max(stimulation_need, min(1.0, time_since_external / 90.0)), 4),
+            },
         )
 
-        hormones = {
-            "arousal": round(arousal, 4),
-            "inquiry": round(inquiry, 4),
-            "affiliation": round(affiliation, 4),
-            "settling": round(settling, 4),
-        }
+        hormones = dict(shared_hormones or {}) if isinstance(shared_hormones, dict) else {}
         state["hormones"] = hormones
 
         sleeping = bool((power_state or {}).get("sleep", False))
@@ -256,26 +235,43 @@ class InitiativeThresholdNeuron(BaseNeuron):
         if r_pending:
             interruption_cost += 0.60
 
+        arousal = float(hormones.get("arousal", 0.15) or 0.15)
+        inquiry = float(hormones.get("inquiry", 0.10) or 0.10)
+        affiliation = float(hormones.get("affiliation", 0.10) or 0.10)
+        caution = float(hormones.get("caution", 0.20) or 0.20)
+        settling = float(hormones.get("settling", 0.80) or 0.80)
+        persistence = float(hormones.get("persistence", 0.45) or 0.45)
+        continuity_h = float(hormones.get("continuity", continuity_need) or continuity_need)
+
         think_pressure = _clamp(
-            (0.42 * inquiry)
-            + (0.22 * continuity_need)
-            + (0.14 * stimulation_need)
-            + (0.10 * salience)
+            (0.36 * inquiry)
+            + (0.20 * continuity_h)
+            + (0.12 * stimulation_need)
+            + (0.08 * salience)
             + (0.08 * introspection)
+            + (0.08 * persistence * persistence_gain)
+            - (0.12 * caution * caution_gain)
             - (0.18 * overload)
         )
         talk_pressure = _clamp(
-            (0.34 * inquiry)
-            + (0.24 * continuity_need)
-            + (0.18 * affiliation)
-            + (0.12 * social_need)
-            + (0.08 * salience)
+            expression_bias * (
+                (0.28 * inquiry)
+                + (0.22 * continuity_h)
+                + (0.18 * affiliation)
+                + (0.10 * social_need)
+                + (0.06 * salience)
+                + (0.04 * arousal)
+            )
+            - (0.14 * caution * caution_gain)
+            - (0.12 * interruption_cost)
+            - (0.10 * max(0.0, restraint_bias - 1.0))
             - (0.20 * overload)
-            - (0.18 * interruption_cost)
         )
 
         if not bool(pending_flags.get("clarify_ready", False)):
             talk_pressure *= 0.60
+        if settling > 0.80 and not pending_text:
+            talk_pressure *= 0.85
 
         tier_score = max(think_pressure, talk_pressure)
         prev_tier = int(state.get("tier", 0) or 0)
@@ -300,7 +296,6 @@ class InitiativeThresholdNeuron(BaseNeuron):
         }
 
         await ctx.set_kv("drive:needs_stack", needs)
-        await ctx.set_kv("drive:hormones", hormones)
         await ctx.set_kv("initiative:last", initiative_snapshot)
         await ctx.set_kv("initiative:tier", new_tier)
 
@@ -392,9 +387,11 @@ class InitiativeThresholdNeuron(BaseNeuron):
         goal_hits = sum(1 for pat in _GOAL_WORDS if pat in lowered)
         has_question = "?" in lowered
         has_error_language = any(pat in lowered for pat in ("error", "issue", "problem", "not working", "stuck"))
+        has_response_request = any(pat in lowered for pat in ("please respond", "respond", "reply", "speak up", "can you hear me"))
 
         coherence_score = 0.0
         coherence_score += 0.30 if has_question else 0.0
+        coherence_score += 0.18 if has_response_request else 0.0
         coherence_score += min(0.35, 0.12 * marker_hits)
         coherence_score += 0.20 if option_hits > 0 else 0.0
         coherence_score += 0.10 if has_error_language else 0.0
@@ -404,6 +401,7 @@ class InitiativeThresholdNeuron(BaseNeuron):
             has_question
             or option_hits > 0
             or has_error_language
+            or has_response_request
             or (goal_hits > 0 and marker_hits > 0)
             or marker_hits >= 2
         )
@@ -412,10 +410,10 @@ class InitiativeThresholdNeuron(BaseNeuron):
             "has_question": has_question,
             "has_options": option_hits > 0,
             "has_error_language": has_error_language,
+            "has_response_request": has_response_request,
             "goal_hits": goal_hits,
             "marker_hits": marker_hits,
             "coherence_score": round(coherence_score, 4),
-            "clarify_ready": clarify_ready,
         }
 
     def _select_tier(
@@ -501,6 +499,8 @@ class InitiativeThresholdNeuron(BaseNeuron):
             return "I can take either path here. Which option should I optimize for?"
         if bool(flags.get("has_error_language", False)):
             return "I can dig in, but I need the target outcome first. What should success look like?"
+        if bool(flags.get("has_response_request", False)):
+            return "I hear you. What do you want me to respond with: a quick acknowledgement, an explanation, or a concrete action?"
         if bool(flags.get("has_question", False)):
             return "I have one missing variable. Do you want an explanation, a plan, or a concrete patch?"
         return f"I think the missing variable is the target outcome for: {compact} What should I optimize for?"
