@@ -41,6 +41,21 @@ DDNA_MOD_KEYS = (
     "volatility",
 )
 
+ROSEHIP_KEYS = (
+    "expression_brake",
+    "social_brake",
+    "redundancy_brake",
+    "interrupt_brake",
+    "sleep_quiet_brake",
+    "confidence_brake",
+    "internal_bias",
+    "external_bias",
+    "clarify_bias",
+    "outward_scale",
+    "internal_scale",
+    "direct_reply_floor",
+)
+
 
 def clamp(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
     if value < lo:
@@ -324,4 +339,122 @@ def derive_want_vector(
         "settle": round(settle, 4),
         "withhold": round(withhold, 4),
         "externalize": round(externalize, 4),
+    }
+
+
+def derive_rosehip_state(
+    hormones: Mapping[str, Any] | None,
+    *,
+    needs: Mapping[str, Any] | None = None,
+    ddna: Mapping[str, Any] | None = None,
+    context: Mapping[str, Any] | None = None,
+) -> Dict[str, float]:
+    h = HormoneState.from_mapping(hormones)
+    n = merge_need_maps(needs)
+    mods = dict(DEFAULT_DDNA_MODULATORS)
+    if isinstance(ddna, Mapping):
+        for key in DDNA_MOD_KEYS:
+            if key in ddna:
+                mods[key] = clamp(safe_float(ddna.get(key), mods[key]), 0.20, 2.00)
+
+    ctx = dict(context or {})
+    interruption = clamp(safe_float(ctx.get("interruption_cost", 0.0), 0.0))
+    redundancy = clamp(safe_float(ctx.get("redundancy", 0.0), 0.0))
+    confidence = clamp(safe_float(ctx.get("confidence", 0.55), 0.55))
+    direct_address = clamp(safe_float(ctx.get("direct_address", 0.0), 0.0))
+    recent_user = clamp(safe_float(ctx.get("recent_user", 0.0), 0.0))
+    answered = clamp(safe_float(ctx.get("answered", 0.0), 0.0))
+    recent_reply = clamp(safe_float(ctx.get("recent_reply", 0.0), 0.0))
+    repeated_direct = clamp(safe_float(ctx.get("repeated_direct", 0.0), 0.0))
+    sleeping = 1.0 if bool(ctx.get("sleeping", False)) else 0.0
+    charging = 1.0 if bool(ctx.get("charging", False)) else 0.0
+
+    expression_brake = clamp(
+        (0.34 * h.caution)
+        + (0.24 * (mods["restraint_bias"] / 2.0))
+        + (0.14 * redundancy)
+        + (0.10 * interruption)
+        + (0.16 * recent_reply)
+        + (0.10 * repeated_direct)
+        - (0.10 * direct_address)
+    )
+    social_brake = clamp(
+        (0.18 * n["social"] * max(0.0, mods["restraint_bias"] - 0.8))
+        + (0.16 * interruption)
+        + (0.10 * answered)
+        + (0.10 * recent_reply)
+        - (0.08 * direct_address)
+    )
+    redundancy_brake = clamp(
+        (0.60 * redundancy)
+        + (0.12 * answered)
+        + (0.22 * recent_reply)
+        + (0.18 * repeated_direct)
+    )
+    interrupt_brake = clamp(
+        (0.68 * interruption)
+        + (0.10 * sleeping)
+        + (0.12 * recent_reply)
+        - (0.10 * direct_address)
+    )
+    sleep_quiet_brake = clamp((0.88 * sleeping) + (0.10 * charging))
+    confidence_brake = clamp((1.0 - confidence) * (0.42 + (0.28 * h.caution)))
+
+    internal_bias = clamp(
+        (0.32 * h.inquiry)
+        + (0.22 * h.continuity)
+        + (0.14 * (mods["restraint_bias"] / 2.0))
+        + (0.10 * recent_user)
+    )
+    external_bias = clamp(
+        ((0.28 * h.affiliation) + (0.22 * h.inquiry) + (0.16 * n["social"]) + (0.12 * direct_address)) * mods["expression_bias"]
+        - (0.18 * expression_brake)
+    )
+    clarify_bias = clamp(
+        (0.34 * h.inquiry)
+        + (0.20 * h.caution)
+        + (0.14 * direct_address)
+        + (0.10 * n["coherence"])
+    )
+
+    outward_scale = clamp(
+        1.0
+        - (0.35 * expression_brake)
+        - (0.20 * redundancy_brake)
+        - (0.25 * interrupt_brake)
+        - (0.55 * sleep_quiet_brake),
+        0.05,
+        1.00,
+    )
+    internal_scale = clamp(
+        0.55
+        + (0.18 * internal_bias)
+        + (0.12 * h.continuity)
+        + (0.10 * (mods["restraint_bias"] / 2.0)),
+        0.25,
+        1.35,
+    )
+    direct_reply_floor = clamp(
+        0.16
+        + (0.22 * direct_address)
+        + (0.08 * recent_user)
+        - (0.05 * sleeping)
+        - (0.08 * recent_reply),
+        0.0,
+        0.75,
+    )
+
+    return {
+        "expression_brake": round(expression_brake, 4),
+        "social_brake": round(social_brake, 4),
+        "redundancy_brake": round(redundancy_brake, 4),
+        "interrupt_brake": round(interrupt_brake, 4),
+        "sleep_quiet_brake": round(sleep_quiet_brake, 4),
+        "confidence_brake": round(confidence_brake, 4),
+        "internal_bias": round(internal_bias, 4),
+        "external_bias": round(external_bias, 4),
+        "clarify_bias": round(clarify_bias, 4),
+        "outward_scale": round(outward_scale, 4),
+        "internal_scale": round(internal_scale, 4),
+        "direct_reply_floor": round(direct_reply_floor, 4),
     }

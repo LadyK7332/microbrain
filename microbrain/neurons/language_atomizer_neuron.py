@@ -193,8 +193,6 @@ class LanguageAtomizerNeuron(BaseNeuron):
         return out
 
     def _relation_candidates(self, tokens: List[TokenAtom]) -> List[Dict[str, Any]]:
-        # Approximate dependency-based subject/relation/object extraction using the
-        # flattened scaffold tokens we currently have. Robust enough for bootstrapping.
         out: List[Dict[str, Any]] = []
         current_subjects = [tok for tok in tokens if tok.dep in ("nsubj", "nsubjpass") and tok.pos in ("NOUN", "PROPN", "PRON")]
         current_objects = [tok for tok in tokens if tok.dep in ("dobj", "obj", "pobj", "attr", "oprd") and tok.pos in ("NOUN", "PROPN", "PRON")]

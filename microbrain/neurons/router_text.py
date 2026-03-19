@@ -50,7 +50,7 @@ class TextRouterNeuron(BaseNeuron):
 
     Emits:
         - "act/speech"     for fast, low-latency responses
-        - "reason/request" for heavier LLM reasoning
+        - "reason/request" for the downstream responder path
 
     Routing rules (v1, simple):
 
@@ -64,7 +64,7 @@ class TextRouterNeuron(BaseNeuron):
          → quick friendly reply via act/speech
 
     3) Everything else:
-       → forward to LLMReasoner via "reason/request"
+       → forward to the responder path via "reason/request"
     """
 
     async def process(self, event: Event, ctx) -> Iterable[Event]:
@@ -754,7 +754,7 @@ class TextRouterNeuron(BaseNeuron):
 
             # Past warmup: let the reasoner handle it (learned/personalized)
             await ctx.log_debug(
-                f"[{self.name}] Greeting forwarded to LLM (post-warmup)",
+                f"[{self.name}] Greeting forwarded to responder path (post-warmup)",
                 text=text,
                 channel=channel,
                 semantic_n=semantic_n,
@@ -763,10 +763,10 @@ class TextRouterNeuron(BaseNeuron):
             # fall through to default forwarding
 
         # ------------------------------
-        # 3) Default: forward to LLM
+        # 3) Default: forward to responder path
         # ------------------------------
         await ctx.log_debug(
-            f"[{self.name}] Forwarding to LLM reasoner",
+            f"[{self.name}] Forwarding to responder path",
             channel=channel,
         )
 

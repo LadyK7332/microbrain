@@ -245,6 +245,13 @@ async def main_async(cfg: AppConfig):
     orch.kv_store["speech:audio_preferred_transport"] = "none"
     orch.kv_store["speech:audio_bias_ttl_s"] = float(getattr(cfg, "spoken_reply_bias_ttl_s", 45.0))
     orch.kv_store.setdefault("interaction:last_input", {})
+    orch.kv_store.setdefault("rosehip:enabled", True)
+    orch.kv_store.setdefault("rosehip:conversation_hold_s", 12.0)
+    orch.kv_store.setdefault("rosehip:repeat_reply_window_s", 18.0)
+    orch.kv_store.setdefault("rosehip:reply_cooldown_s", 10.0)
+    orch.kv_store.setdefault("rosehip:repeat_direct_window_s", 14.0)
+    orch.kv_store.setdefault("rosehip:thought_min_interval_s", 35.0)
+    orch.kv_store.setdefault("rosehip:clarify_min_interval_s", 30.0)
     if mouth_backend != "none":
         ensure_token_file(Path(cfg.memdir) / "ipc_token.txt")
 

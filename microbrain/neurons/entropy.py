@@ -291,6 +291,6 @@ def build_neurons(orchestrator: Orchestrator):
         subscribed_topics=["clock/tick"],
         output_topics=[],
         priority=9,       # late; after learning edges were written
-        cooldown_sec=0.5,
+        cooldown_sec=0.0,  # quiet: use internal run_every_s instead of base cooldown spam
     )
     yield EntropyNeuron(cfg)

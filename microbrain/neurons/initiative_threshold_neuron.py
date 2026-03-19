@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
-from microbrain.hormone import derive_ddna_modulators, merge_need_maps
+from microbrain.hormone import derive_ddna_modulators, derive_rosehip_state, merge_need_maps
 from microbrain.orchestrator.neuron_base import BaseNeuron, Event, NeuronConfig
 from microbrain.orchestrator.orchestrator import Orchestrator
 
@@ -273,6 +273,79 @@ class InitiativeThresholdNeuron(BaseNeuron):
         if settling > 0.80 and not pending_text:
             talk_pressure *= 0.85
 
+        rosehip_enabled = bool(await ctx.get_kv("rosehip:enabled", True))
+        direct_address = 1.0 if (
+            bool(pending_flags.get("has_question", False))
+            or bool(pending_flags.get("has_response_request", False))
+        ) else 0.0
+        recent_user = _clamp(
+            1.0 - (
+                time_since_user
+                / max(1.0, float(await ctx.get_kv("rosehip:conversation_hold_s", 12.0) or 12.0))
+            )
+        )
+
+        redundancy = 0.0
+        repeat_window_s = float(await ctx.get_kv("rosehip:repeat_reply_window_s", 18.0) or 18.0)
+        if time_since_speech < repeat_window_s:
+            redundancy += _clamp(1.0 - (time_since_speech / max(1.0, repeat_window_s)))
+        if bool(state.get("clarify_said", False)):
+            redundancy += 0.25
+        redundancy = _clamp(redundancy)
+
+        recent_reply_window_s = float(await ctx.get_kv("rosehip:reply_cooldown_s", 10.0) or 10.0)
+        recent_reply = 0.0
+        if time_since_speech < recent_reply_window_s:
+            recent_reply = _clamp(1.0 - (time_since_speech / max(1.0, recent_reply_window_s)))
+
+        repeated_direct = 0.0
+        repeat_direct_window_s = float(await ctx.get_kv("rosehip:repeat_direct_window_s", 14.0) or 14.0)
+        if direct_address > 0.0 and bool(state.get("pending_answered", False)) and time_since_speech < repeat_direct_window_s:
+            repeated_direct = _clamp(1.0 - (time_since_speech / max(1.0, repeat_direct_window_s)))
+
+        confidence = _clamp(
+            0.55
+            + (0.25 * float(pending_flags.get("coherence_score", 0.0) or 0.0))
+            + (0.10 if pending_text else 0.0)
+        )
+        rosehip = derive_rosehip_state(
+            hormones,
+            needs=needs,
+            ddna=ddna_mods,
+            context={
+                "interruption_cost": interruption_cost,
+                "redundancy": redundancy,
+                "confidence": confidence,
+                "direct_address": direct_address,
+                "recent_user": recent_user,
+                "answered": 1.0 if bool(state.get("pending_answered", False)) else 0.0,
+                "recent_reply": recent_reply,
+                "repeated_direct": repeated_direct,
+                "sleeping": sleeping,
+                "charging": bool((power_state or {}).get("charging", False)),
+            },
+        ) if rosehip_enabled else {}
+        await ctx.set_kv("drive:rosehip", rosehip)
+
+        if rosehip:
+            think_pressure = _clamp((think_pressure * float(rosehip.get("internal_scale", 1.0) or 1.0)) + (0.08 * float(rosehip.get("internal_bias", 0.0) or 0.0)))
+            talk_pressure = _clamp(
+                (talk_pressure * float(rosehip.get("outward_scale", 1.0) or 1.0))
+                + (0.10 * float(rosehip.get("external_bias", 0.0) or 0.0))
+                - (0.18 * float(rosehip.get("expression_brake", 0.0) or 0.0))
+                - (0.12 * float(rosehip.get("redundancy_brake", 0.0) or 0.0))
+                - (0.16 * float(rosehip.get("interrupt_brake", 0.0) or 0.0))
+                - (0.20 * float(rosehip.get("sleep_quiet_brake", 0.0) or 0.0))
+                - (0.10 * float(rosehip.get("confidence_brake", 0.0) or 0.0))
+            )
+            if direct_address > 0.0:
+                # Direct user address should still get through, but repeated
+                # immediate follow-ups should de-escalate toward shorter/cleaner replies.
+                talk_pressure = max(
+                    talk_pressure,
+                    min(float(rosehip.get("direct_reply_floor", 0.0) or 0.0), 0.72),
+                )
+
         tier_score = max(think_pressure, talk_pressure)
         prev_tier = int(state.get("tier", 0) or 0)
         new_tier = self._select_tier(
@@ -293,6 +366,7 @@ class InitiativeThresholdNeuron(BaseNeuron):
             "clarify_ready": bool(pending_flags.get("clarify_ready", False)),
             "pending_text": pending_text,
             "pending_age_s": round(pending_age, 3),
+            "rosehip": rosehip,
         }
 
         await ctx.set_kv("drive:needs_stack", needs)
@@ -306,9 +380,9 @@ class InitiativeThresholdNeuron(BaseNeuron):
             new_tier >= 2
             and not sleeping
             and time_since_user >= 1.5
-            and (prev_tier < 2 or (now - float(state.get("last_thought_ts", 0.0) or 0.0)) >= 35.0)
+            and (prev_tier < 2 or (now - float(state.get("last_thought_ts", 0.0) or 0.0)) >= float(await ctx.get_kv("rosehip:thought_min_interval_s", 35.0) or 35.0))
         ):
-            thought_prompt = self._build_internal_prompt(
+            thought_note = self._build_internal_note(
                 needs=needs,
                 hormones=hormones,
                 pending_text=pending_text,
@@ -316,21 +390,16 @@ class InitiativeThresholdNeuron(BaseNeuron):
             )
             out.append(
                 Event(
-                    topic="reason/request",
-                    payload={
-                        "text": thought_prompt,
-                        "source": "internal",
-                        "channel": "thought",
-                        "raw_meta": {
-                            "mode": "initiative_reflection",
-                            "tier": new_tier,
-                            "needs": needs,
-                            "hormones": hormones,
-                        },
-                    },
+                    topic="reason/output",
+                    payload={"text": thought_note},
                     source=self.name,
                     correlation_id=event.correlation_id,
-                    meta={"kind": "initiative_reflection"},
+                    meta={
+                        "channel": "thought",
+                        "kind": "initiative_reflection",
+                        "mode": "initiative_reflection",
+                        "tier": new_tier,
+                    },
                 )
             )
             state["last_thought_ts"] = now
@@ -342,7 +411,7 @@ class InitiativeThresholdNeuron(BaseNeuron):
             and not bool(state.get("clarify_said", False))
             and not sleeping
             and time_since_user >= 2.5
-            and (now - float(state.get("last_clarify_ts", 0.0) or 0.0)) >= 30.0
+            and (now - float(state.get("last_clarify_ts", 0.0) or 0.0)) >= float(await ctx.get_kv("rosehip:clarify_min_interval_s", 30.0) or 30.0)
         ):
             question = self._build_clarify_text(pending_text=pending_text, flags=pending_flags)
             if question:
@@ -414,6 +483,7 @@ class InitiativeThresholdNeuron(BaseNeuron):
             "goal_hits": goal_hits,
             "marker_hits": marker_hits,
             "coherence_score": round(coherence_score, 4),
+            "clarify_ready": clarify_ready,
         }
 
     def _select_tier(
@@ -426,46 +496,50 @@ class InitiativeThresholdNeuron(BaseNeuron):
         clarify_ready: bool,
         interruption_cost: float,
     ) -> int:
-        enter_t1 = 0.34
-        leave_t1 = 0.24
-        enter_t2 = 0.56
-        leave_t2 = 0.42
-        enter_t3 = 0.78
-        leave_t3 = 0.58
+        enter_t1 = 0.22
+        enter_t2 = 0.46
+        enter_t3 = 0.68
 
-        tier = prev_tier
+        leave_t1 = 0.16
+        leave_t2 = 0.34
+        leave_t3 = 0.54
+
         if prev_tier >= 3:
-            tier = 3 if (talk_pressure >= leave_t3 and clarify_ready) else 2
-        elif prev_tier == 2:
-            if talk_pressure >= enter_t3 and clarify_ready and interruption_cost < 0.55:
-                tier = 3
-            elif tier_score >= leave_t2:
-                tier = 2
-            elif tier_score >= leave_t1:
-                tier = 1
-            else:
-                tier = 0
-        elif prev_tier == 1:
-            if talk_pressure >= enter_t3 and clarify_ready and interruption_cost < 0.55:
-                tier = 3
-            elif think_pressure >= enter_t2:
-                tier = 2
-            elif tier_score >= leave_t1:
-                tier = 1
-            else:
-                tier = 0
-        else:
-            if talk_pressure >= enter_t3 and clarify_ready and interruption_cost < 0.55:
-                tier = 3
-            elif think_pressure >= enter_t2:
-                tier = 2
-            elif tier_score >= enter_t1:
-                tier = 1
-            else:
-                tier = 0
-        return tier
+            if talk_pressure >= leave_t3 and clarify_ready and interruption_cost < 0.70:
+                return 3
+            if think_pressure >= enter_t2:
+                return 2
+            if tier_score >= enter_t1:
+                return 1
+            return 0
 
-    def _build_internal_prompt(
+        if prev_tier == 2:
+            if talk_pressure >= enter_t3 and clarify_ready and interruption_cost < 0.55:
+                return 3
+            if think_pressure >= leave_t2:
+                return 2
+            if tier_score >= enter_t1:
+                return 1
+            return 0
+
+        if prev_tier == 1:
+            if talk_pressure >= enter_t3 and clarify_ready and interruption_cost < 0.55:
+                return 3
+            if think_pressure >= enter_t2:
+                return 2
+            if tier_score >= leave_t1:
+                return 1
+            return 0
+
+        if talk_pressure >= enter_t3 and clarify_ready and interruption_cost < 0.55:
+            return 3
+        if think_pressure >= enter_t2:
+            return 2
+        if tier_score >= enter_t1:
+            return 1
+        return 0
+
+    def _build_internal_note(
         self,
         *,
         needs: Dict[str, Any],
@@ -473,19 +547,40 @@ class InitiativeThresholdNeuron(BaseNeuron):
         pending_text: str,
         pending_flags: Dict[str, Any],
     ) -> str:
-        lines: List[str] = []
-        lines.append("Internal reflection only. Do not address the user.")
-        lines.append("Summarize what matters in 1-3 short sentences.")
-        lines.append("Focus on missing variables, unresolved continuity, or the next useful check.")
-        lines.append("")
-        lines.append(f"Needs: {needs}")
-        lines.append(f"Hormones: {hormones}")
-        if pending_text:
-            lines.append(f"Pending text: {pending_text}")
-            lines.append(f"Pending flags: {pending_flags}")
+        compact = re.sub(r"\s+", " ", (pending_text or "").strip())
+        if len(compact) > 140:
+            compact = compact[:137] + "..."
+
+        inquiry = float(hormones.get("inquiry", 0.0) or 0.0)
+        caution = float(hormones.get("caution", 0.0) or 0.0)
+        continuity = float(hormones.get("continuity", 0.0) or 0.0)
+        coherence = float(needs.get("coherence", 0.0) or 0.0)
+
+        notes: List[str] = []
+
+        if compact:
+            notes.append(f"pending: {compact}")
         else:
-            lines.append("Pending text: none")
-        return "\n".join(lines)
+            notes.append("pending: none")
+
+        if bool(pending_flags.get("has_response_request", False)):
+            notes.append("user likely wants acknowledgement or direct outward reply")
+        elif bool(pending_flags.get("has_question", False)):
+            notes.append("question detected; likely needs a missing-variable check")
+        elif bool(pending_flags.get("has_options", False)):
+            notes.append("multiple valid paths detected; target may be missing")
+
+        if continuity >= 0.40:
+            notes.append("continuity pressure elevated")
+        if coherence >= 0.40 or inquiry >= 0.45:
+            notes.append("coherence / inquiry pressure suggests clarification or tighter framing")
+        if caution >= 0.45:
+            notes.append("caution elevated; avoid overcommitting")
+
+        if len(notes) == 1:
+            notes.append("next useful move: hold internally and wait for clearer signal")
+
+        return " | ".join(notes[:4])
 
     def _build_clarify_text(self, *, pending_text: str, flags: Dict[str, Any]) -> str:
         if not pending_text:
@@ -518,7 +613,7 @@ def build_neurons(orchestrator: Orchestrator):
             "affect/state",
             "affect/salience",
         ],
-        output_topics=["reason/request", "act/speech"],
+        output_topics=["reason/output", "act/speech"],
         priority=-8,
     )
     yield InitiativeThresholdNeuron(cfg)

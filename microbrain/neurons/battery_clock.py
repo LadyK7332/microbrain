@@ -118,6 +118,6 @@ def build_neurons(orchestrator: Orchestrator):
         subscribed_topics=["clock/tick", "control/power"],
         output_topics=[],
         priority=3,
-        cooldown_sec=0.25,
+        cooldown_sec=0.0,  # quiet: update directly without base cooldown skip spam
     )
     yield BatteryClockNeuron(cfg)

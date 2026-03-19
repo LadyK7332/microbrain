@@ -503,11 +503,16 @@ class LLMReasonerNeuron(BaseNeuron):
 
 
 def build_neurons(orchestrator: Orchestrator):
+    # LLM reasoning is explicitly opt-in. When disabled, the native responder
+    # owns the default outward reply path.
+    if not orchestrator.kv_store.get("llm:enabled", False):
+        return
+
     cfg = NeuronConfig(
         name="llm_reasoner",
         subscribed_topics=["reason/request"],
         output_topics=["act/speech"],
         priority=5,  # runs before echo_neuron(priority=0) if both are present
     )
-    
+
     yield LLMReasonerNeuron(cfg)
