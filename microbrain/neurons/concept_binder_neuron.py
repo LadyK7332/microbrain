@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
 from microbrain.orchestrator.neuron_base import BaseNeuron, NeuronConfig, Event
+from microbrain.memory.filters import classify_event_for_memory
 
 NEURON_NAME = Path(__file__).stem
 
@@ -54,6 +55,9 @@ class ConceptBinderNeuron(BaseNeuron):
 
         # ---- Update recent buffers ----
         if event.topic == "percept/text":
+            guard = classify_event_for_memory(event)
+            if not guard.get("allow_pattern", False):
+                return []
             text = self._normalize_text(event.payload)
             if text:
                 items: List[Dict[str, Any]] = recents.get("text", []) or []

@@ -25,6 +25,12 @@ NEED_KEYS = (
     "maintenance",
 )
 
+# Per-subsystem need-signal channels that the endocrine system may consume.
+# These are inputs TO hormone_state_neuron, not canonical endocrine outputs.
+NEED_SIGNAL_KEYS = (
+    "drive:need_signal:initiative",
+)
+
 DDNA_MOD_KEYS = (
     "arousal_gain",
     "inquiry_gain",
@@ -364,8 +370,6 @@ def derive_rosehip_state(
     direct_address = clamp(safe_float(ctx.get("direct_address", 0.0), 0.0))
     recent_user = clamp(safe_float(ctx.get("recent_user", 0.0), 0.0))
     answered = clamp(safe_float(ctx.get("answered", 0.0), 0.0))
-    recent_reply = clamp(safe_float(ctx.get("recent_reply", 0.0), 0.0))
-    repeated_direct = clamp(safe_float(ctx.get("repeated_direct", 0.0), 0.0))
     sleeping = 1.0 if bool(ctx.get("sleeping", False)) else 0.0
     charging = 1.0 if bool(ctx.get("charging", False)) else 0.0
 
@@ -374,29 +378,14 @@ def derive_rosehip_state(
         + (0.24 * (mods["restraint_bias"] / 2.0))
         + (0.14 * redundancy)
         + (0.10 * interruption)
-        + (0.16 * recent_reply)
-        + (0.10 * repeated_direct)
-        - (0.10 * direct_address)
     )
     social_brake = clamp(
         (0.18 * n["social"] * max(0.0, mods["restraint_bias"] - 0.8))
         + (0.16 * interruption)
         + (0.10 * answered)
-        + (0.10 * recent_reply)
-        - (0.08 * direct_address)
     )
-    redundancy_brake = clamp(
-        (0.60 * redundancy)
-        + (0.12 * answered)
-        + (0.22 * recent_reply)
-        + (0.18 * repeated_direct)
-    )
-    interrupt_brake = clamp(
-        (0.68 * interruption)
-        + (0.10 * sleeping)
-        + (0.12 * recent_reply)
-        - (0.10 * direct_address)
-    )
+    redundancy_brake = clamp((0.60 * redundancy) + (0.12 * answered))
+    interrupt_brake = clamp((0.68 * interruption) + (0.10 * sleeping))
     sleep_quiet_brake = clamp((0.88 * sleeping) + (0.10 * charging))
     confidence_brake = clamp((1.0 - confidence) * (0.42 + (0.28 * h.caution)))
 
@@ -434,15 +423,7 @@ def derive_rosehip_state(
         0.25,
         1.35,
     )
-    direct_reply_floor = clamp(
-        0.16
-        + (0.22 * direct_address)
-        + (0.08 * recent_user)
-        - (0.05 * sleeping)
-        - (0.08 * recent_reply),
-        0.0,
-        0.75,
-    )
+    direct_reply_floor = clamp(0.18 + (0.18 * direct_address) + (0.08 * recent_user) - (0.05 * sleeping), 0.0, 0.75)
 
     return {
         "expression_brake": round(expression_brake, 4),

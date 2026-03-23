@@ -23,6 +23,7 @@ from typing import Iterable, List, Dict, Any
 
 from microbrain.orchestrator.neuron_base import BaseNeuron, NeuronConfig, Event
 from microbrain.orchestrator.orchestrator import Orchestrator
+from microbrain.memory.filters import classify_event_for_memory
 
 NEURON_NAME = Path(__file__).stem
 
@@ -44,8 +45,9 @@ class HRMObserverNeuron(BaseNeuron):
         if topic not in ("percept/text", "act/speech"):
             return []
 
-        # Skip system/control messages (menus, debug, etc.)
-        if event.meta.get("control"):
+        guard = classify_event_for_memory(event)
+        if not guard.get("allow_hrm", False):
+            self.debug("hrm_skip", reason=guard.get("junk_reason") or "blocked", channel=guard.get("channel"), kind=guard.get("kind"))
             return []
 
         # ------------------------------
@@ -100,6 +102,7 @@ class HRMObserverNeuron(BaseNeuron):
                 text_preview=text[:80],
                 meta=event.meta,
             )
+            return []
 
         self.debug(
             "hrm_node_created",

@@ -10,6 +10,7 @@ from typing import Any, Dict, Iterable, Optional
 
 from microbrain.orchestrator.neuron_base import BaseNeuron, NeuronConfig, Event
 from microbrain.orchestrator.orchestrator import Orchestrator
+from microbrain.memory.filters import classify_event_for_memory
 
 try:
     # Reuse the same thread-safe JSONL writer used by MemoryStore
@@ -79,6 +80,10 @@ class EpisodeLoggerNeuron(BaseNeuron):
         self.debug("received", topic=event.topic, source=event.source, meta=event.meta)
 
         now = float(event.payload.get("ts")) if isinstance(event.payload, dict) and "ts" in event.payload else time.time()
+
+        guard = classify_event_for_memory(event)
+        if event.topic in ("percept/text", "act/speech") and not guard.get("allow_trace", False):
+            return []
 
         # Throttle high-volume vision events to keep disk sane at first light.
         if event.topic == "percept/vision" and not self._vision_allowed_now(now):

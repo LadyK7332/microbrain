@@ -6,6 +6,7 @@ from typing import Any, Dict, Iterable, Optional
 
 from microbrain.orchestrator.neuron_base import BaseNeuron, NeuronConfig, Event
 from microbrain.orchestrator.orchestrator import Orchestrator
+from microbrain.memory.filters import classify_event_for_memory
 
 from microbrain.patterns.lexicon_store import LexiconStore
 from microbrain.patterns.pattern_edge_log import PatternEdgeLog
@@ -92,6 +93,11 @@ class PatternBinderNeuron(BaseNeuron):
 
         payload = event.payload
         if not isinstance(payload, dict):
+            return []
+
+        guard = classify_event_for_memory(event)
+        if not guard.get("allow_pattern", False):
+            self.debug("pattern_skip", reason=guard.get("junk_reason") or "blocked", channel=guard.get("channel"), kind=guard.get("kind"))
             return []
 
         text = str(payload.get("text", "") or "").strip()

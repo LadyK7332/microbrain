@@ -74,7 +74,7 @@ class HormoneStateNeuron(BaseNeuron):
         pdna = await ctx.get_kv("pdna:profile", None)
         interaction = await ctx.get_kv("interaction:last_input", {}) or {}
         initiative_last = await ctx.get_kv("initiative:last", {}) or {}
-        current_needs_stack = await ctx.get_kv("drive:needs_stack", {}) or {}
+        initiative_need_signal = await ctx.get_kv("drive:need_signal:initiative", {}) or {}
         prev_hormones = await ctx.get_kv("drive:hormones", {}) or {}
         power_sleep = bool(await ctx.get_kv("power:sleep", False))
         power_charging = bool(await ctx.get_kv("power:charging", False))
@@ -111,7 +111,7 @@ class HormoneStateNeuron(BaseNeuron):
             pending_age_s=pending_age_s,
             coherence_hint=coherence_hint,
         )
-        merged_needs = merge_need_maps(base_needs, current_needs_stack)
+        merged_needs = merge_need_maps(base_needs, initiative_need_signal)
 
         ddna_mods = derive_ddna_modulators(pdna)
         hormones = update_hormone_state(
@@ -128,6 +128,7 @@ class HormoneStateNeuron(BaseNeuron):
         )
         wants = derive_want_vector(hormones, needs=merged_needs, ddna=ddna_mods)
 
+        await ctx.set_kv("drive:endocrine_authority", self.name)
         await ctx.set_kv("drive:needs_base", base_needs)
         await ctx.set_kv("drive:needs_stack", merged_needs)
         await ctx.set_kv("drive:ddna_modulators", ddna_mods)
@@ -140,6 +141,9 @@ class HormoneStateNeuron(BaseNeuron):
                 "dt_s": round(dt_s, 4),
                 "base_needs": base_needs,
                 "needs": merged_needs,
+                "need_signals": {
+                    "initiative": initiative_need_signal,
+                },
                 "hormones": hormones,
                 "wants": wants,
             },

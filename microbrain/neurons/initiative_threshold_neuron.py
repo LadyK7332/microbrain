@@ -274,17 +274,8 @@ class InitiativeThresholdNeuron(BaseNeuron):
             talk_pressure *= 0.85
 
         rosehip_enabled = bool(await ctx.get_kv("rosehip:enabled", True))
-        direct_address = 1.0 if (
-            bool(pending_flags.get("has_question", False))
-            or bool(pending_flags.get("has_response_request", False))
-        ) else 0.0
-        recent_user = _clamp(
-            1.0 - (
-                time_since_user
-                / max(1.0, float(await ctx.get_kv("rosehip:conversation_hold_s", 12.0) or 12.0))
-            )
-        )
-
+        direct_address = 1.0 if (bool(pending_flags.get("has_question", False)) or bool(pending_flags.get("has_response_request", False))) else 0.0
+        recent_user = _clamp(1.0 - (time_since_user / max(1.0, float(await ctx.get_kv("rosehip:conversation_hold_s", 12.0) or 12.0))))
         redundancy = 0.0
         repeat_window_s = float(await ctx.get_kv("rosehip:repeat_reply_window_s", 18.0) or 18.0)
         if time_since_speech < repeat_window_s:
@@ -292,22 +283,7 @@ class InitiativeThresholdNeuron(BaseNeuron):
         if bool(state.get("clarify_said", False)):
             redundancy += 0.25
         redundancy = _clamp(redundancy)
-
-        recent_reply_window_s = float(await ctx.get_kv("rosehip:reply_cooldown_s", 10.0) or 10.0)
-        recent_reply = 0.0
-        if time_since_speech < recent_reply_window_s:
-            recent_reply = _clamp(1.0 - (time_since_speech / max(1.0, recent_reply_window_s)))
-
-        repeated_direct = 0.0
-        repeat_direct_window_s = float(await ctx.get_kv("rosehip:repeat_direct_window_s", 14.0) or 14.0)
-        if direct_address > 0.0 and bool(state.get("pending_answered", False)) and time_since_speech < repeat_direct_window_s:
-            repeated_direct = _clamp(1.0 - (time_since_speech / max(1.0, repeat_direct_window_s)))
-
-        confidence = _clamp(
-            0.55
-            + (0.25 * float(pending_flags.get("coherence_score", 0.0) or 0.0))
-            + (0.10 if pending_text else 0.0)
-        )
+        confidence = _clamp(0.55 + (0.25 * float(pending_flags.get("coherence_score", 0.0) or 0.0)) + (0.10 if pending_text else 0.0))
         rosehip = derive_rosehip_state(
             hormones,
             needs=needs,
@@ -319,8 +295,6 @@ class InitiativeThresholdNeuron(BaseNeuron):
                 "direct_address": direct_address,
                 "recent_user": recent_user,
                 "answered": 1.0 if bool(state.get("pending_answered", False)) else 0.0,
-                "recent_reply": recent_reply,
-                "repeated_direct": repeated_direct,
                 "sleeping": sleeping,
                 "charging": bool((power_state or {}).get("charging", False)),
             },
@@ -339,12 +313,7 @@ class InitiativeThresholdNeuron(BaseNeuron):
                 - (0.10 * float(rosehip.get("confidence_brake", 0.0) or 0.0))
             )
             if direct_address > 0.0:
-                # Direct user address should still get through, but repeated
-                # immediate follow-ups should de-escalate toward shorter/cleaner replies.
-                talk_pressure = max(
-                    talk_pressure,
-                    min(float(rosehip.get("direct_reply_floor", 0.0) or 0.0), 0.72),
-                )
+                talk_pressure = max(talk_pressure, min(float(rosehip.get("direct_reply_floor", 0.0) or 0.0), 0.85))
 
         tier_score = max(think_pressure, talk_pressure)
         prev_tier = int(state.get("tier", 0) or 0)
@@ -369,7 +338,8 @@ class InitiativeThresholdNeuron(BaseNeuron):
             "rosehip": rosehip,
         }
 
-        await ctx.set_kv("drive:needs_stack", needs)
+        await ctx.set_kv("initiative:needs_local", needs)
+        await ctx.set_kv("drive:need_signal:initiative", needs)
         await ctx.set_kv("initiative:last", initiative_snapshot)
         await ctx.set_kv("initiative:tier", new_tier)
 
