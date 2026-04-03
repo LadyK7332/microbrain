@@ -289,8 +289,54 @@ class MemoryStore:
             sal.setdefault("reinforce_sum", 0.0)
             sal.setdefault("reinforce_count", 0)
             sal.setdefault("last_reinforced_ts", None)
+            sal.setdefault("reinforcement_pts", 0.0)
+            sal.setdefault("salience_updated_ts", item.get("ts", time.time()))
+            sal.setdefault("decay_half_life_s", 6.0 * 3600.0)
 
         return item
+
+    @staticmethod
+    def _safe_float(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return float(default)
+
+    def _effective_salience(self, item: dict, now_ts: float | None = None) -> dict[str, float]:
+        now_ts = float(now_ts or time.time())
+        sal = item.get("salience", {}) or {}
+        if not isinstance(sal, dict):
+            sal = {}
+
+        score = self._safe_float(sal.get("score", 0.0), 0.0)
+        valence = self._safe_float(sal.get("valence", 0.0), 0.0)
+        satisfaction = self._safe_float(sal.get("satisfaction", 0.0), 0.0)
+        arousal = self._safe_float(sal.get("arousal", 0.0), 0.0)
+        reinforce_sum = self._safe_float(sal.get("reinforce_sum", 0.0), 0.0)
+        reinforce_count = max(0.0, self._safe_float(sal.get("reinforce_count", 0.0), 0.0))
+        reinforcement_pts = max(
+            0.0,
+            self._safe_float(
+                sal.get("reinforcement_pts", (0.20 * max(0.0, reinforce_sum)) + (0.08 * reinforce_count)),
+                0.0,
+            ),
+        )
+        updated_ts = self._safe_float(sal.get("salience_updated_ts", item.get("ts", now_ts)), now_ts)
+        half_life_s = max(60.0, self._safe_float(sal.get("decay_half_life_s", 6.0 * 3600.0), 6.0 * 3600.0))
+        age_s = max(0.0, now_ts - updated_ts)
+        decay = 0.5 ** (age_s / half_life_s) if half_life_s > 0.0 else 1.0
+
+        return {
+            "score": score * decay,
+            "valence": valence * decay,
+            "satisfaction": satisfaction * decay,
+            "arousal": arousal * decay,
+            "reinforcement_pts": reinforcement_pts,
+            "reinforce_sum": reinforce_sum,
+            "reinforce_count": reinforce_count,
+            "decay": decay,
+            "age_s": age_s,
+        }
 
     def add_semantic(self, text: str, meta: dict | None = None, salience: dict | None = None):
         # Try Ollama embeddings first; if unavailable, fall back to local
@@ -307,6 +353,9 @@ class MemoryStore:
 
         item = {"text": text, "vec": vec, "meta": meta or {}, "ts": time.time()}
         if salience is not None:
+            salience = dict(salience)
+            salience.setdefault("salience_updated_ts", item["ts"])
+            salience.setdefault("reinforcement_pts", max(0.0, self._safe_float(salience.get("reinforcement_pts", (0.20 * max(0.0, self._safe_float(salience.get("reinforce_sum", 0.0), 0.0))) + (0.08 * max(0.0, self._safe_float(salience.get("reinforce_count", 0.0), 0.0)))), 0.0)))
             item["salience"] = salience
         item = self._ensure_memory_schema(item)
         self.semantic.append(item)        
@@ -315,6 +364,9 @@ class MemoryStore:
     def add_episodic(self, text: str, meta: dict | None = None, salience: dict | None = None):
         item = {"text": text, "meta": meta or {}, "ts": time.time()}
         if salience is not None:
+            salience = dict(salience)
+            salience.setdefault("salience_updated_ts", item["ts"])
+            salience.setdefault("reinforcement_pts", max(0.0, self._safe_float(salience.get("reinforcement_pts", (0.20 * max(0.0, self._safe_float(salience.get("reinforce_sum", 0.0), 0.0))) + (0.08 * max(0.0, self._safe_float(salience.get("reinforce_count", 0.0), 0.0)))), 0.0)))
             item["salience"] = salience
         item = self._ensure_memory_schema(item)
         self.episodic.append(item)
@@ -340,26 +392,20 @@ class MemoryStore:
             qv = _local_embed(query)
 
         scored = []
+        now_ts = time.time()
         for it in self.semantic:
             sim = self._cosine(qv, it.get("vec", []))
-            sal = it.get("salience") or {}
-            try:
-                satisfaction = float(sal.get("satisfaction", 0.0) or 0.0)
-            except Exception:
-                satisfaction = 0.0
-            try:
-                valence = float(sal.get("valence", 0.0) or 0.0)
-            except Exception:
-                valence = 0.0
-            try:
-                score = float(sal.get("score", 0.0) or 0.0)
-            except Exception:
-                score = 0.0
+            eff = self._effective_salience(it, now_ts=now_ts)
+            satisfaction = float(eff.get("satisfaction", 0.0) or 0.0)
+            valence = float(eff.get("valence", 0.0) or 0.0)
+            score = float(eff.get("score", 0.0) or 0.0)
+            reinforcement_pts = float(eff.get("reinforcement_pts", 0.0) or 0.0)
+            reinforcement_bonus = min(0.20, reinforcement_pts * 0.04)
 
             # Salience shaping:
-            # - unreinforced babble has negative satisfaction, so it sinks a bit
-            # - reinforced items (positive satisfaction) rise
-            adj = sim + (0.30 * satisfaction) + (0.10 * valence) + (0.10 * score)
+            # - transient salience fades unless refreshed
+            # - reinforced items retain a modest retrieval advantage
+            adj = sim + (0.26 * satisfaction) + (0.10 * valence) + (0.10 * score) + reinforcement_bonus
             scored.append((adj, sim, it))
 
         scored.sort(key=lambda x: -x[0])

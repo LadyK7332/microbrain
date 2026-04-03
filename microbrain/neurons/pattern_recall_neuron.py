@@ -8,8 +8,10 @@ from typing import Any, Dict, Iterable, Optional
 from microbrain.orchestrator.neuron_base import BaseNeuron, NeuronConfig, Event
 from microbrain.orchestrator.orchestrator import Orchestrator
 
+from microbrain.memory.recall_aperture import advance_recall_tracker, compute_match_quality, make_recall_key
 from microbrain.patterns.lexicon_store import LexiconStore, simple_tokenize
 from microbrain.patterns.pattern_edge_log import PatternEdgeLog
+from microbrain.memory.mem_cell_store import MemCellStore
 
 NEURON_NAME = Path(__file__).stem
 
@@ -54,6 +56,7 @@ class PatternRecallNeuron(BaseNeuron):
         self._edges: Optional[PatternEdgeLog] = None
         self._mem_store = None
         self._memdir: Optional[Path] = None
+        self._mem_cell_store: Optional[MemCellStore] = None
 
     async def _ensure_ready(self, ctx) -> bool:
         if self._lex is not None and self._edges is not None and self._mem_store is not None:
@@ -81,8 +84,25 @@ class PatternRecallNeuron(BaseNeuron):
                 await ctx.set_kv("patterns:edges", self._edges)
 
             self._mem_store = mem_store
+            self._mem_cell_store = await ctx.get_kv("memory:mem_cell_store", None)
+            if self._mem_cell_store is None:
+                self._mem_cell_store = MemCellStore(memdir)
+                await ctx.set_kv("memory:mem_cell_store", self._mem_cell_store)
 
         return True
+
+    def _write_recall_tracker(self, tracker: Dict[str, Any]) -> None:
+        try:
+            if not self._memdir:
+                return
+            state_dir = Path(self._memdir) / "state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            (state_dir / "recall_tracker.json").write_text(
+                json.dumps(tracker, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
 
     def _semantic_anchor_salience(self, concept_id: str) -> Dict[str, float]:
         # best-effort: look for a concept_anchor row
@@ -143,6 +163,7 @@ class PatternRecallNeuron(BaseNeuron):
 
         # --- Spread v0: token -> concept (1 hop) ---
         concept_scores: Dict[str, float] = {}
+        learned_hit_count = 0
 
         # NOTE: PatternEdgeLog keeps an internal weight map; early-stage size is small.
         W = getattr(self._edges, "_W", {}) or {}
@@ -158,6 +179,7 @@ class PatternRecallNeuron(BaseNeuron):
                     if not concept_id:
                         continue
                     concept_scores[concept_id] = concept_scores.get(concept_id, 0.0) + float(w)
+                    learned_hit_count += 1
                 except Exception:
                     continue
 
@@ -165,7 +187,7 @@ class PatternRecallNeuron(BaseNeuron):
             fallback = f"concept:{tok}"
             concept_scores.setdefault(fallback, 0.01)
 
-                # --- Personal boost: noun -> concept edges ---
+        # --- Personal boost: noun -> concept edges ---
         if noun_id:
             alpha = float(await ctx.get_kv("patterns:noun_boost_alpha", 0.5) or 0.5)
             for k, w in W.items():
@@ -178,12 +200,40 @@ class PatternRecallNeuron(BaseNeuron):
                     if not cid:
                         continue
                     concept_scores[cid] = concept_scores.get(cid, 0.0) + (alpha * float(w))
+                    learned_hit_count += 1
                 except Exception:
                     continue
 
+        ranked_all = sorted(concept_scores.items(), key=lambda kv: kv[1], reverse=True)
+        all_scores = [float(score) for _, score in ranked_all]
+        quality = compute_match_quality(
+            all_scores,
+            learned_hit_count=learned_hit_count,
+            fallback_only=(learned_hit_count <= 0),
+        )
+        uncertainty = max(0.0, 1.0 - float(quality))
 
-        # Rank top concepts
-        ranked = sorted(concept_scores.items(), key=lambda kv: kv[1], reverse=True)[:8]
+        tracker = await ctx.get_kv("recall:tracker", {}) or {}
+        tracker, aperture = advance_recall_tracker(
+            tracker,
+            key=make_recall_key(seed_kind="text", tokens=tokens, noun_id=noun_id),
+            now=ts,
+            uncertainty=uncertainty,
+            quality=quality,
+            revisit_window_s=float(await ctx.get_kv("recall:revisit_window_s", 300.0) or 300.0),
+            base_limit=int(await ctx.get_kv("recall:base_limit", 6) or 6),
+            step=int(await ctx.get_kv("recall:step", 2) or 2),
+            max_extra=int(await ctx.get_kv("recall:max_extra", 12) or 12),
+            uncertainty_boost=int(await ctx.get_kv("recall:uncertainty_boost", 6) or 6),
+            failure_boost=int(await ctx.get_kv("recall:failure_boost", 4) or 4),
+            prune_limit=int(await ctx.get_kv("recall:tracker_prune_limit", 256) or 256),
+        )
+        await ctx.set_kv("recall:tracker", tracker)
+        self._write_recall_tracker(tracker)
+
+        # Rank top concepts through a dynamic recall aperture.
+        active_limit = int(aperture.get("active_limit", 8) or 8)
+        ranked = ranked_all[:active_limit]
         top_concepts = []
         for concept_id, score in ranked:
             label = concept_id.split(":", 1)[1] if ":" in concept_id else concept_id
@@ -204,8 +254,11 @@ class PatternRecallNeuron(BaseNeuron):
             "channel": channel,
             "noun_id": noun_id,
             "ts": ts,
-            "schema_ver": 2,
+            "schema_ver": 3,
             "kind": "pattern_recall_bundle",
+            "recall_aperture": aperture,
+            "match_quality": round(float(quality), 4),
+            "learned_hit_count": int(learned_hit_count),
         }
 
         await ctx.set_kv("recall:last_bundle", bundle)

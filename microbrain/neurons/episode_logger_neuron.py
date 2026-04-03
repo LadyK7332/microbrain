@@ -106,26 +106,22 @@ class EpisodeLoggerNeuron(BaseNeuron):
 
 
 def build_neurons(orchestrator: Orchestrator) -> Iterable[BaseNeuron]:
-    cfg = NeuronConfig(
-        name=NEURON_NAME,
+    # Episodes are disabled by default for now.
+    # The continuous memory stream is the source of truth until a real,
+    # populated episodic layer is needed again.
+    if False:
+        cfg = NeuronConfig(
+            name=NEURON_NAME,
             subscribed_topics=[
-                # bootstrap (creates episode file immediately on startup)
                 "clock/tick",
-
-                # core teaching loop channels
                 "percept/text",
                 "act/speech",
-
-                # vision (when you wire it)
                 "percept/vision",
-
-                # future supervised motor/input channels
                 "percept/input_mouse",
                 "percept/input_key",
-
-                # feedback + drive adjustments are useful to replay
                 "curiosity/adjust",
             ],
-        output_topics=[],
-    )
-    yield EpisodeLoggerNeuron(cfg)
+            output_topics=[],
+        )
+        yield EpisodeLoggerNeuron(cfg)
+    return

@@ -31,6 +31,12 @@ class PowerSleepCycleNeuron(BaseNeuron):
 
         now = time.time()
         last_ext = float(await ctx.get_kv("power:last_external_ts", 0.0) or 0.0)
+        if last_ext <= 0.0:
+            interaction = await ctx.get_kv("interaction:last_input", {}) or {}
+            if isinstance(interaction, dict):
+                last_ext = float(interaction.get("ts", 0.0) or 0.0)
+                if last_ext > 0.0:
+                    await ctx.set_kv("power:last_external_ts", last_ext)
         if last_ext and (now - last_ext) < idle_s and not kick:
             return []
 

@@ -6,6 +6,8 @@ import time
 from typing import Any, Dict, Iterable, List, Mapping
 
 from microbrain.hormone import derive_rosehip_state
+from microbrain.memory.cross_modal_answer import gather_support, compose_answer
+from microbrain.memory.mem_cell_store import MemCellStore
 from microbrain.orchestrator.neuron_base import BaseNeuron, Event, NeuronConfig
 from microbrain.orchestrator.orchestrator import Orchestrator
 
@@ -29,6 +31,11 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except Exception:
         return float(default)
+
+
+def _looks_stock_reply(text: str) -> bool:
+    norm = _norm(text)
+    return norm.startswith("i heard your question") or norm.startswith("i heard you")
 
 
 class NativeResponderNeuron(BaseNeuron):
@@ -85,7 +92,7 @@ class NativeResponderNeuron(BaseNeuron):
             )
             return []
 
-        reply = await self._build_response(ctx, text=text, shape=shape)
+        reply = await self._build_response(ctx, text=text, shape=shape, payload=payload)
         if not reply:
             return []
 
@@ -275,12 +282,27 @@ class NativeResponderNeuron(BaseNeuron):
             "restraint_bias": round(restraint_bias, 4),
         }
 
-    async def _build_response(self, ctx, *, text: str, shape: Dict[str, Any]) -> str:
+    async def _build_response(self, ctx, *, text: str, shape: Dict[str, Any], payload: Dict[str, Any]) -> str:
         norm = _norm(text)
         atomized = await ctx.get_kv("language:last_atomized", {}) or {}
         noun_candidates = atomized.get("nouns", []) if isinstance(atomized, Mapping) else []
         noun_chunks = atomized.get("noun_chunks", []) if isinstance(atomized, Mapping) else []
         relations = atomized.get("relations", []) if isinstance(atomized, Mapping) else []
+        mem_store = await ctx.get_kv("memory:mem_cell_store", None)
+        if mem_store is None:
+            memdir = await ctx.get_kv("cfg:memdir", None) or await ctx.get_kv("memdir", None)
+            if memdir:
+                try:
+                    mem_store = MemCellStore(str(memdir))
+                    await ctx.set_kv("memory:mem_cell_store", mem_store)
+                except Exception:
+                    mem_store = None
+        thought_path_last = await ctx.get_kv("thought_path:last", {}) or {}
+        power_state = await ctx.get_kv("power:state", {}) or {}
+        needs = await ctx.get_kv("drive:needs_stack", {}) or {}
+        context = payload.get("context", {}) if isinstance(payload.get("context", {}), Mapping) else {}
+        associations = list(context.get("associations", []) or []) if isinstance(context, Mapping) else []
+        association_meta = dict(context.get("association_meta", {}) or {}) if isinstance(context, Mapping) else {}
 
         terse = _safe_float(shape.get("terse", 0.0))
         warm = _safe_float(shape.get("warm", 0.0))
@@ -292,6 +314,62 @@ class NativeResponderNeuron(BaseNeuron):
             if terse >= 0.56:
                 return short
             return medium
+
+        def best_recalled_phrase() -> str:
+            best_text = ""
+            best_score = 0.0
+
+            top_assoc_score = _safe_float(association_meta.get("top_score", 0.0), 0.0)
+            if top_assoc_score >= 0.42:
+                for assoc in associations[:4]:
+                    if not isinstance(assoc, Mapping):
+                        continue
+                    candidate = str(assoc.get("text", "") or "").strip()
+                    if not candidate:
+                        continue
+                    candidate_norm = _norm(candidate)
+                    if not candidate_norm or candidate_norm == norm or _looks_stock_reply(candidate):
+                        continue
+                    if candidate.startswith("/") or len(candidate.split()) > 18:
+                        continue
+                    score = _safe_float(assoc.get("score", top_assoc_score), top_assoc_score)
+                    if score > best_score:
+                        best_text = candidate
+                        best_score = score
+
+            if isinstance(mem_store, MemCellStore):
+                try:
+                    hits = mem_store.search_text_cells(text, limit=10)
+                except Exception:
+                    hits = []
+                for hit in hits:
+                    if not isinstance(hit, Mapping):
+                        continue
+                    meta = dict(hit.get("meta", {}) or {})
+                    role = str(meta.get("role", "") or "")
+                    if role and role not in ("assistant", "system"):
+                        continue
+                    candidate = ""
+                    refs = hit.get("refs", []) if isinstance(hit.get("refs", []), list) else []
+                    if refs:
+                        candidate = str(refs[0] or "").strip()
+                    if not candidate:
+                        candidate = str(hit.get("anchor_text", "") or "").strip()
+                    candidate_norm = _norm(candidate)
+                    if not candidate_norm or candidate_norm == norm or _looks_stock_reply(candidate):
+                        continue
+                    if candidate.startswith("/") or len(candidate.split()) > 18:
+                        continue
+                    if text.strip().endswith("?") and not candidate.strip().endswith(("?", ".")):
+                        candidate = candidate.rstrip() + "."
+                    score = _safe_float(hit.get("score", 0.0), 0.0) + (0.06 if role in ("assistant", "system") else 0.0)
+                    if score > best_score:
+                        best_text = candidate
+                        best_score = score
+
+            return best_text if best_score >= 0.48 else ""
+
+        recalled_phrase = best_recalled_phrase()
 
         if norm in ("hi", "hello", "hey", "yo", "howdy"):
             return choose(
@@ -393,19 +471,46 @@ class NativeResponderNeuron(BaseNeuron):
             )
 
         if text.strip().endswith("?"):
+            bundle = gather_support(
+                query_text=text,
+                mem_cell_store=mem_store if isinstance(mem_store, MemCellStore) else None,
+                power_state=power_state if isinstance(power_state, Mapping) else {},
+                needs=needs if isinstance(needs, Mapping) else {},
+                thought_path_last=thought_path_last if isinstance(thought_path_last, Mapping) else {},
+            )
+            answer, confidence, answer_meta = compose_answer(bundle)
+            if answer:
+                await ctx.set_kv(
+                    "composer:last_answer_bundle",
+                    {
+                        "query_text": text,
+                        "bundle": bundle,
+                        "answer": answer,
+                        "confidence": confidence,
+                        "meta": answer_meta,
+                        "ts": time.time(),
+                    },
+                )
+                return answer
+            if recalled_phrase:
+                return recalled_phrase
             return choose(
                 "Need a target.",
-                "I heard your question. Give me the concrete target or missing variable and I'll answer directly.",
-                "I heard your question. Give me the concrete target or missing variable and I'll answer directly.",
+                "Give me the concrete target or missing variable and I'll answer directly.",
+                "Give me the concrete target or missing variable and I'll answer directly.",
             )
 
         if mode == "ack":
+            if recalled_phrase:
+                return recalled_phrase
             return choose("Noted.", "I heard you.", "I heard you.")
 
+        if recalled_phrase:
+            return recalled_phrase
         return choose(
-            "I heard you.",
-            "I heard you. Give me a concrete goal, question, or choice and I'll respond directly.",
-            "I heard you. Give me a concrete goal, question, or choice and I'll respond directly.",
+            "Need one target.",
+            "Give me a concrete goal, question, or choice and I'll respond directly.",
+            "Give me a concrete goal, question, or choice and I'll respond directly.",
         )
 
 

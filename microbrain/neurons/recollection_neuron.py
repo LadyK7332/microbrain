@@ -9,11 +9,57 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from microbrain.orchestrator.neuron_base import BaseNeuron, NeuronConfig, Event
 from microbrain.orchestrator.orchestrator import Orchestrator
+from microbrain.memory.mem_cell_store import MemCellStore
+from microbrain.utils.memdir import resolve_memdir_ctx
 
 NEURON_NAME = Path(__file__).stem
 
 
 class RecollectionNeuron(BaseNeuron):
+
+
+    async def _mem_cell_store(self, ctx) -> Optional[MemCellStore]:
+        store = await ctx.get_kv("memory:mem_cell_store", None)
+        if store is not None:
+            return store
+        try:
+            memdir = await resolve_memdir_ctx(ctx, fallback=r"Z:\memory")
+            store = MemCellStore(memdir)
+            await ctx.set_kv("memory:mem_cell_store", store)
+            return store
+        except Exception:
+            return None
+
+    def _mem_cell_snippets(self, hits: List[Dict[str, Any]], *, limit: int = 5) -> List[str]:
+        snippets: List[str] = []
+        for hit in hits[:max(1, int(limit))]:
+            anchor_text = str(hit.get("anchor_text", "") or "").strip()
+            refs = hit.get("refs", []) if isinstance(hit.get("refs", []), list) else []
+            body = anchor_text or (str(refs[0]) if refs else "")
+            if not body:
+                continue
+            if len(body) > 220:
+                body = body[:220] + "..."
+            snippets.append(f"- {body} [tier={hit.get('tier', 'now')} score={float(hit.get('score', 0.0)):.3f}]")
+        return snippets
+
+    def _build_native_recollection_reply(self, hits: List[Dict[str, Any]]) -> str:
+        if not hits:
+            return "I don't have a strong recollection anchor for that yet."
+        lead = hits[0]
+        score = float(lead.get("score", 0.0) or 0.0)
+        anchor_text = str(lead.get("anchor_text", "") or "").strip()
+        refs = lead.get("refs", []) if isinstance(lead.get("refs", []), list) else []
+        body = anchor_text or (str(refs[0]) if refs else "")
+        if len(body) > 180:
+            body = body[:177] + "..."
+        if score >= 0.70:
+            prefix = "I remember something close to that:"
+        elif score >= 0.45:
+            prefix = "I have a partial recollection:"
+        else:
+            prefix = "I only have a weak recollection:"
+        return f"{prefix} {body}"
     """
     Recollection / memory search neuron (v2).
 
@@ -78,35 +124,53 @@ class RecollectionNeuron(BaseNeuron):
         # Optional context cues: modality / window / mood / novelty (best-effort)
         context_cues = self._extract_context_cues(raw_user_text or query_text, raw_meta)
 
+        mem_cell_store = await self._mem_cell_store(ctx)
+        mem_cell_hits: List[Dict[str, Any]] = []
+        mem_cell_snippets: List[str] = []
+        if mem_cell_store is not None:
+            try:
+                mem_cell_hits = mem_cell_store.search_text_cells(query_text, limit=6, tiers=("now", "short", "long"))
+                mem_cell_snippets = self._mem_cell_snippets(mem_cell_hits, limit=5)
+            except Exception:
+                mem_cell_hits = []
+                mem_cell_snippets = []
+
         # Try to get HRM core
         hrm = await ctx.get_kv("hrm:core", None)
         if hrm is None:
-            # No HRM available; fall back to simple "I don't remember" via reasoner.
-            prompt = (
-                "The user asked you to remember something from earlier, but your "
-                "long-term memory system (HRM) is not available right now. "
-                "Explain gently that you can't reliably recall older details at the moment."
-            )
-
-            reason_payload = {
-                "text": prompt,
-                "source": "system",
+            bundle = {
+                "seed_kind": "recollection",
+                "query_text": query_text,
                 "channel": channel,
-                "raw_meta": {
-                    "mode": "recollection_fallback",
-                    "raw_user_text": raw_user_text,
-                    "query_text": query_text,
-                    "time_hint": time_hint,
-                    "raw_meta": raw_meta,
-                },
+                "time_hint": time_hint,
+                "top_cells": mem_cell_hits[:5],
+                "top_concepts": [],
+                "kind": "mem_cell_recollection_bundle",
             }
+            await ctx.set_kv("recall:last_bundle", bundle)
+            if mem_cell_hits:
+                return [
+                    Event(topic="memory/recall_context", payload=bundle, source=self.name, correlation_id=event.correlation_id),
+                    Event(
+                        topic="act/speech",
+                        payload={"text": self._build_native_recollection_reply(mem_cell_hits), "channel": channel, "style": "assistant"},
+                        source=self.name,
+                        correlation_id=event.correlation_id,
+                        meta={"kind": "recollection_native_memcell"},
+                    ),
+                ]
 
+            # No HRM and no mem-cell hits; fall back to a simple native response.
             return [Event(
-                topic="reason/request",
-                payload=reason_payload,
+                topic="act/speech",
+                payload={
+                    "text": "I don't have a reliable recollection anchor for that right now.",
+                    "channel": channel,
+                    "style": "assistant",
+                },
                 source=self.name,
                 correlation_id=event.correlation_id,
-                meta={"kind": "recollection_fallback"},
+                meta={"kind": "recollection_fallback_native"},
             )]
 
         # ------------------------------
@@ -206,6 +270,13 @@ class RecollectionNeuron(BaseNeuron):
                 memory_snippets.append(f"- {text_j}")
                 if len(memory_snippets) >= 5:
                     break
+
+        # Blend in memory-cell snippets as a parallel bounded memory source.
+        for snippet in mem_cell_snippets:
+            if snippet not in memory_snippets:
+                memory_snippets.append(snippet)
+            if len(memory_snippets) >= 6:
+                break
 
         # ------------------------------
         # Build recollection prompt
@@ -491,7 +562,7 @@ def build_neurons(orchestrator: Orchestrator):
     cfg = NeuronConfig(
         name=NEURON_NAME,
         subscribed_topics=["memory/recollect"],
-        output_topics=["reason/request"],
+        output_topics=["reason/request", "act/speech", "memory/recall_context"],
         priority=8,  # runs after router/introspect, before general chatter if needed
     )
     yield RecollectionNeuron(cfg)

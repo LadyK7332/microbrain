@@ -40,6 +40,20 @@ def _time_in_window(now_h: int, now_m: int, start_h: int, start_m: int, end_h: i
     return now >= start or now < end
 
 
+def _coerce_power_state(raw, charging: bool, sleep: bool, now_ts: float):
+    if isinstance(raw, dict):
+        state = dict(raw)
+    else:
+        state = {"mode": str(raw or "active")}
+    state["mode"] = str(state.get("mode", "active") or "active").lower()
+    state["charging"] = bool(state.get("charging", charging))
+    state["sleep"] = bool(state.get("sleep", sleep))
+    state["last_ts"] = float(state.get("last_ts", now_ts) or now_ts)
+    if "pct" not in state:
+        state["pct"] = 100.0
+    return state
+
+
 class PowerStateSchedulerNeuron(BaseNeuron):
     """
     Computes a simple time+state switch for future hardware integration:
@@ -61,6 +75,7 @@ class PowerStateSchedulerNeuron(BaseNeuron):
             charging = bool(payload.get("charging", False))
             await ctx.set_kv("power:charging", charging)
             await ctx.set_kv("power:charging_last_event_ts", time.time())
+            await ctx.set_kv("power:charging_last_set_ts", time.time())
 
         if event.topic not in ("clock/tick", "power/charging"):
             return []
@@ -105,6 +120,12 @@ class PowerStateSchedulerNeuron(BaseNeuron):
             if busy_count <= 0:
                 idle_after_s = float(await ctx.get_kv("power:idle_after_s", 60.0) or 60.0)
                 last_ext = float(await ctx.get_kv("power:last_external_ts", 0.0) or 0.0)
+                if last_ext <= 0.0:
+                    interaction = await ctx.get_kv("interaction:last_input", {}) or {}
+                    if isinstance(interaction, dict):
+                        last_ext = float(interaction.get("ts", 0.0) or 0.0)
+                        if last_ext > 0.0:
+                            await ctx.set_kv("power:last_external_ts", last_ext)
                 idle_ok = (last_ext > 0.0) and ((now_ts - last_ext) >= idle_after_s)
                 cpu_ok = True
                 cpu_thr = float(await ctx.get_kv("power:idle_cpu_threshold", 15.0) or 15.0)
@@ -124,23 +145,43 @@ class PowerStateSchedulerNeuron(BaseNeuron):
                 if idle_ok and cpu_ok:
                     desired_state = "idle"
 
-        cur_state = str(await ctx.get_kv("power:state", "active") or "active")
-        if desired_state != cur_state:
-            await ctx.set_kv("power:state", desired_state)
+        sleep_value = bool(await ctx.get_kv("power:sleep", False))
+
+        # autosleep behavior
+        auto = bool(await ctx.get_kv("power:autosleep_on_charge", True))
+        if auto:
+            if desired_state == "charge":
+                if not sleep_value:
+                    await ctx.set_kv("power:sleep", True)
+                    await ctx.set_kv("power:sleep_last_set_ts", now_ts)
+                    await ctx.set_kv("power:sleep_auto_set", True)
+                sleep_value = True
+            else:
+                # Only clear sleep if we were the one that set it
+                if bool(await ctx.get_kv("power:sleep_auto_set", False)):
+                    await ctx.set_kv("power:sleep", False)
+                    await ctx.set_kv("power:sleep_last_set_ts", now_ts)
+                    await ctx.set_kv("power:sleep_auto_set", False)
+                    sleep_value = False
+
+        raw_state = await ctx.get_kv("power:state", None)
+        state = _coerce_power_state(raw_state, charging=charging, sleep=sleep_value, now_ts=now_ts)
+        cur_state = str(state.get("mode", "active") or "active").lower()
+        state_changed = desired_state != cur_state
+
+        if (
+            state_changed
+            or bool(state.get("charging", False)) != charging
+            or bool(state.get("sleep", False)) != sleep_value
+        ):
+            state["mode"] = desired_state
+            state["charging"] = charging
+            state["sleep"] = sleep_value
+            await ctx.set_kv("power:state", state)
+            await ctx.set_kv("power:mode", desired_state)
             await ctx.set_kv("power:state_last_change_ts", now_ts)
 
-            # autosleep behavior
-            auto = bool(await ctx.get_kv("power:autosleep_on_charge", True))
-            if auto:
-                if desired_state == "charge":
-                    await ctx.set_kv("power:sleep", True)
-                    await ctx.set_kv("power:sleep_auto_set", True)
-                else:
-                    # Only clear sleep if we were the one that set it
-                    if bool(await ctx.get_kv("power:sleep_auto_set", False)):
-                        await ctx.set_kv("power:sleep", False)
-                        await ctx.set_kv("power:sleep_auto_set", False)
-
+        if state_changed:
             # Emit a lightweight state-change event for observers
             return [
                 Event(
@@ -157,7 +198,6 @@ class PowerStateSchedulerNeuron(BaseNeuron):
                     meta={"kind": "power_schedule"},
                 )
             ]
-
         return []
 
 

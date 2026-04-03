@@ -53,6 +53,24 @@ _GOAL_WORDS = (
     "patch",
 )
 
+_BRIDGE_MARKERS = (
+    " is ",
+    " means ",
+    " = ",
+    " aka ",
+    " called ",
+)
+
+_GREETING_PHRASES = {
+    "hi",
+    "hello",
+    "hey",
+    "yo",
+    "good morning",
+    "good afternoon",
+    "good evening",
+}
+
 
 def _clamp(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
     if value < lo:
@@ -102,9 +120,12 @@ class InitiativeThresholdNeuron(BaseNeuron):
                 "pending_since": 0.0,
                 "pending_flags": {},
                 "pending_answered": False,
+                "pending_fingerprint": "",
+                "pending_repeats": 0,
                 "last_user_channel": "repl",
                 "tier": 0,
                 "last_thought_ts": 0.0,
+                "last_thought_fingerprint": "",
                 "last_clarify_ts": 0.0,
                 "clarify_said": False,
                 "hormones": {
@@ -129,11 +150,70 @@ class InitiativeThresholdNeuron(BaseNeuron):
                 state["last_user_ts"] = now
                 state["last_external_ts"] = now
                 state["last_user_channel"] = channel
-                state["pending_text"] = text[:280]
-                state["pending_since"] = now
-                state["pending_flags"] = self._classify_text(text)
-                state["pending_answered"] = False
-                state["clarify_said"] = False
+
+                prev_text = str(state.get("pending_text", "") or "")
+                prev_flags = state.get("pending_flags", {}) or {}
+                prev_fp = str(state.get("pending_fingerprint", "") or "")
+                new_fp = self._pending_fingerprint(text)
+                bridge_resolution = None
+                if (
+                    prev_text
+                    and prev_fp
+                    and new_fp
+                    and new_fp != prev_fp
+                    and (bool(state.get("clarify_said", False)) or self._is_probe_fragment(prev_text, prev_flags))
+                ):
+                    bridge_resolution = self._resolve_bridge(prev_text, text)
+
+                if bridge_resolution:
+                    state["pending_text"] = ""
+                    state["pending_since"] = 0.0
+                    state["pending_flags"] = {}
+                    state["pending_answered"] = True
+                    state["pending_fingerprint"] = ""
+                    state["pending_repeats"] = 0
+                    state["last_thought_fingerprint"] = ""
+                    state["clarify_said"] = False
+                    state["last_clarify_ts"] = now
+                    await ctx.set_kv(
+                        "initiative:last_bridge_resolution",
+                        {
+                            "pending_text": prev_text,
+                            "bridge_text": text[:280],
+                            "concept": bridge_resolution.get("concept", ""),
+                            "ts": now,
+                        },
+                    )
+                    if self._is_greeting_phrase(str(bridge_resolution.get("concept", "") or "")):
+                        alias_key = self._pending_fingerprint(prev_text)
+                        if alias_key:
+                            aliases = await ctx.get_kv("router:greeting_aliases", {}) or {}
+                            if not isinstance(aliases, dict):
+                                aliases = {}
+                            aliases[alias_key] = str(bridge_resolution.get("concept", "") or "greeting")
+                            await ctx.set_kv("router:greeting_aliases", aliases)
+
+                if bridge_resolution and self._looks_like_bridge_statement(text):
+                    text = ""
+                    new_fp = ""
+
+                if text:
+                    same_pending = bool(prev_fp and new_fp and new_fp == prev_fp)
+                    state["pending_text"] = text[:280]
+                    if same_pending and prev_text:
+                        state["pending_since"] = float(state.get("pending_since", now) or now)
+                        state["pending_flags"] = prev_flags or self._classify_text(text)
+                        state["pending_answered"] = False
+                        state["pending_fingerprint"] = prev_fp
+                        state["pending_repeats"] = int(state.get("pending_repeats", 0) or 0) + 1
+                    else:
+                        state["pending_since"] = now
+                        state["pending_flags"] = self._classify_text(text)
+                        state["pending_answered"] = False
+                        state["pending_fingerprint"] = new_fp
+                        state["pending_repeats"] = 0
+                        state["last_thought_fingerprint"] = ""
+                        state["clarify_said"] = False
 
         elif event.topic == "percept/vision":
             state["last_external_ts"] = now
@@ -142,19 +222,27 @@ class InitiativeThresholdNeuron(BaseNeuron):
             payload = event.payload if isinstance(event.payload, dict) else {}
             channel = str(payload.get("channel", "repl") or "repl")
             style = str(payload.get("style", "") or "")
+            spoken_text = str(payload.get("text", "") or "").strip()
+            kind = str((event.meta or {}).get("kind", "") or "")
             state["last_speech_ts"] = now
 
             if channel != "thought":
                 state["last_external_ts"] = now
 
             if style in ("assistant", "system") and state.get("pending_text"):
-                state["pending_answered"] = True
-                flags = state.get("pending_flags", {}) or {}
-                if not bool(flags.get("clarify_ready", False)):
-                    state["pending_text"] = ""
-                    state["pending_since"] = 0.0
-                    state["pending_flags"] = {}
-                    state["clarify_said"] = False
+                if kind == "initiative_probe" or spoken_text == "?":
+                    state["clarify_said"] = True
+                    state["last_clarify_ts"] = now
+                else:
+                    state["pending_answered"] = True
+                    flags = state.get("pending_flags", {}) or {}
+                    if not bool(flags.get("clarify_ready", False)):
+                        state["pending_text"] = ""
+                        state["pending_since"] = 0.0
+                        state["pending_flags"] = {}
+                        state["pending_fingerprint"] = ""
+                        state["pending_repeats"] = 0
+                        state["clarify_said"] = False
 
         boredom = await ctx.get_kv("drive:boredom", {}) or {}
         stress = await ctx.get_kv("drive:stress", {}) or {}
@@ -204,6 +292,8 @@ class InitiativeThresholdNeuron(BaseNeuron):
         continuity_need = 0.0
         if pending_text:
             continuity_need = _clamp(0.20 + min(0.55, pending_age / 90.0))
+            if self._is_declarative_assertion(pending_text, pending_flags):
+                continuity_need *= 0.22
             if bool(state.get("pending_answered", False)):
                 continuity_need *= 0.45
             if bool(state.get("clarify_said", False)):
@@ -346,11 +436,23 @@ class InitiativeThresholdNeuron(BaseNeuron):
         out: List[Event] = []
         emitted_thought = False
 
+        pending_fingerprint = str(state.get("pending_fingerprint", "") or "")
+        declarative_assertion = self._is_declarative_assertion(pending_text, pending_flags)
+        same_thought_already_emitted = (
+            pending_fingerprint
+            and pending_fingerprint == str(state.get("last_thought_fingerprint", "") or "")
+        )
+
         if (
             new_tier >= 2
             and not sleeping
             and time_since_user >= 1.5
-            and (prev_tier < 2 or (now - float(state.get("last_thought_ts", 0.0) or 0.0)) >= float(await ctx.get_kv("rosehip:thought_min_interval_s", 35.0) or 35.0))
+            and not same_thought_already_emitted
+            and (
+                prev_tier < 2
+                or (now - float(state.get("last_thought_ts", 0.0) or 0.0))
+                >= float(await ctx.get_kv("rosehip:thought_min_interval_s", 35.0) or 35.0)
+            )
         ):
             thought_note = self._build_internal_note(
                 needs=needs,
@@ -373,6 +475,9 @@ class InitiativeThresholdNeuron(BaseNeuron):
                 )
             )
             state["last_thought_ts"] = now
+            state["last_thought_fingerprint"] = pending_fingerprint
+            if declarative_assertion:
+                state["pending_answered"] = True
             emitted_thought = True
 
         if (
@@ -385,6 +490,7 @@ class InitiativeThresholdNeuron(BaseNeuron):
         ):
             question = self._build_clarify_text(pending_text=pending_text, flags=pending_flags)
             if question:
+                meta_kind = "initiative_probe" if question.strip() == "?" else "initiative_clarify"
                 out.append(
                     Event(
                         topic="act/speech",
@@ -395,7 +501,7 @@ class InitiativeThresholdNeuron(BaseNeuron):
                         },
                         source=self.name,
                         correlation_id=event.correlation_id,
-                        meta={"kind": "initiative_clarify", "tier": new_tier},
+                        meta={"kind": meta_kind, "tier": new_tier},
                     )
                 )
                 state["clarify_said"] = True
@@ -406,6 +512,8 @@ class InitiativeThresholdNeuron(BaseNeuron):
             state["pending_since"] = 0.0
             state["pending_flags"] = {}
             state["pending_answered"] = False
+            state["pending_fingerprint"] = ""
+            state["last_thought_fingerprint"] = ""
             state["clarify_said"] = False
 
         await self.save_state(ctx, "initiative_state", state)
@@ -427,6 +535,8 @@ class InitiativeThresholdNeuron(BaseNeuron):
         has_question = "?" in lowered
         has_error_language = any(pat in lowered for pat in ("error", "issue", "problem", "not working", "stuck"))
         has_response_request = any(pat in lowered for pat in ("please respond", "respond", "reply", "speak up", "can you hear me"))
+        short_fragment = self._is_probe_fragment(text, {})
+        bridge_statement = self._looks_like_bridge_statement(text)
 
         coherence_score = 0.0
         coherence_score += 0.30 if has_question else 0.0
@@ -434,6 +544,7 @@ class InitiativeThresholdNeuron(BaseNeuron):
         coherence_score += min(0.35, 0.12 * marker_hits)
         coherence_score += 0.20 if option_hits > 0 else 0.0
         coherence_score += 0.10 if has_error_language else 0.0
+        coherence_score += 0.16 if short_fragment else 0.0
         coherence_score = _clamp(coherence_score)
 
         clarify_ready = bool(
@@ -441,6 +552,7 @@ class InitiativeThresholdNeuron(BaseNeuron):
             or option_hits > 0
             or has_error_language
             or has_response_request
+            or short_fragment
             or (goal_hits > 0 and marker_hits > 0)
             or marker_hits >= 2
         )
@@ -452,6 +564,8 @@ class InitiativeThresholdNeuron(BaseNeuron):
             "has_response_request": has_response_request,
             "goal_hits": goal_hits,
             "marker_hits": marker_hits,
+            "short_fragment": short_fragment,
+            "bridge_statement": bridge_statement,
             "coherence_score": round(coherence_score, 4),
             "clarify_ready": clarify_ready,
         }
@@ -509,6 +623,28 @@ class InitiativeThresholdNeuron(BaseNeuron):
             return 1
         return 0
 
+
+    def _pending_fingerprint(self, text: str) -> str:
+        norm = re.sub(r"[^a-z0-9\s]", " ", (text or "").lower())
+        norm = re.sub(r"\s+", " ", norm).strip()
+        return norm[:160]
+
+    def _is_declarative_assertion(self, text: str, flags: Dict[str, Any]) -> bool:
+        if not text:
+            return False
+        if bool(flags.get("has_question", False)):
+            return False
+        if bool(flags.get("has_response_request", False)):
+            return False
+        if bool(flags.get("has_options", False)):
+            return False
+        if bool(flags.get("has_error_language", False)):
+            return False
+
+        norm = re.sub(r"\s+", " ", (text or "").strip())
+        word_count = len(norm.split())
+        return word_count >= 3
+
     def _build_internal_note(
         self,
         *,
@@ -533,16 +669,20 @@ class InitiativeThresholdNeuron(BaseNeuron):
         else:
             notes.append("pending: none")
 
+        declarative_assertion = self._is_declarative_assertion(pending_text, pending_flags)
+
         if bool(pending_flags.get("has_response_request", False)):
             notes.append("user likely wants acknowledgement or direct outward reply")
         elif bool(pending_flags.get("has_question", False)):
             notes.append("question detected; likely needs a missing-variable check")
         elif bool(pending_flags.get("has_options", False)):
             notes.append("multiple valid paths detected; target may be missing")
+        elif declarative_assertion:
+            notes.append("declarative statement observed; grounding still forming")
 
         if continuity >= 0.40:
             notes.append("continuity pressure elevated")
-        if coherence >= 0.40 or inquiry >= 0.45:
+        if not declarative_assertion and (coherence >= 0.40 or inquiry >= 0.45):
             notes.append("coherence / inquiry pressure suggests clarification or tighter framing")
         if caution >= 0.45:
             notes.append("caution elevated; avoid overcommitting")
@@ -560,6 +700,8 @@ class InitiativeThresholdNeuron(BaseNeuron):
         if len(compact) > 120:
             compact = compact[:117] + "..."
 
+        if self._is_probe_fragment(compact, flags):
+            return "?"
         if bool(flags.get("has_options", False)):
             return "I can take either path here. Which option should I optimize for?"
         if bool(flags.get("has_error_language", False)):
@@ -569,6 +711,53 @@ class InitiativeThresholdNeuron(BaseNeuron):
         if bool(flags.get("has_question", False)):
             return "I have one missing variable. Do you want an explanation, a plan, or a concrete patch?"
         return f"I think the missing variable is the target outcome for: {compact} What should I optimize for?"
+
+
+    def _is_probe_fragment(self, text: str, flags: Dict[str, Any]) -> bool:
+        if not text:
+            return False
+        if bool((flags or {}).get("has_question", False)):
+            return False
+        if bool((flags or {}).get("has_response_request", False)):
+            return False
+        if bool((flags or {}).get("has_error_language", False)):
+            return False
+        if self._looks_like_bridge_statement(text):
+            return False
+        norm = re.sub(r"[^a-z0-9\s]", " ", (text or "").lower())
+        words = [w for w in norm.split() if w]
+        if not words or len(words) > 3:
+            return False
+        return True
+
+    def _looks_like_bridge_statement(self, text: str) -> bool:
+        lowered = f" {(text or '').strip().lower()} "
+        return any(marker in lowered for marker in _BRIDGE_MARKERS)
+
+    def _resolve_bridge(self, pending_text: str, new_text: str) -> Dict[str, str]:
+        pending_norm = self._pending_fingerprint(pending_text)
+        new_norm = re.sub(r"\s+", " ", (new_text or "").strip().lower())
+        if not pending_norm or not new_norm:
+            return {}
+
+        for marker in _BRIDGE_MARKERS:
+            marker_norm = marker.strip()
+            if marker_norm not in new_norm:
+                continue
+            left, right = [part.strip() for part in new_norm.split(marker_norm, 1)]
+            if left == pending_norm and right:
+                return {"concept": right}
+            if right == pending_norm and left:
+                return {"concept": left}
+
+        if self._is_greeting_phrase(new_norm):
+            return {"concept": new_norm}
+
+        return {}
+
+    def _is_greeting_phrase(self, text: str) -> bool:
+        norm = re.sub(r"\s+", " ", (text or "").strip().lower())
+        return norm in _GREETING_PHRASES
 
 
 

@@ -15,6 +15,26 @@ from microbrain.orchestrator.neuron_base import BaseNeuron, NeuronConfig, Event
 from microbrain.orchestrator.orchestrator import Orchestrator
 
 
+def _coerce_power_state(raw: Any) -> Dict[str, Any]:
+    if isinstance(raw, dict):
+        state = dict(raw)
+    else:
+        state = {"mode": str(raw or "active")}
+    state["pct"] = max(0.0, min(100.0, float(state.get("pct", 100.0) or 100.0)))
+    state["charging"] = bool(state.get("charging", False))
+    state["sleep"] = bool(state.get("sleep", False))
+    state["mode"] = str(state.get("mode", "active") or "active").lower()
+    return state
+
+
+def _display_power_pct(pct: Any) -> int:
+    raw = max(0.0, min(100.0, float(pct or 0.0)))
+    if raw >= 100.0:
+        return 100
+    bucket = int(raw // 5.0) * 5
+    return max(0, min(95, bucket))
+
+
 class TextInputNeuron(BaseNeuron):
     """
     First-stop neuron for incoming text.
@@ -143,6 +163,24 @@ class TextInputNeuron(BaseNeuron):
         # Handle /power commands here so they don't become percept/text.
         if text_norm.startswith("/power"):
             return await self._handle_power_command(
+                cmd_text=text_norm,
+                ctx=ctx,
+                channel=channel,
+                correlation_id=event.correlation_id,
+            )
+
+        # Handle /cookie here so it feeds virtual power without memory pollution.
+        if text_norm.startswith("/cookie"):
+            return await self._handle_cookie_command(
+                cmd_text=text_norm,
+                ctx=ctx,
+                channel=channel,
+                correlation_id=event.correlation_id,
+            )
+
+        # Handle /read commands here so they don't become percept/text.
+        if text_norm.startswith("/read"):
+            return await self._handle_read_command(
                 cmd_text=text_norm,
                 ctx=ctx,
                 channel=channel,
@@ -604,13 +642,12 @@ class TextInputNeuron(BaseNeuron):
         line = (cmd_text or "").strip()
         parts = line.split(maxsplit=2)  # "/power", "<subcmd>", "<rest...>"
 
-        state = await ctx.get_kv("power:state", None)
-        if not isinstance(state, dict):
-            state = {"pct": 100.0, "charging": False, "sleep": False}
+        state = _coerce_power_state(await ctx.get_kv("power:state", None))
 
         if len(parts) == 1:
             msg = (
-                f"power: {float(state.get('pct', 100.0)):.1f}% | "
+                f"power: {_display_power_pct(state.get('pct', 100.0))}% | "
+                f"mode={str(state.get('mode', 'active'))} | "
                 f"charging={bool(state.get('charging', False))} | "
                 f"sleep={bool(state.get('sleep', False))} | "
                 f"entropy_allowed={bool(await ctx.get_kv('entropy:allowed', False))}\n"
@@ -618,7 +655,8 @@ class TextInputNeuron(BaseNeuron):
                 "  /power status\n"
                 "  /power pct <0-100>\n"
                 "  /power charging on|off\n"
-                "  /power sleep on|off"
+                "  /power sleep on|off\n"
+                "  /cookie"
             )
             return [self._speech_control(msg, channel=channel, correlation_id=correlation_id)]
 
@@ -627,18 +665,19 @@ class TextInputNeuron(BaseNeuron):
 
         if subcmd in ("status", "state"):
             msg = (
-                f"power: {float(state.get('pct', 100.0)):.1f}% | "
+                f"power: {_display_power_pct(state.get('pct', 100.0))}% | "
+                f"mode={str(state.get('mode', 'active'))} | "
                 f"charging={bool(state.get('charging', False))} | "
                 f"sleep={bool(state.get('sleep', False))} | "
                 f"entropy_allowed={bool(await ctx.get_kv('entropy:allowed', False))}"
             )
             return [self._speech_control(msg, channel=channel, correlation_id=correlation_id)]
 
-        if subcmd == "pct":
+        if subcmd in ("pct", "set"):
             try:
                 v = float(rest)
             except Exception:
-                return [self._speech_control("Usage: /power pct <0-100>", channel=channel, correlation_id=correlation_id)]
+                return [self._speech_control("Usage: /power pct <0-100> or /power set <0-100>", channel=channel, correlation_id=correlation_id)]
             v = max(0.0, min(100.0, v))
 
             # Immediately persist state so /power status reflects it right away
@@ -646,6 +685,9 @@ class TextInputNeuron(BaseNeuron):
             state["last_ts"] = time.time()
             await ctx.set_kv("power:state", state)
             await ctx.set_kv("power:battery_pct", float(state.get("pct", 100.0)))
+            await ctx.set_kv("power:charging", bool(state.get("charging", False)))
+            await ctx.set_kv("power:sleep", bool(state.get("sleep", False)))
+            await ctx.set_kv("power:mode", str(state.get("mode", "active")))
             await ctx.set_kv("entropy:allowed", bool(state.get("charging", False) and state.get("sleep", False)))
 
             return [
@@ -656,7 +698,11 @@ class TextInputNeuron(BaseNeuron):
                     correlation_id=correlation_id,
                     meta={"control": True, "kind": "power_control"},
                 ),
-                self._speech_control(f"Set battery to {v:.1f}%.", channel=channel, correlation_id=correlation_id),
+                self._speech_control(
+                    f"Set battery to {v:.1f}% (display bucket {_display_power_pct(v)}%).",
+                    channel=channel,
+                    correlation_id=correlation_id,
+                ),
             ]
         
         if subcmd == "charging":
@@ -667,8 +713,12 @@ class TextInputNeuron(BaseNeuron):
             # Immediately persist state so /power status reflects it right away
             state["charging"] = val
             state["last_ts"] = time.time()
+            await ctx.set_kv("power:charging_last_set_ts", state["last_ts"])
             await ctx.set_kv("power:state", state)
             await ctx.set_kv("power:battery_pct", float(state.get("pct", 100.0)))
+            await ctx.set_kv("power:charging", bool(state.get("charging", False)))
+            await ctx.set_kv("power:sleep", bool(state.get("sleep", False)))
+            await ctx.set_kv("power:mode", str(state.get("mode", "active")))
             await ctx.set_kv("entropy:allowed", bool(state.get("charging", False) and state.get("sleep", False)))
 
             return [
@@ -690,8 +740,12 @@ class TextInputNeuron(BaseNeuron):
             # Immediately persist state so /power status reflects it right away
             state["sleep"] = val
             state["last_ts"] = time.time()
+            await ctx.set_kv("power:sleep_last_set_ts", state["last_ts"])
             await ctx.set_kv("power:state", state)
             await ctx.set_kv("power:battery_pct", float(state.get("pct", 100.0)))
+            await ctx.set_kv("power:charging", bool(state.get("charging", False)))
+            await ctx.set_kv("power:sleep", bool(state.get("sleep", False)))
+            await ctx.set_kv("power:mode", str(state.get("mode", "active")))
             await ctx.set_kv("entropy:allowed", bool(state.get("charging", False) and state.get("sleep", False)))
 
             return [
@@ -705,7 +759,119 @@ class TextInputNeuron(BaseNeuron):
                 self._speech_control(f"Sleep {'on' if val else 'off'}.", channel=channel, correlation_id=correlation_id),
             ]
         
-        return [self._speech_control("Unknown /power subcommand. Try: status, pct, charging, sleep", channel=channel, correlation_id=correlation_id)]
+        return [self._speech_control("Unknown /power subcommand. Try: status, pct, set, charging, sleep", channel=channel, correlation_id=correlation_id)]
+
+    async def _handle_cookie_command(
+        self,
+        cmd_text: str,
+        ctx,
+        channel: str,
+        correlation_id: str,
+    ) -> List[Event]:
+        state = _coerce_power_state(await ctx.get_kv("power:state", None))
+        before = float(state.get("pct", 100.0) or 100.0)
+        after = max(0.0, min(100.0, before + 5.0))
+
+        state["pct"] = after
+        state["last_ts"] = time.time()
+        await ctx.set_kv("power:state", state)
+        await ctx.set_kv("power:battery_pct", after)
+        await ctx.set_kv("power:charging", bool(state.get("charging", False)))
+        await ctx.set_kv("power:sleep", bool(state.get("sleep", False)))
+        await ctx.set_kv("power:mode", str(state.get("mode", "active")))
+        await ctx.set_kv("entropy:allowed", bool(state.get("charging", False) and state.get("sleep", False)))
+
+        delta = after - before
+        if delta <= 0.0:
+            msg = f"Cookie received, but power is already full at {_display_power_pct(after)}%."
+        else:
+            msg = (
+                f"Cookie received. Power +{delta:.1f}% → {after:.1f}% "
+                f"(display bucket {_display_power_pct(after)}%)."
+            )
+
+        return [
+            Event(
+                topic="control/power",
+                payload={"set_pct": after, "reason": "cookie"},
+                source=self.name,
+                correlation_id=correlation_id,
+                meta={"control": True, "kind": "power_control", "feed": "cookie"},
+            ),
+            self._speech_control(msg, channel=channel, correlation_id=correlation_id),
+        ]
+
+
+    async def _handle_read_command(
+        self,
+        cmd_text: str,
+        ctx,
+        channel: str,
+        correlation_id: str,
+    ) -> List[Event]:
+        parts = (cmd_text or "").strip().split(maxsplit=1)
+        arg = parts[1].strip() if len(parts) > 1 else "status"
+        sub = arg.lower()
+
+        if sub in ("", "status", "state"):
+            enabled = bool(await ctx.get_kv("read:enabled", False))
+            active_file = str(await ctx.get_kv("read:active_file", "") or "")
+            active_kind = str(await ctx.get_kv("read:active_kind", "") or "")
+            chunk_index = int(await ctx.get_kv("read:chunk_index", 0) or 0)
+            idle_after_s = float(await ctx.get_kv("read:idle_after_s", 90.0) or 90.0)
+            read_dir = str(await ctx.get_kv("read:dir", "") or "")
+            last = await ctx.get_kv("read:last_result", {})
+            progress = "idle"
+            if isinstance(last, dict) and last:
+                progress = str(last.get("summary", progress) or progress)
+            msg = (
+                f"read: {'on' if enabled else 'off'} | file={Path(active_file).name if active_file else '-'} | "
+                f"kind={active_kind or '-'} | chunk={chunk_index} | idle_after={int(idle_after_s)}s\n"
+                f"dir: {read_dir or '-'}\n"
+                f"last: {progress}"
+            )
+            return [self._speech_control(msg, channel=channel, correlation_id=correlation_id)]
+
+        if sub in ("on", "start"):
+            await ctx.set_kv("read:enabled", True)
+            return [
+                Event(
+                    topic="control/read",
+                    payload={"command": "on"},
+                    source=self.name,
+                    correlation_id=correlation_id,
+                    meta={"control": True, "kind": "read_control"},
+                ),
+                self._speech_control("Read mode on.", channel=channel, correlation_id=correlation_id),
+            ]
+
+        if sub in ("off", "stop"):
+            await ctx.set_kv("read:enabled", False)
+            return [
+                Event(
+                    topic="control/read",
+                    payload={"command": "off"},
+                    source=self.name,
+                    correlation_id=correlation_id,
+                    meta={"control": True, "kind": "read_control"},
+                ),
+                self._speech_control("Read mode off.", channel=channel, correlation_id=correlation_id),
+            ]
+
+        if sub in ("next", "step"):
+            return [
+                Event(
+                    topic="control/read",
+                    payload={"command": "next"},
+                    source=self.name,
+                    correlation_id=correlation_id,
+                    meta={"control": True, "kind": "read_control"},
+                ),
+                self._speech_control("Read next chunk requested.", channel=channel, correlation_id=correlation_id),
+            ]
+
+        return [self._speech_control("Unknown /read subcommand. Try: on, off, status, next", channel=channel, correlation_id=correlation_id)]
+
 
     def _speech_user_profile(self, text: str, channel: str, correlation_id: str) -> Event:
         return Event(

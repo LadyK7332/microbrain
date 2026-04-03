@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 from microbrain.config import AppConfig
 from microbrain.memory.emotional_journal import EmotionJournal
 from microbrain.memory.memory_store import MemoryStore
+from microbrain.memory.mem_cell_store import MemCellStore
 from microbrain.hrm.core import HRMCore
 from microbrain.pdna.core import PDNAStore
 from microbrain.utils.logging_setup import configure_logging
@@ -188,8 +189,8 @@ def _resolve_memdir(arg_memdir: str | None) -> str:
         "synapse",
         "thought",
         "touch",
-        "episodes",
         "logs",
+        "read_dir",
     ]
 
     ensure_child_dirs(base, child_dirs, logger=logger)
@@ -262,7 +263,12 @@ async def main_async(cfg: AppConfig):
 
     # Charging + schedule window (for future HW triggers)
     orch.kv_store.setdefault("power:charging", False)
-    orch.kv_store.setdefault("power:state", "active")         # active|charge
+    orch.kv_store.setdefault(
+        "power:state",
+        {"pct": 100.0, "charging": False, "sleep": False, "mode": "active", "last_ts": time.time()},
+    )
+    orch.kv_store.setdefault("power:battery_pct", 100.0)
+    orch.kv_store.setdefault("power:mode", "active")
     orch.kv_store.setdefault("power:timezone", "America/Chicago")
     orch.kv_store.setdefault("power:charge_window_start", "22:00")
     orch.kv_store.setdefault("power:charge_window_end", "06:00")
@@ -275,6 +281,39 @@ async def main_async(cfg: AppConfig):
     orch.kv_store.setdefault("power:idle_cpu_threshold", 15.0)    # CPU% threshold (best effort; psutil if available)
     orch.kv_store.setdefault("power:busy_count", 0)
     orch.kv_store.setdefault("power:busy", False)
+    orch.kv_store.setdefault("power:active_drain_per_sec", 100.0 / 86400.0)
+    orch.kv_store.setdefault("power:idle_drain_per_sec", 40.0 / 86400.0)
+    orch.kv_store.setdefault("power:sleep_drain_per_sec", 10.0 / 86400.0)
+    orch.kv_store.setdefault("power:busy_drain_per_sec", 15.0 / 86400.0)
+    orch.kv_store.setdefault("power:charge_per_sec", 100.0 / 3600.0)
+    orch.kv_store.setdefault("power:reason_request_cost", 0.10)
+    orch.kv_store.setdefault("power:reason_internal_cost", 0.03)
+    orch.kv_store.setdefault("power:act_speech_cost", 0.12)
+    orch.kv_store.setdefault("power:act_speech_thought_cost", 0.02)
+    orch.kv_store.setdefault("power:task_start_cost", 0.15)
+    orch.kv_store.setdefault("power:act_motor_cost", 0.50)
+    orch.kv_store.setdefault("probe:enabled", True)
+    orch.kv_store.setdefault("probe:every_s", 300.0)
+    orch.kv_store.setdefault("probe:maintenance_every_s", 1800.0)
+    orch.kv_store.setdefault("probe:activation_delta", 0.03)
+    orch.kv_store.setdefault("probe:promotion_delta", 0.01)
+    orch.kv_store.setdefault("mem_cell:now_hours", 36.0)
+    orch.kv_store.setdefault("mem_cell:short_hours", 72.0)
+    orch.kv_store.setdefault("mem_cell:long_hours", 96.0)
+    orch.kv_store.setdefault("mem_cell:learned_hours", 336.0)
+
+    orch.kv_store.setdefault("read:enabled", False)
+    orch.kv_store.setdefault("read:idle_after_s", 90.0)
+    orch.kv_store.setdefault("read:tick_every_s", 30.0)
+    orch.kv_store.setdefault("read:chunk_lines", 40)
+    orch.kv_store.setdefault("read:chunk_chars", 1200)
+    orch.kv_store.setdefault("read:dir", str(Path(cfg.memdir) / "read_dir"))
+    orch.kv_store.setdefault("read:active_file", "")
+    orch.kv_store.setdefault("read:active_kind", "")
+    orch.kv_store.setdefault("read:chunk_index", 0)
+    orch.kv_store.setdefault("read:last_user_ts", 0.0)
+    orch.kv_store.setdefault("read:last_activity_ts", 0.0)
+    orch.kv_store.setdefault("read:last_result", {})
 
     # Evidence recorder / hazard gating (split raw streams; OFF unless armed).
     orch.kv_store.setdefault("er:enabled", True)

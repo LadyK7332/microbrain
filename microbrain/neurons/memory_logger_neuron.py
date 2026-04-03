@@ -6,7 +6,8 @@ from typing import Iterable, Any, Dict
 
 from microbrain.orchestrator.neuron_base import BaseNeuron, NeuronConfig, Event
 from microbrain.orchestrator.orchestrator import Orchestrator
-from microbrain.memory.filters import classify_event_for_memory
+from microbrain.utils.memdir import resolve_memdir_ctx
+from microbrain.memory.mem_cell_store import MemCellStore
 
 
 NEURON_NAME = Path(__file__).stem
@@ -33,9 +34,18 @@ class MemoryLoggerNeuron(BaseNeuron):
         # Grab the memory objects injected by mind.py
         mem_store = await ctx.get_kv("memory:store", None)
         ejournal = await ctx.get_kv("memory:emotion_journal", None)
+        mem_cell_store = await ctx.get_kv("memory:mem_cell_store", None)
+        if mem_cell_store is None:
+            try:
+                memdir = await resolve_memdir_ctx(ctx, fallback=r"Z:\memory")
+                mem_cell_store = MemCellStore(memdir)
+                await ctx.set_kv("memory:mem_cell_store", mem_cell_store)
+            except Exception as e:
+                self.debug("mem_cell_store_error", error=str(e))
+                mem_cell_store = None
 
         # If nothing is wired, bail out quietly
-        if mem_store is None and ejournal is None:
+        if mem_store is None and ejournal is None and mem_cell_store is None:
             return []
 
         topic = event.topic
@@ -109,8 +119,6 @@ class MemoryLoggerNeuron(BaseNeuron):
         role: str = "user"
         transport_source: str = "user"
 
-        guard = classify_event_for_memory(event)
-
         if topic == "percept/text":
             # TextInputNeuron always passes a dict payload with 'text'
             if isinstance(payload, dict):
@@ -141,11 +149,8 @@ class MemoryLoggerNeuron(BaseNeuron):
 
             transport_source = str(event.source or "assistant")
 
-        # Nothing meaningful to log, or event is not eligible for long-term memory
+        # Nothing meaningful to log
         if not text:
-            return []
-        if not guard.get("allow_longterm", False):
-            self.debug("memory_skip", reason=guard.get("junk_reason") or "blocked", channel=guard.get("channel"), kind=guard.get("kind"), role=guard.get("role"))
             return []
 
         ts = int(time.time())
@@ -154,7 +159,7 @@ class MemoryLoggerNeuron(BaseNeuron):
         try:
             if mem_store is not None:
                 # Preserve meta so recall can filter system/control noise later
-                meta_base: Dict[str, Any] = {"role": role, "schema_ver": 2, "transport_source": transport_source, "memory_source": role, "memory_quality": "trusted"}
+                meta_base: Dict[str, Any] = {"role": role, "schema_ver": 2, "transport_source": transport_source}
                 if event.meta:
                     for k in ("kind", "control", "channel", "source"):
                         if k in event.meta:
@@ -178,6 +183,28 @@ class MemoryLoggerNeuron(BaseNeuron):
         except Exception as e:
             # Keep logging failures from killing the brain
             self.debug("mem_store_error", error=str(e))
+
+        # --- Write to mem_cell/now -----------------------------------------------
+        try:
+            if mem_cell_store is not None and role in ("user", "assistant"):
+                ingest_result = mem_cell_store.ingest_text(
+                    text=text,
+                    topic=topic,
+                    role=role,
+                    transport_source=transport_source,
+                    source=str(event.source or role),
+                    meta=dict(event.meta or {}),
+                    tier="now",
+                )
+                await ctx.set_kv("memory:last_memcell_ingest", {
+                    "utterance_id": str((ingest_result.get("utterance", {}) or {}).get("id", "") or ""),
+                    "token_ids": [str((c or {}).get("id", "") or "") for c in ingest_result.get("tokens", [])],
+                    "pattern_ids": [str((c or {}).get("id", "") or "") for c in ingest_result.get("patterns", [])],
+                    "general_patterns": [str((c or {}).get("id", "") or "") for c in ingest_result.get("general_patterns", [])],
+                    "linker_ids": [str((c or {}).get("id", "") or "") for c in ingest_result.get("linkers", [])],
+                })
+        except Exception as e:
+            self.debug("mem_cell_error", error=str(e))
 
         # --- Write to EmotionJournal --------------------------------------------
         try:

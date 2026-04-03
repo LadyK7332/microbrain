@@ -49,12 +49,16 @@ class EngramConsolidatorNeuron(BaseNeuron):
         now = time.time()
         sleep_active = bool(await ctx.get_kv("power:sleep", False))
         charging_active = bool(await ctx.get_kv("power:charging", False))
-        power_state = str(await ctx.get_kv("power:state", "") or "")
+        raw_power_state = await ctx.get_kv("power:state", "")
+        if isinstance(raw_power_state, dict):
+            power_mode = str(raw_power_state.get("mode", "") or "").lower()
+        else:
+            power_mode = str(raw_power_state or "").lower()
 
         # Maintenance-only: only run when the organism is actually parked.
         if not sleep_active or not charging_active:
             return []
-        if power_state and power_state not in ("charge", "charging", "sleep_charge"):
+        if power_mode and power_mode not in ("charge", "charging", "sleep_charge"):
             return []
 
         sleep_set_ts = _safe_float(await ctx.get_kv("power:sleep_last_set_ts", 0.0), 0.0)
