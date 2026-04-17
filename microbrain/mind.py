@@ -189,8 +189,8 @@ def _resolve_memdir(arg_memdir: str | None) -> str:
         "synapse",
         "thought",
         "touch",
+        "episodes",
         "logs",
-        "read_dir",
     ]
 
     ensure_child_dirs(base, child_dirs, logger=logger)
@@ -301,19 +301,6 @@ async def main_async(cfg: AppConfig):
     orch.kv_store.setdefault("mem_cell:short_hours", 72.0)
     orch.kv_store.setdefault("mem_cell:long_hours", 96.0)
     orch.kv_store.setdefault("mem_cell:learned_hours", 336.0)
-
-    orch.kv_store.setdefault("read:enabled", False)
-    orch.kv_store.setdefault("read:idle_after_s", 90.0)
-    orch.kv_store.setdefault("read:tick_every_s", 30.0)
-    orch.kv_store.setdefault("read:chunk_lines", 40)
-    orch.kv_store.setdefault("read:chunk_chars", 1200)
-    orch.kv_store.setdefault("read:dir", str(Path(cfg.memdir) / "read_dir"))
-    orch.kv_store.setdefault("read:active_file", "")
-    orch.kv_store.setdefault("read:active_kind", "")
-    orch.kv_store.setdefault("read:chunk_index", 0)
-    orch.kv_store.setdefault("read:last_user_ts", 0.0)
-    orch.kv_store.setdefault("read:last_activity_ts", 0.0)
-    orch.kv_store.setdefault("read:last_result", {})
 
     # Evidence recorder / hazard gating (split raw streams; OFF unless armed).
     orch.kv_store.setdefault("er:enabled", True)
@@ -572,6 +559,16 @@ async def main_async(cfg: AppConfig):
             )
 
     asyncio.create_task(_clock_tick_loop())
+
+    # Background read organ: keep file chewing out of Textual / interaction.
+    read_sidecar = None
+    try:
+        from microbrain.sidecars.read_sidecar import ReadSidecar
+
+        read_sidecar = ReadSidecar(orch, memdir=cfg.memdir)
+        await read_sidecar.start()
+    except Exception as exc:
+        logger.warning("Read sidecar failed to start: %s", exc)
 
     if getattr(cfg, "ui", "repl") == "textual":
         logger.info("Starting Textual UI …")

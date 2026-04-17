@@ -92,6 +92,8 @@ class TextInputNeuron(BaseNeuron):
             )
             return []
 
+        command_root = text_norm.split(maxsplit=1)[0].lower()
+
         # ----------------------------------------------
         # 2) Derive source/channel & merge metadata
         # ----------------------------------------------
@@ -131,19 +133,19 @@ class TextInputNeuron(BaseNeuron):
         # 2.5) Reinforcement snapshot latch (/r ...)
         # ----------------------------------------------
         r_pending = bool(await ctx.get_kv("control:r_pending", False))
+        is_r_command = text_norm == "/r" or text_norm.startswith("/r ")
 
         # If a /r menu is open, refuse non-/r input until it is resolved.
-        if r_pending and not text_norm.startswith("/r"):
+        if r_pending and not is_r_command:
             return [
                 self._speech_control(
                     "Reinforcement menu is still open. Use `/r +3 2`, `/r -2 4`, or `/r clear`.",
                     channel=channel,
-                    correlation_id=event.correlation_id,
                 )
             ]
 
         # Handle /r commands here so they don't become percept/text (no HRM/memory pollution).
-        if text_norm.startswith("/r"):
+        if text_norm == "/r" or text_norm.startswith("/r "):
             return await self._handle_r_command(
                 cmd_text=text_norm,
                 ctx=ctx,
@@ -152,7 +154,7 @@ class TextInputNeuron(BaseNeuron):
             )
 
         # Handle /user commands here so they don't become percept/text.
-        if text_norm.startswith("/user"):
+        if command_root == "/user":
             return await self._handle_user_command(
                 cmd_text=text_norm,
                 ctx=ctx,
@@ -161,7 +163,7 @@ class TextInputNeuron(BaseNeuron):
             )
 
         # Handle /power commands here so they don't become percept/text.
-        if text_norm.startswith("/power"):
+        if command_root == "/power":
             return await self._handle_power_command(
                 cmd_text=text_norm,
                 ctx=ctx,
@@ -170,7 +172,7 @@ class TextInputNeuron(BaseNeuron):
             )
 
         # Handle /cookie here so it feeds virtual power without memory pollution.
-        if text_norm.startswith("/cookie"):
+        if command_root == "/cookie":
             return await self._handle_cookie_command(
                 cmd_text=text_norm,
                 ctx=ctx,
@@ -179,7 +181,7 @@ class TextInputNeuron(BaseNeuron):
             )
 
         # Handle /read commands here so they don't become percept/text.
-        if text_norm.startswith("/read"):
+        if text_norm == "/read" or text_norm.startswith("/read "):
             return await self._handle_read_command(
                 cmd_text=text_norm,
                 ctx=ctx,
@@ -188,7 +190,7 @@ class TextInputNeuron(BaseNeuron):
             )
         
         # Handle /vision commands here so they don't become percept/text (babble can't see them).
-        if text_norm.startswith("/vision"):
+        if command_root == "/vision":
             return await self._handle_vision_command(
                 cmd_text=text_norm,
                 ctx=ctx,
@@ -197,7 +199,7 @@ class TextInputNeuron(BaseNeuron):
             )
 
         # Handle /focus commands here so they don't become percept/text (babble can't see them).
-        if text_norm.startswith("/focus"):
+        if command_root == "/focus":
             return await self._handle_focus_command(
                 cmd_text=text_norm,
                 ctx=ctx,

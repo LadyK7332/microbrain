@@ -29,6 +29,39 @@ def _focus_tokens(text: str) -> List[str]:
     return [t for t in toks if t not in STOPWORDS]
 
 
+
+def _render_general_pattern(candidate: Mapping[str, Any]) -> str:
+    meta = dict(candidate.get("meta", {}) or {})
+    pattern_type = str(meta.get("pattern_type", "") or "").strip()
+    slots = dict(meta.get("slots", {}) or {})
+    if pattern_type == "assert_attribute":
+        subject = str(slots.get("subject", "") or "").strip()
+        attribute = str(slots.get("attribute", "") or "").strip()
+        copula = str(slots.get("copula", "is") or "is").strip() or "is"
+        deixis = str(slots.get("deixis", "") or "").strip()
+        subject_text = " ".join([p for p in [deixis, subject] if p]).strip()
+        if subject_text and attribute:
+            return f"{subject_text} {copula} {attribute}".strip()
+    if pattern_type == "assert_existence":
+        entity = str(slots.get("entity", "") or "").strip()
+        copula = str(slots.get("copula", "is") or "is").strip() or "is"
+        deixis = str(slots.get("deixis", "") or "").strip()
+        entity_text = " ".join([p for p in [deixis, entity] if p]).strip()
+        if entity_text:
+            return f"There {copula} {entity_text}".strip()
+    if pattern_type == "question_about":
+        focus = str(slots.get("focus", "") or "").strip()
+        if focus:
+            return f"The open question is about {focus}".strip()
+    if pattern_type == "social_redirect":
+        person = str(slots.get("person", "") or "").strip()
+        location = str(slots.get("location", "") or "").strip()
+        if person and location:
+            return f"Ask {person} in {location}".strip()
+        if person:
+            return f"Ask {person}".strip()
+    return str(candidate.get("anchor_text", "") or "").strip()
+
 def classify_query(text: str) -> str:
     norm = _norm(text)
     if any(k in norm for k in ("power", "battery", "charge", "charging", "sleeping", "sleep", "maintenance")):
@@ -75,11 +108,20 @@ def gather_support(
                     score += 0.12 * overlap
                 kind = str(hit.get("kind", "") or "")
                 meta = dict(hit.get("meta", {}) or {})
+                if kind == "general_pattern":
+                    pattern_type = str(meta.get("pattern_type", "") or "")
+                    score += 0.18
+                    if qtype == "what_is" and pattern_type in ("assert_attribute", "assert_existence"):
+                        score += 0.18
+                    if qtype == "what_does" and pattern_type in ("assert_attribute", "social_redirect"):
+                        score += 0.10
+                    if qtype == "question_generic" and pattern_type == "question_about":
+                        score += 0.06
                 if qtype == "what_does" and ("pattern" in kind or "utterance" in kind):
                     score += 0.08
                     if any(tok in ACTION_HINTS for tok in _tokens(anchor_text)):
                         score += 0.10
-                if qtype == "what_is" and kind == "utterance_anchor":
+                if qtype == "what_is" and (kind == "utterance_anchor" or kind == "general_pattern"):
                     score += 0.07
                 candidates.append({
                     "source": "mem_cell",
@@ -190,7 +232,18 @@ def compose_answer(bundle: Mapping[str, Any]) -> Tuple[str, float, Dict[str, Any
     selected = candidates[:5]
     best = selected[0]
     best_text = str(best.get("anchor_text", "") or "").strip()
-    candidate_texts = _dedupe_preserve([str(c.get("anchor_text", "") or "").strip() for c in selected])
+    rendered_selected = [
+        _render_general_pattern(c) if str(c.get("kind", "") or "") == "general_pattern" else str(c.get("anchor_text", "") or "").strip()
+        for c in selected
+    ]
+    candidate_texts = _dedupe_preserve(rendered_selected)
+
+    if str(best.get("kind", "") or "") == "general_pattern":
+        rendered = _render_general_pattern(best)
+        if rendered:
+            cleaned = rendered.rstrip(" .")
+            conf = 0.84 if qtype in ("what_is", "what_does") else 0.72
+            return cleaned[:1].upper() + cleaned[1:] + ".", conf, {"selected_sources": [c.get("source") for c in selected], "used_general_pattern": True}
 
     if qtype == "what_does":
         for text in candidate_texts:
