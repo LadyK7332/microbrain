@@ -201,6 +201,7 @@ class MemoryLoggerNeuron(BaseNeuron):
                     "token_ids": [str((c or {}).get("id", "") or "") for c in ingest_result.get("tokens", [])],
                     "pattern_ids": [str((c or {}).get("id", "") or "") for c in ingest_result.get("patterns", [])],
                     "general_patterns": [str((c or {}).get("id", "") or "") for c in ingest_result.get("general_patterns", [])],
+                    "utterance_patterns": [str((c or {}).get("id", "") or "") for c in ingest_result.get("utterance_patterns", [])],
                     "linker_ids": [str((c or {}).get("id", "") or "") for c in ingest_result.get("linkers", [])],
                 })
         except Exception as e:

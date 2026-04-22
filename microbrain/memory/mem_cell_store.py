@@ -343,6 +343,125 @@ class MemCellStore:
 
         return out
 
+    def make_utterance_pattern_cells(
+        self,
+        *,
+        text: str,
+        parent_id: str,
+        token_cells: Sequence[Dict[str, Any]],
+        general_pattern_cells: Sequence[Dict[str, Any]],
+        role: str,
+        tier: str = "now",
+    ) -> List[Dict[str, Any]]:
+        tokens = [str((c.get("anchor", {}) or {}).get("ref", "") or "") for c in token_cells]
+        token_ids = [str(c.get("id", "") or "") for c in token_cells]
+        out: List[Dict[str, Any]] = []
+        now_ts = time.time()
+        clean = str(text or "").strip()
+        lowered = clean.lower()
+
+        def add_utterance(*, act_type: str, canonical: str, template: str, slots: Dict[str, Any], activation: float = 0.68) -> None:
+            digest = hashlib.blake2b(
+                f"utterance|{act_type}|{canonical}|{template}".encode("utf-8", errors="ignore"),
+                digest_size=8,
+            ).hexdigest()
+            refs = [{"kind": "utterance_pattern", "value": canonical}]
+            for slot_name, slot_value in slots.items():
+                if slot_value in (None, "", []):
+                    continue
+                refs.append({"kind": "slot", "name": str(slot_name), "value": slot_value})
+            out.append({
+                "id": f"u{digest}",
+                "kind": "utterance_pattern",
+                "tier": tier,
+                "anchor": {"kind": f"utterance/{act_type}", "ref": canonical, "norm": self._norm_text(canonical)},
+                "refs": refs,
+                "modalities": ["text"],
+                "links_explicit": [parent_id] + token_ids[:6],
+                "activation": activation,
+                "promotion": 0.05,
+                "decay": 1.0,
+                "trust": 0.64 if role == "assistant" else 0.52,
+                "meta": {
+                    "role": role,
+                    "act_type": act_type,
+                    "canonical": canonical,
+                    "template": template,
+                    "surface": clean or canonical,
+                    "parent_id": parent_id,
+                    "slots": dict(slots),
+                },
+                "ts": now_ts,
+                "last_seen": now_ts,
+                "encounter_count": 1,
+                "revision": 0,
+            })
+
+        question_gp = None
+        for gp in general_pattern_cells or []:
+            meta = gp.get("meta", {}) if isinstance(gp.get("meta", {}), dict) else {}
+            if str(meta.get("pattern_type", "") or "") == "question_about":
+                question_gp = meta
+                break
+
+        if tokens and tokens[0] in GREETING_TOKENS:
+            greeting = tokens[0]
+            add_utterance(
+                act_type="greet_present",
+                canonical=f"greet {greeting}",
+                template="{greeting}. I'm here.",
+                slots={"greeting": greeting},
+                activation=0.66,
+            )
+
+        if question_gp is not None:
+            slots = dict(question_gp.get("slots", {}) or {})
+            focus = str(slots.get("focus", "") or "").strip()
+            if focus:
+                add_utterance(
+                    act_type="clarify_focus",
+                    canonical=f"clarify {focus}",
+                    template="What should I optimize for on {focus}?",
+                    slots={"focus": focus},
+                    activation=0.70,
+                )
+            add_utterance(
+                act_type="answer_start",
+                canonical=f"answer {focus or 'thread'}",
+                template="I want to answer that.",
+                slots={"focus": focus},
+                activation=0.64,
+            )
+
+        if lowered.startswith(("ok", "okay", "got it", "understood", "i hear", "right")):
+            add_utterance(
+                act_type="acknowledge",
+                canonical="acknowledge thread",
+                template="I hear the open thread.",
+                slots={},
+                activation=0.62,
+            )
+
+        if any(tok in tokens for tok in ("answer", "reply", "respond")):
+            add_utterance(
+                act_type="answer_start",
+                canonical="answer open thread",
+                template="I want to answer that.",
+                slots={},
+                activation=0.68,
+            )
+
+        if any(tok in tokens for tok in ("missing", "target", "outcome", "optimize")) or "what should" in lowered:
+            add_utterance(
+                act_type="clarify_target",
+                canonical="clarify target",
+                template="What outcome should I optimize for?",
+                slots={},
+                activation=0.72,
+            )
+
+        return out
+
     def make_linker_cells(
         self,
         *,
@@ -592,6 +711,17 @@ class MemCellStore:
                 tier=tier,
             )
         ]
+        utterance_pattern_cells = [
+            self.upsert_cell(c, tier=tier)
+            for c in self.make_utterance_pattern_cells(
+                text=text,
+                parent_id=str(utterance.get('id','')),
+                token_cells=token_cells,
+                general_pattern_cells=general_pattern_cells,
+                role=role,
+                tier=tier,
+            )
+        ]
         linker_cells = [
             self.upsert_cell(c, tier=tier)
             for c in self.make_linker_cells(
@@ -603,7 +733,7 @@ class MemCellStore:
             )
         ]
         # back-link strongest immediate pieces into utterance
-        if token_cells or pattern_cells or general_pattern_cells or linker_cells:
+        if token_cells or pattern_cells or general_pattern_cells or utterance_pattern_cells or linker_cells:
             utterance['links_explicit'] = self._merge_unique_list(
                 list(utterance.get('links_explicit', []) or []),
                 [
@@ -612,6 +742,7 @@ class MemCellStore:
                         token_cells[:4]
                         + pattern_cells[:4]
                         + general_pattern_cells[:4]
+                        + utterance_pattern_cells[:4]
                         + linker_cells[:4]
                     )
                     if c.get('id')
@@ -624,6 +755,7 @@ class MemCellStore:
             'tokens': token_cells,
             'patterns': pattern_cells,
             'general_patterns': general_pattern_cells,
+            'utterance_patterns': utterance_pattern_cells,
             'linkers': linker_cells,
         }
 
