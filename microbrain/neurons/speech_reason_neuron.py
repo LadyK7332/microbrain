@@ -73,7 +73,7 @@ class SpeechReasonNeuron(BaseNeuron):
         if lowered == "power":
             return {"power", "low", "cookie", "charge", "battery", "help"}
         if lowered == "interaction":
-            return {"answer", "reply", "respond", "clarify", "question", "hello", "hey", "here", "thread", "open"}
+            return {"answer", "reply", "respond", "clarify", "question", "hello", "hey", "here", "want", "feel"}
         return set()
 
     def _query_text(self, payload: Dict[str, Any]) -> str:
@@ -81,11 +81,11 @@ class SpeechReasonNeuron(BaseNeuron):
         style = str(payload.get("style", "") or "")
         message = str(payload.get("message", "") or "")
         vector = payload.get("vector", {}) if isinstance(payload.get("vector", {}), dict) else {}
-        options = [need, style, message, str(vector.get("message", "") or ""), str(payload.get("pending_text", "") or "")]
+        options = [need, style, message, str(vector.get("message", "") or "")]
         if need == "power":
             options.extend(["power low", "battery low", "cookie", "charge", "need help", "power request"])
         elif need == "interaction":
-            options.extend(["open thread", "reply needed", "answer", "clarify", "social response", "interaction pressure"])
+            options.extend(["interaction pressure", "reply needed", "open thread", "clarify response", "social response"])
         query = " ".join(part for part in options if part)
         return self._clean_text(query)
 
@@ -93,19 +93,18 @@ class SpeechReasonNeuron(BaseNeuron):
         style = str(style or "direct_simple")
         clean = self._clean_text(text)
         n = len(clean)
-        lower = clean.lower()
         if style == "urgent_direct":
             score = 0.10 if n <= 72 else 0.02
-            if any(tok in lower for tok in ("need", "soon", "critical", "low", "charge", "cookie", "answer", "reply", "now", "here")):
+            if any(tok in clean.lower() for tok in ("need", "soon", "critical", "low", "charge", "cookie")):
                 score += 0.10
             return score
         if style == "gentle_notice":
             score = 0.08 if n <= 96 else 0.03
-            if any(tok in lower for tok in ("later", "bit", "dipping", "help", "here", "open", "clarify", "thread")):
+            if any(tok in clean.lower() for tok in ("later", "bit", "dipping", "help")):
                 score += 0.08
             return score
         score = 0.10 if n <= 88 else 0.03
-        if any(tok in lower for tok in ("power", "low", "cookie", "help", "charge", "answer", "reply", "clarify", "hello", "hey", "here")):
+        if any(tok in clean.lower() for tok in ("power", "low", "cookie", "help", "charge")):
             score += 0.08
         return score
 
@@ -118,55 +117,6 @@ class SpeechReasonNeuron(BaseNeuron):
             "score": 0.16,
             "kind": "fallback",
         }
-
-    def _render_template(self, template: str, payload: Dict[str, Any], slots: Dict[str, Any] | None = None) -> str:
-        merged: Dict[str, Any] = {}
-        if isinstance(slots, dict):
-            merged.update(slots)
-        pending_text = self._clean_text(str(payload.get("pending_text", "") or ""))
-        merged.setdefault("pending_text", pending_text)
-        merged.setdefault("topic", pending_text or str(merged.get("focus", "") or "thread"))
-        merged.setdefault("focus", str(merged.get("focus", "") or pending_text or "that").strip())
-        merged.setdefault("greeting", str(merged.get("greeting", "Hey") or "Hey").strip().title())
-        try:
-            return self._clean_text(template.format(**merged))
-        except Exception:
-            return self._clean_text(template)
-
-    def _build_interaction_fallback(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        pressure = payload.get("pressure", {}) if isinstance(payload.get("pressure", {}), dict) else {}
-        pending_text = self._clean_text(str(payload.get("pending_text", pressure.get("pending_text", "")) or ""))
-        style = str(payload.get("style", "direct_simple") or "direct_simple")
-
-        if bool(pressure.get("greeting", False)):
-            text = "Hey, I'm here."
-        elif bool(pressure.get("question", False)) or bool(pressure.get("response_request", False)):
-            text = "I want to answer that." if style != "urgent_direct" else "I should answer that now."
-        elif bool(pressure.get("clarify_ready", False)):
-            text = "What outcome should I optimize for?"
-        elif pending_text:
-            text = f"I still have an open interaction thread around: {pending_text}"
-        else:
-            text = "I hear the open thread."
-
-        return {
-            "text": self._clean_text(text),
-            "source": "interaction_renderer",
-            "role": "assistant",
-            "score": 0.44,
-            "kind": "interaction_fallback",
-        }
-
-    def _render_utterance_pattern(self, row: Dict[str, Any], payload: Dict[str, Any]) -> str:
-        meta = row.get("meta", {}) if isinstance(row.get("meta", {}), dict) else {}
-        template = self._clean_text(str(meta.get("template", "") or ""))
-        slots = dict(meta.get("slots", {}) or {})
-        surface = self._clean_text(str(meta.get("surface", "") or ""))
-        if template:
-            rendered = self._render_template(template, payload, slots)
-            if rendered:
-                return rendered
-        return surface
 
     async def _recent_speech_state(self, ctx) -> Dict[str, Any]:
         raw = await ctx.get_kv("speech_reason:last", {})
@@ -244,7 +194,12 @@ class SpeechReasonNeuron(BaseNeuron):
                 overlap = len(lexicon & set(self._tokens(text)))
                 token_bonus = min(0.18, overlap * 0.05)
             role_bonus = 0.08 if role == "assistant" else 0.05 if role == "user" else 0.0
-            kind_bonus = 0.08 if kind == "reinforced" else 0.03 if kind else 0.0
+            if kind == "reinforced":
+                kind_bonus = 0.08
+            elif kind == "trainer_correction":
+                kind_bonus = 0.16
+            else:
+                kind_bonus = 0.03 if kind else 0.0
             rank_penalty = rank * 0.015
             score = max(
                 0.0,
@@ -267,30 +222,6 @@ class SpeechReasonNeuron(BaseNeuron):
             })
         return out
 
-    def _utterance_pattern_candidates(self, mem_cell_store: MemCellStore, query: str, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-        hits = mem_cell_store.search_text_cells(query, limit=12)
-        style = str(payload.get("style", "direct_simple") or "direct_simple")
-        out: List[Dict[str, Any]] = []
-        seen: set[str] = set()
-        for rank, row in enumerate(hits):
-            if not isinstance(row, dict) or str(row.get("kind", "") or "") != "utterance_pattern":
-                continue
-            text = self._render_utterance_pattern(row, payload)
-            if self._is_bad_candidate(text):
-                continue
-            norm = self._norm(text)
-            if not norm or norm in seen:
-                continue
-            seen.add(norm)
-            meta = row.get("meta", {}) if isinstance(row.get("meta", {}), dict) else {}
-            role = str(meta.get("role", "assistant") or "assistant")
-            act_type = str(meta.get("act_type", "") or "")
-            promotion = self._safe_float(row.get("promotion", 0.0), 0.0)
-            salience_now = self._safe_float(row.get("current_salience", row.get("activation", 0.0)), 0.0)
-            score = max(0.0, 0.42 + min(0.12, promotion * 0.10) + min(0.14, salience_now * 0.12) + (0.08 if role == "assistant" else 0.0) + (0.08 if act_type in ("answer_start", "clarify_target", "clarify_focus", "greet_present", "acknowledge") else 0.0) + self._style_score(text, style) - (rank * 0.015))
-            out.append({"text": text, "source": "utterance_pattern", "role": role, "score": round(score, 4), "kind": act_type or "utterance_pattern"})
-        return out
-
     def _memcell_candidates(self, mem_cell_store: MemCellStore, query: str, need: str, style: str) -> List[Dict[str, Any]]:
         hits = mem_cell_store.search_text_cells(query, limit=8)
         lexicon = self._need_lexicon(need)
@@ -301,7 +232,11 @@ class SpeechReasonNeuron(BaseNeuron):
                 continue
             anchor = row.get("anchor", {}) if isinstance(row.get("anchor", {}), dict) else {}
             refs = row.get("refs", []) if isinstance(row.get("refs", []), list) else []
+            kind = str(row.get("kind", "") or "")
+            meta = row.get("meta", {}) if isinstance(row.get("meta", {}), dict) else {}
             text = self._clean_text(str(anchor.get("ref", "") or ""))
+            if kind == "trainer_alignment":
+                text = self._clean_text(str(meta.get("desired_utterance", "") or ""))
             if not text and refs:
                 for ref in refs:
                     if isinstance(ref, dict):
@@ -315,7 +250,6 @@ class SpeechReasonNeuron(BaseNeuron):
                 continue
             seen.add(norm)
 
-            meta = row.get("meta", {}) if isinstance(row.get("meta", {}), dict) else {}
             role = str(meta.get("role", "assistant") or "assistant")
             reinforcement_pts = self._safe_float(row.get("reinforcement_pts", 0.0), 0.0)
             promotion = self._safe_float(row.get("promotion", 0.0), 0.0)
@@ -325,6 +259,15 @@ class SpeechReasonNeuron(BaseNeuron):
                 overlap = len(lexicon & set(self._tokens(text)))
                 token_bonus = min(0.14, overlap * 0.04)
             role_bonus = 0.06 if role == "assistant" else 0.04 if role == "user" else 0.0
+            trainer_need = str(meta.get("trainer_need", "") or "")
+            trainer_style = str(meta.get("trainer_style", "") or "")
+            trainer_bonus = 0.0
+            if kind == "trainer_alignment":
+                trainer_bonus += 0.22
+                if trainer_need and trainer_need == str(need or ""):
+                    trainer_bonus += 0.10
+                if trainer_style and trainer_style == str(style or ""):
+                    trainer_bonus += 0.06
             score = max(
                 0.0,
                 0.28
@@ -333,15 +276,16 @@ class SpeechReasonNeuron(BaseNeuron):
                 + min(0.10, salience_now * 0.10)
                 + token_bonus
                 + role_bonus
+                + trainer_bonus
                 + self._style_score(text, style)
                 - (rank * 0.012),
             )
             out.append({
                 "text": text,
-                "source": "mem_cell",
+                "source": "trainer_alignment" if kind == "trainer_alignment" else "mem_cell",
                 "role": role,
                 "score": round(score, 4),
-                "kind": str(row.get("kind", "mem_cell") or "mem_cell"),
+                "kind": kind or "mem_cell",
             })
         return out
 
@@ -410,19 +354,15 @@ class SpeechReasonNeuron(BaseNeuron):
 
     async def _update_pending_request(self, ctx, event: Event, chosen: Dict[str, Any]) -> None:
         need = str((event.payload or {}).get("need", "") or "") if isinstance(event.payload, dict) else ""
-        if need == "power":
-            pending_key = "drive:power_pending_request"
-        elif need == "interaction":
-            pending_key = "drive:interaction_pending_request"
-        else:
+        if need != "power":
             return
-        pending = await ctx.get_kv(pending_key, None)
+        pending = await ctx.get_kv("drive:power_pending_request", None)
         if not isinstance(pending, dict):
             return
         pending["message"] = chosen.get("text", pending.get("message"))
         pending["utterance_source"] = chosen.get("source", "fallback")
         pending["utterance_score"] = self._safe_float(chosen.get("score", 0.0), 0.0)
-        await ctx.set_kv(pending_key, pending)
+        await ctx.set_kv("drive:power_pending_request", pending)
 
     async def process(self, event: Event, ctx) -> Iterable[Event]:
         self.debug(
@@ -463,6 +403,7 @@ class SpeechReasonNeuron(BaseNeuron):
                 "need": str(payload.get("need", "") or ""),
                 "style": str(payload.get("style", "") or ""),
                 "utterance": utterance,
+                "message": str(payload.get("message", "") or ""),
                 "source": chosen.get("source", "fallback"),
                 "score": self._safe_float(chosen.get("score", 0.0), 0.0),
                 "candidates": candidates[:5],

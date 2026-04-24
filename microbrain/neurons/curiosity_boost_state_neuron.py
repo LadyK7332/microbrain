@@ -31,6 +31,31 @@ class CuriosityBoostStateNeuron(BaseNeuron):
     # Linear decay per second. 0.01 => 1.0 drains to 0 in ~100 seconds.
     BOOST_DECAY_PER_S = 0.01
 
+    async def _update_utterance_explore(self, ctx, boost: float) -> None:
+        base = float(await ctx.get_kv("curiosity:utterance_explore_base", 0.02) or 0.02)
+        max_explore = float(await ctx.get_kv("curiosity:utterance_explore_max", 0.22) or 0.22)
+        boost_scale = float(await ctx.get_kv("curiosity:utterance_explore_boost_scale", 0.12) or 0.12)
+        boredom_scale = float(await ctx.get_kv("curiosity:utterance_explore_boredom_scale", 0.08) or 0.08)
+
+        boredom = await ctx.get_kv("drive:boredom", None)
+        boredom_level = 0.0
+        boredom_active = False
+        if isinstance(boredom, dict):
+            try:
+                boredom_level = float(boredom.get("level", 0.0) or 0.0)
+            except Exception:
+                boredom_level = 0.0
+            boredom_active = bool(boredom.get("active", False))
+
+        explore = base + max(0.0, min(1.0, boost)) * boost_scale
+        if boredom_active and boredom_level > 0.0:
+            explore += max(0.0, min(1.0, boredom_level)) * boredom_scale
+        if explore < 0.0:
+            explore = 0.0
+        if explore > max_explore:
+            explore = max_explore
+        await ctx.set_kv("curiosity:utterance_explore", explore)
+
     async def process(self, event: Event, ctx) -> Iterable[Event]:
         if event.topic == "curiosity/adjust":
             payload = event.payload or {}
@@ -50,6 +75,7 @@ class CuriosityBoostStateNeuron(BaseNeuron):
             new_cd = max(current_cd, now + pause_s) if pause_s > 0.0 else current_cd
 
             await ctx.set_kv("curiosity:boost", new_boost)
+            await self._update_utterance_explore(ctx, new_boost)
             await ctx.set_kv("curiosity:cooldown_until", new_cd)
             await ctx.set_kv("curiosity:last_feedback_ts", now)
             await ctx.set_kv("curiosity:last_feedback_score", -abs(boost_add))
@@ -84,6 +110,7 @@ class CuriosityBoostStateNeuron(BaseNeuron):
                 # Only write when it changes, keeps KV quieter
                 if decayed != boost:
                     await ctx.set_kv("curiosity:boost", decayed)
+                    await self._update_utterance_explore(ctx, decayed)
                     self.debug(
                         "curiosity_boost_decayed",
                         before=boost,
@@ -92,6 +119,8 @@ class CuriosityBoostStateNeuron(BaseNeuron):
                         rate_per_s=self.BOOST_DECAY_PER_S,
                     )
 
+            current_boost = float(await ctx.get_kv("curiosity:boost", 0.0) or 0.0)
+            await self._update_utterance_explore(ctx, current_boost)
             await ctx.set_kv("curiosity:boost_last_update_ts", now)
             return []
 

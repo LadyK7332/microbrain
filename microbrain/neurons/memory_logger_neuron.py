@@ -56,6 +56,10 @@ class MemoryLoggerNeuron(BaseNeuron):
         if (event.meta or {}).get("control") and topic != "control/reinforce":
             return []
 
+        trainer_pending = bool(await ctx.get_kv("control:t_pending", False))
+        if trainer_pending and topic == "act/speech" and not (event.meta or {}).get("control"):
+            return []
+
         # Persist reinforcement events emitted by /r +/- (append-only; no rewriting old memory rows)
         if topic == "control/reinforce":
             if mem_store is not None and isinstance(payload, dict):
@@ -148,6 +152,16 @@ class MemoryLoggerNeuron(BaseNeuron):
                 role = "assistant"
 
             transport_source = str(event.source or "assistant")
+            if role == "assistant" and text:
+                await ctx.set_kv(
+                    "trainer:last_assistant_utterance",
+                    {
+                        "ts": time.time(),
+                        "text": text,
+                        "source": str(event.source or "assistant"),
+                        "meta": dict(event.meta or {}),
+                    },
+                )
 
         # Nothing meaningful to log
         if not text:
@@ -201,7 +215,6 @@ class MemoryLoggerNeuron(BaseNeuron):
                     "token_ids": [str((c or {}).get("id", "") or "") for c in ingest_result.get("tokens", [])],
                     "pattern_ids": [str((c or {}).get("id", "") or "") for c in ingest_result.get("patterns", [])],
                     "general_patterns": [str((c or {}).get("id", "") or "") for c in ingest_result.get("general_patterns", [])],
-                    "utterance_patterns": [str((c or {}).get("id", "") or "") for c in ingest_result.get("utterance_patterns", [])],
                     "linker_ids": [str((c or {}).get("id", "") or "") for c in ingest_result.get("linkers", [])],
                 })
         except Exception as e:

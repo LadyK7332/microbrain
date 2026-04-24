@@ -167,6 +167,14 @@ class SpeechOutputNeuron(BaseNeuron):
         if not text:
             return []
 
+        trainer_pending = bool(await ctx.get_kv("control:t_pending", False))
+        if trainer_pending and not (event.meta or {}).get("control"):
+            await ctx.set_kv(
+                "speech_output:last_suppressed",
+                {"ts": time.time(), "text": text, "reason": "trainer_pending", "source": event.source},
+            )
+            return []
+
         # Internal thought should be stored, not spoken aloud.
         if channel == "thought":
             thought_entry = {

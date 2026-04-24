@@ -141,6 +141,8 @@ class PowerReliefLearningNeuron(BaseNeuron):
             return []
 
         if event.topic == "act/speech":
+            if bool(await ctx.get_kv("control:t_pending", False)):
+                return []
             await self._track_emitted_utterance(ctx, event)
             return []
 

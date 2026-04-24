@@ -343,125 +343,6 @@ class MemCellStore:
 
         return out
 
-    def make_utterance_pattern_cells(
-        self,
-        *,
-        text: str,
-        parent_id: str,
-        token_cells: Sequence[Dict[str, Any]],
-        general_pattern_cells: Sequence[Dict[str, Any]],
-        role: str,
-        tier: str = "now",
-    ) -> List[Dict[str, Any]]:
-        tokens = [str((c.get("anchor", {}) or {}).get("ref", "") or "") for c in token_cells]
-        token_ids = [str(c.get("id", "") or "") for c in token_cells]
-        out: List[Dict[str, Any]] = []
-        now_ts = time.time()
-        clean = str(text or "").strip()
-        lowered = clean.lower()
-
-        def add_utterance(*, act_type: str, canonical: str, template: str, slots: Dict[str, Any], activation: float = 0.68) -> None:
-            digest = hashlib.blake2b(
-                f"utterance|{act_type}|{canonical}|{template}".encode("utf-8", errors="ignore"),
-                digest_size=8,
-            ).hexdigest()
-            refs = [{"kind": "utterance_pattern", "value": canonical}]
-            for slot_name, slot_value in slots.items():
-                if slot_value in (None, "", []):
-                    continue
-                refs.append({"kind": "slot", "name": str(slot_name), "value": slot_value})
-            out.append({
-                "id": f"u{digest}",
-                "kind": "utterance_pattern",
-                "tier": tier,
-                "anchor": {"kind": f"utterance/{act_type}", "ref": canonical, "norm": self._norm_text(canonical)},
-                "refs": refs,
-                "modalities": ["text"],
-                "links_explicit": [parent_id] + token_ids[:6],
-                "activation": activation,
-                "promotion": 0.05,
-                "decay": 1.0,
-                "trust": 0.64 if role == "assistant" else 0.52,
-                "meta": {
-                    "role": role,
-                    "act_type": act_type,
-                    "canonical": canonical,
-                    "template": template,
-                    "surface": clean or canonical,
-                    "parent_id": parent_id,
-                    "slots": dict(slots),
-                },
-                "ts": now_ts,
-                "last_seen": now_ts,
-                "encounter_count": 1,
-                "revision": 0,
-            })
-
-        question_gp = None
-        for gp in general_pattern_cells or []:
-            meta = gp.get("meta", {}) if isinstance(gp.get("meta", {}), dict) else {}
-            if str(meta.get("pattern_type", "") or "") == "question_about":
-                question_gp = meta
-                break
-
-        if tokens and tokens[0] in GREETING_TOKENS:
-            greeting = tokens[0]
-            add_utterance(
-                act_type="greet_present",
-                canonical=f"greet {greeting}",
-                template="{greeting}. I'm here.",
-                slots={"greeting": greeting},
-                activation=0.66,
-            )
-
-        if question_gp is not None:
-            slots = dict(question_gp.get("slots", {}) or {})
-            focus = str(slots.get("focus", "") or "").strip()
-            if focus:
-                add_utterance(
-                    act_type="clarify_focus",
-                    canonical=f"clarify {focus}",
-                    template="What should I optimize for on {focus}?",
-                    slots={"focus": focus},
-                    activation=0.70,
-                )
-            add_utterance(
-                act_type="answer_start",
-                canonical=f"answer {focus or 'thread'}",
-                template="I want to answer that.",
-                slots={"focus": focus},
-                activation=0.64,
-            )
-
-        if lowered.startswith(("ok", "okay", "got it", "understood", "i hear", "right")):
-            add_utterance(
-                act_type="acknowledge",
-                canonical="acknowledge thread",
-                template="I hear the open thread.",
-                slots={},
-                activation=0.62,
-            )
-
-        if any(tok in tokens for tok in ("answer", "reply", "respond")):
-            add_utterance(
-                act_type="answer_start",
-                canonical="answer open thread",
-                template="I want to answer that.",
-                slots={},
-                activation=0.68,
-            )
-
-        if any(tok in tokens for tok in ("missing", "target", "outcome", "optimize")) or "what should" in lowered:
-            add_utterance(
-                act_type="clarify_target",
-                canonical="clarify target",
-                template="What outcome should I optimize for?",
-                slots={},
-                activation=0.72,
-            )
-
-        return out
-
     def make_linker_cells(
         self,
         *,
@@ -683,6 +564,94 @@ class MemCellStore:
             })
         return out
 
+
+    def ingest_trainer_alignment(
+        self,
+        *,
+        desired_text: str,
+        context_query: str,
+        bad_utterance: str = "",
+        need: str = "",
+        style: str = "",
+        source: str = "trainer",
+        meta: Optional[Dict[str, Any]] = None,
+        tier: str = "learned",
+    ) -> Dict[str, Any]:
+        desired_clean = str(desired_text or "").strip()
+        context_clean = str(context_query or "").strip()
+        if not desired_clean or not context_clean:
+            return {}
+
+        trainer_meta = dict(meta or {})
+        trainer_meta.update({
+            "kind": "trainer_correction",
+            "trainer_context": context_clean,
+            "trainer_bad_utterance": str(bad_utterance or "").strip(),
+            "trainer_need": str(need or "").strip(),
+            "trainer_style": str(style or "").strip(),
+            "trainer_source": str(source or "trainer").strip() or "trainer",
+        })
+
+        ingest_result = self.ingest_text(
+            text=desired_clean,
+            topic="trainer/correction",
+            role="assistant",
+            transport_source="trainer",
+            source=str(source or "trainer"),
+            meta=trainer_meta,
+            tier=tier,
+        )
+
+        utterance = ingest_result.get("utterance", {}) if isinstance(ingest_result, dict) else {}
+        utterance_id = str((utterance or {}).get("id", "") or "").strip()
+        gp_ids = [str((c or {}).get("id", "") or "").strip() for c in ingest_result.get("general_patterns", []) if str((c or {}).get("id", "") or "").strip()]
+        linker_ids = [str((c or {}).get("id", "") or "").strip() for c in ingest_result.get("linkers", []) if str((c or {}).get("id", "") or "").strip()]
+
+        digest = hashlib.blake2b(
+            f"trainer|{self._norm_text(context_clean)}|{self._norm_text(desired_clean)}|{str(need or '').strip().lower()}|{str(style or '').strip().lower()}".encode("utf-8", errors="ignore"),
+            digest_size=8,
+        ).hexdigest()
+        now_ts = time.time()
+        alignment = {
+            "id": f"tr{digest}",
+            "kind": "trainer_alignment",
+            "tier": tier,
+            "anchor": {"kind": "trainer/context", "ref": context_clean[:200], "norm": self._norm_text(context_clean)[:200]},
+            "refs": [
+                {"kind": "desired_utterance", "value": desired_clean},
+                {"kind": "bad_utterance", "value": str(bad_utterance or "").strip()},
+                {"kind": "need", "value": str(need or "").strip()},
+                {"kind": "style", "value": str(style or "").strip()},
+            ],
+            "modalities": ["text"],
+            "links_explicit": [cell_id for cell_id in ([utterance_id] + gp_ids[:4] + linker_ids[:4]) if cell_id],
+            "activation": 1.0,
+            "promotion": 0.38,
+            "decay": 1.0,
+            "trust": 0.96,
+            "meta": {
+                "role": "assistant",
+                "kind": "trainer_correction",
+                "desired_utterance": desired_clean,
+                "bad_utterance": str(bad_utterance or "").strip(),
+                "trainer_need": str(need or "").strip(),
+                "trainer_style": str(style or "").strip(),
+                "trainer_context": context_clean,
+                "source": str(source or "trainer").strip() or "trainer",
+            },
+            "ts": now_ts,
+            "last_seen": now_ts,
+            "encounter_count": 1,
+            "revision": 0,
+        }
+        alignment = self.upsert_cell(alignment, tier=tier)
+        return {
+            "utterance": utterance,
+            "alignment": alignment,
+            "general_patterns": ingest_result.get("general_patterns", []),
+            "linkers": ingest_result.get("linkers", []),
+        }
+
     def ingest_text(
         self,
         *,
@@ -711,17 +680,6 @@ class MemCellStore:
                 tier=tier,
             )
         ]
-        utterance_pattern_cells = [
-            self.upsert_cell(c, tier=tier)
-            for c in self.make_utterance_pattern_cells(
-                text=text,
-                parent_id=str(utterance.get('id','')),
-                token_cells=token_cells,
-                general_pattern_cells=general_pattern_cells,
-                role=role,
-                tier=tier,
-            )
-        ]
         linker_cells = [
             self.upsert_cell(c, tier=tier)
             for c in self.make_linker_cells(
@@ -733,7 +691,7 @@ class MemCellStore:
             )
         ]
         # back-link strongest immediate pieces into utterance
-        if token_cells or pattern_cells or general_pattern_cells or utterance_pattern_cells or linker_cells:
+        if token_cells or pattern_cells or general_pattern_cells or linker_cells:
             utterance['links_explicit'] = self._merge_unique_list(
                 list(utterance.get('links_explicit', []) or []),
                 [
@@ -742,7 +700,6 @@ class MemCellStore:
                         token_cells[:4]
                         + pattern_cells[:4]
                         + general_pattern_cells[:4]
-                        + utterance_pattern_cells[:4]
                         + linker_cells[:4]
                     )
                     if c.get('id')
@@ -755,7 +712,6 @@ class MemCellStore:
             'tokens': token_cells,
             'patterns': pattern_cells,
             'general_patterns': general_pattern_cells,
-            'utterance_patterns': utterance_pattern_cells,
             'linkers': linker_cells,
         }
 

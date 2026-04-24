@@ -153,6 +153,25 @@ class TextInputNeuron(BaseNeuron):
                 correlation_id=event.correlation_id,
             )
 
+        # /t trainer latch: pause outward chatter and treat the NEXT user input as a correction.
+        t_pending = bool(await ctx.get_kv("control:t_pending", False))
+        is_t_command = text_norm == "/t" or text_norm.startswith("/t ")
+        if t_pending and not is_t_command:
+            return await self._handle_t_capture(
+                correction_text=text_norm,
+                ctx=ctx,
+                channel=channel,
+                correlation_id=event.correlation_id,
+            )
+
+        if text_norm == "/t" or text_norm.startswith("/t "):
+            return await self._handle_t_command(
+                cmd_text=text_norm,
+                ctx=ctx,
+                channel=channel,
+                correlation_id=event.correlation_id,
+            )
+
         # Handle /user commands here so they don't become percept/text.
         if command_root == "/user":
             return await self._handle_user_command(
@@ -249,6 +268,106 @@ class TextInputNeuron(BaseNeuron):
 
         return [percept_event]
 
+
+
+    def _trainer_target_snapshot(self, last_spoken: Any, speech_reason_last: Any) -> Dict[str, Any]:
+        spoken = dict(last_spoken) if isinstance(last_spoken, dict) else {}
+        reason_last = dict(speech_reason_last) if isinstance(speech_reason_last, dict) else {}
+        utterance = str(spoken.get("text", reason_last.get("utterance", "")) or "").strip()
+        need = str(reason_last.get("need", "") or "").strip()
+        style = str(reason_last.get("style", "") or "").strip()
+        message = str(reason_last.get("message", "") or "").strip()
+        context_parts = [p for p in [need, style, message, utterance] if p]
+        context_query = " | ".join(context_parts) if context_parts else utterance
+        return {
+            "utterance": utterance,
+            "need": need,
+            "style": style,
+            "message": message,
+            "context_query": context_query,
+            "spoken": spoken,
+            "reason": reason_last,
+        }
+
+    async def _handle_t_command(
+        self,
+        cmd_text: str,
+        ctx,
+        channel: str,
+        correlation_id: str,
+    ) -> List[Event]:
+        line = (cmd_text or "").strip()
+        parts = line.split(maxsplit=1)
+        arg = (parts[1] or "").strip().lower() if len(parts) > 1 else ""
+
+        if arg in ("cancel", "clear", "off"):
+            prev_allow = await ctx.get_kv("control:t_prev_allow_babble", True)
+            await ctx.set_kv("control:t_pending", False)
+            await ctx.set_kv("control:t_target", None)
+            await ctx.set_kv("control:t_prev_allow_babble", None)
+            await ctx.set_kv("attention:allow_babble", bool(prev_allow))
+            await ctx.set_kv("attention:focus_target", "internal" if bool(prev_allow) else "external")
+            return [self._speech_control("Trainer mode cancelled.", channel=channel, correlation_id=correlation_id)]
+
+        if arg == "status":
+            pending = bool(await ctx.get_kv("control:t_pending", False))
+            target = await ctx.get_kv("control:t_target", None)
+            utterance = str((target or {}).get("utterance", "") or "").strip() if isinstance(target, dict) else ""
+            msg = f"Trainer: {'armed' if pending else 'off'}"
+            if utterance:
+                msg += f" | target={utterance}"
+            return [self._speech_control(msg, channel=channel, correlation_id=correlation_id)]
+
+        last_spoken = await ctx.get_kv("trainer:last_assistant_utterance", None)
+        speech_reason_last = await ctx.get_kv("speech_reason:last", None)
+        target = self._trainer_target_snapshot(last_spoken, speech_reason_last)
+        if not str(target.get("utterance", "") or "").strip():
+            return [self._speech_control("No recent assistant utterance to correct.", channel=channel, correlation_id=correlation_id)]
+
+        prev_allow = bool(await ctx.get_kv("attention:allow_babble", True))
+        await ctx.set_kv("control:t_prev_allow_babble", prev_allow)
+        await ctx.set_kv("control:t_target", target)
+        await ctx.set_kv("control:t_pending", True)
+        await ctx.set_kv("attention:allow_babble", False)
+        await ctx.set_kv("attention:focus_target", "external")
+        return [
+            self._speech_control(
+                f"Trainer armed. Next input will correct: {target.get('utterance','')}",
+                channel=channel,
+                correlation_id=correlation_id,
+            )
+        ]
+
+    async def _handle_t_capture(
+        self,
+        correction_text: str,
+        ctx,
+        channel: str,
+        correlation_id: str,
+    ) -> List[Event]:
+        target = await ctx.get_kv("control:t_target", None)
+        prev_allow = await ctx.get_kv("control:t_prev_allow_babble", True)
+        await ctx.set_kv("control:t_pending", False)
+        await ctx.set_kv("control:t_target", None)
+        await ctx.set_kv("control:t_prev_allow_babble", None)
+        await ctx.set_kv("attention:allow_babble", bool(prev_allow))
+        await ctx.set_kv("attention:focus_target", "internal" if bool(prev_allow) else "external")
+
+        payload = {
+            "correction_text": str(correction_text or "").strip(),
+            "target": dict(target) if isinstance(target, dict) else {},
+            "splitter": "|",
+            "ts": time.time(),
+        }
+        return [
+            Event(
+                topic="control/trainer_correction",
+                payload=payload,
+                source=self.name,
+                correlation_id=correlation_id,
+                meta={"control": True, "kind": "trainer_correction"},
+            )
+        ]
 
     # ------------------------------------------------------------------
     # /user: set a preferred user display name (used by the reasoning prompt)
