@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from microbrain.memory.builder_forge import build_forge_workspace, forge_from_workspace
 from microbrain.memory.mem_cell_store import MemCellStore
 
 STOPWORDS = {
@@ -14,6 +15,7 @@ ACTION_HINTS = {
     "makes", "make", "made", "moves", "move", "moved", "chops", "chop", "chopped", "cuts", "cut",
     "cutting", "using", "used", "use", "helps", "help", "works", "work", "working",
 }
+STRUCTURAL_KINDS = {"general_pattern", "compressed_general_pattern", "trainer_alignment"}
 
 
 def _norm(text: str) -> str:
@@ -62,6 +64,25 @@ def _render_general_pattern(candidate: Mapping[str, Any]) -> str:
             return f"Ask {person}".strip()
     return str(candidate.get("anchor_text", "") or "").strip()
 
+
+def _render_candidate(candidate: Mapping[str, Any]) -> str:
+    kind = str(candidate.get("kind", "") or "")
+    meta = dict(candidate.get("meta", {}) or {})
+    if kind in {"general_pattern", "compressed_general_pattern"}:
+        return _render_general_pattern(candidate)
+    if kind == "trainer_alignment":
+        desired = str(meta.get("desired_utterance", "") or "").strip()
+        if desired:
+            return desired
+    return str(candidate.get("anchor_text", "") or "").strip()
+
+
+def _is_reading_quote(candidate: Mapping[str, Any]) -> bool:
+    kind = str(candidate.get("kind", "") or "")
+    transport_source = str(candidate.get("transport_source", "") or "")
+    return transport_source == "reading" and kind == "utterance_anchor"
+
+
 def classify_query(text: str) -> str:
     norm = _norm(text)
     if any(k in norm for k in ("power", "battery", "charge", "charging", "sleeping", "sleep", "maintenance")):
@@ -107,31 +128,55 @@ def gather_support(
                 if overlap:
                     score += 0.12 * overlap
                 kind = str(hit.get("kind", "") or "")
+                tier = str(hit.get("tier", "") or "")
                 meta = dict(hit.get("meta", {}) or {})
-                if kind == "general_pattern":
+                transport_source = str(meta.get("transport_source", "") or "")
+                channel = str(meta.get("channel", "") or "")
+
+                if kind in {"general_pattern", "compressed_general_pattern"}:
                     pattern_type = str(meta.get("pattern_type", "") or "")
                     score += 0.18
+                    if kind == "compressed_general_pattern" or tier == "derived":
+                        score += 0.14
                     if qtype == "what_is" and pattern_type in ("assert_attribute", "assert_existence"):
                         score += 0.18
                     if qtype == "what_does" and pattern_type in ("assert_attribute", "social_redirect"):
                         score += 0.10
                     if qtype == "question_generic" and pattern_type == "question_about":
                         score += 0.06
+                if kind == "trainer_alignment":
+                    score += 0.16
                 if qtype == "what_does" and ("pattern" in kind or "utterance" in kind):
                     score += 0.08
                     if any(tok in ACTION_HINTS for tok in _tokens(anchor_text)):
                         score += 0.10
-                if qtype == "what_is" and (kind == "utterance_anchor" or kind == "general_pattern"):
+                if qtype == "what_is" and kind in {"utterance_anchor", "general_pattern", "compressed_general_pattern", "trainer_alignment"}:
                     score += 0.07
+
+                # Reading should shape structure more than it quotes surface lines.
+                if transport_source == "reading":
+                    if kind in {"general_pattern", "compressed_general_pattern"}:
+                        score += 0.10
+                    elif kind == "utterance_anchor":
+                        score -= 0.18
+                if transport_source == "trainer":
+                    score += 0.08
+                if channel == "reading" and kind == "utterance_anchor":
+                    score -= 0.08
+
+                source = "mem_cell_derived" if tier == "derived" else "mem_cell"
                 candidates.append({
-                    "source": "mem_cell",
+                    "source": source,
                     "cell_id": hid,
                     "kind": kind,
+                    "tier": tier,
                     "anchor_text": anchor_text,
                     "refs": list(hit.get("refs", []) or []),
                     "modalities": mods,
                     "links_explicit": list(hit.get("links_explicit", []) or []),
                     "meta": meta,
+                    "transport_source": transport_source,
+                    "channel": channel,
                     "score": round(score, 6),
                 })
                 modalities.update(mods)
@@ -150,11 +195,14 @@ def gather_support(
             "source": "power_state",
             "cell_id": "power:battery_state",
             "kind": "state_anchor",
+            "tier": "state",
             "anchor_text": f"power {pct:.1f}% charging {'on' if charging else 'off'} sleep {'on' if sleep else 'off'} maintenance {maint:.2f}",
             "refs": [],
             "modalities": ["maintenance", "power"],
             "links_explicit": [],
             "meta": {"pct": pct, "charging": charging, "sleep": sleep, "maintenance": maint},
+            "transport_source": "state",
+            "channel": "internal",
             "score": 1.25,
         })
         modalities.update(["maintenance", "power"])
@@ -166,11 +214,14 @@ def gather_support(
                 "source": "thought_path",
                 "cell_id": str(thought_path_last.get("trace_id", "thought_path:last") or "thought_path:last"),
                 "kind": "thought_path",
+                "tier": "trace",
                 "anchor_text": ans,
                 "refs": [],
                 "modalities": ["thought"],
                 "links_explicit": list(thought_path_last.get("recalled_cells", []) or []),
                 "meta": dict(thought_path_last),
+                "transport_source": "thought",
+                "channel": "internal",
                 "score": 0.40,
             })
             modalities.add("thought")
@@ -218,6 +269,17 @@ def _compose_maintenance_answer(bundle: Mapping[str, Any]) -> Tuple[str, float]:
     return ". ".join(state_parts) + ".", 0.92
 
 
+def _answer_meta(selected: Sequence[Mapping[str, Any]], **extra: Any) -> Dict[str, Any]:
+    meta: Dict[str, Any] = {
+        "selected_sources": [str(c.get("source", "") or "") for c in selected],
+        "selected_cell_ids": [str(c.get("cell_id", "") or "") for c in selected if str(c.get("cell_id", "") or "")],
+        "selected_tiers": [str(c.get("tier", "") or "") for c in selected],
+        "selected_transport_sources": [str(c.get("transport_source", "") or "") for c in selected],
+    }
+    meta.update(extra)
+    return meta
+
+
 def compose_answer(bundle: Mapping[str, Any]) -> Tuple[str, float, Dict[str, Any]]:
     qtype = str(bundle.get("query_type", "question_generic") or "question_generic")
     focus = list(bundle.get("focus_tokens", []) or [])
@@ -225,25 +287,49 @@ def compose_answer(bundle: Mapping[str, Any]) -> Tuple[str, float, Dict[str, Any
     if qtype == "maintenance_status":
         answer, conf = _compose_maintenance_answer(bundle)
         if answer:
-            return answer, conf, {"selected_sources": ["power_state"]}
+            return answer, conf, {"selected_sources": ["power_state"], "selected_cell_ids": ["power:battery_state"]}
     if not candidates:
-        return "", 0.0, {"selected_sources": []}
+        return "", 0.0, {"selected_sources": [], "selected_cell_ids": []}
 
-    selected = candidates[:5]
+    structural = [c for c in candidates if str(c.get("kind", "") or "") in STRUCTURAL_KINDS]
+    non_reading_quotes = [c for c in candidates if not _is_reading_quote(c)]
+    selected = (structural[:3] + [c for c in non_reading_quotes if c not in structural][:2])[:5]
+    if not selected:
+        selected = candidates[:5]
     best = selected[0]
-    best_text = str(best.get("anchor_text", "") or "").strip()
-    rendered_selected = [
-        _render_general_pattern(c) if str(c.get("kind", "") or "") == "general_pattern" else str(c.get("anchor_text", "") or "").strip()
-        for c in selected
-    ]
+    best_text = _render_candidate(best).strip()
+    rendered_selected = [_render_candidate(c) for c in selected]
     candidate_texts = _dedupe_preserve(rendered_selected)
 
-    if str(best.get("kind", "") or "") == "general_pattern":
-        rendered = _render_general_pattern(best)
+    forge_workspace = build_forge_workspace(query_type=qtype, focus_tokens=focus, candidates=selected or candidates)
+    forge_bundle = forge_from_workspace(forge_workspace)
+    forge_choice = dict(forge_bundle.get("chosen", {}) or {})
+    if forge_choice.get("text"):
+        forge_sources = [sid for sid in list(forge_choice.get("source_ids", []) or []) if sid]
+        forge_selected = [c for c in selected if str(c.get("cell_id", "") or "") in set(forge_sources)] or selected
+        return str(forge_choice.get("text", "") or ""), float(forge_choice.get("confidence", 0.72) or 0.72), _answer_meta(
+            forge_selected,
+            used_forge=True,
+            forge_intent=str(forge_bundle.get("intent", "") or ""),
+            forge_workspace=forge_workspace,
+            forge_choice=forge_choice,
+            used_general_pattern=str(best.get("kind", "") or "") in {"general_pattern", "compressed_general_pattern", "trainer_alignment"},
+            used_compressed=str(best.get("kind", "") or "") == "compressed_general_pattern",
+            used_trainer_alignment=str(best.get("kind", "") or "") == "trainer_alignment",
+        )
+
+    if str(best.get("kind", "") or "") in {"general_pattern", "compressed_general_pattern", "trainer_alignment"}:
+        rendered = _render_candidate(best)
         if rendered:
             cleaned = rendered.rstrip(" .")
-            conf = 0.84 if qtype in ("what_is", "what_does") else 0.72
-            return cleaned[:1].upper() + cleaned[1:] + ".", conf, {"selected_sources": [c.get("source") for c in selected], "used_general_pattern": True}
+            conf = 0.88 if str(best.get("kind", "") or "") == "compressed_general_pattern" else (0.84 if qtype in ("what_is", "what_does") else 0.74)
+            return cleaned[:1].upper() + cleaned[1:] + ".", conf, _answer_meta(
+                selected,
+                used_general_pattern=True,
+                used_compressed=str(best.get("kind", "") or "") == "compressed_general_pattern",
+                used_trainer_alignment=str(best.get("kind", "") or "") == "trainer_alignment",
+                forge_workspace=forge_workspace,
+            )
 
     if qtype == "what_does":
         for text in candidate_texts:
@@ -257,17 +343,17 @@ def compose_answer(bundle: Mapping[str, Any]) -> Tuple[str, float, Dict[str, Any
                     if subject in toks and toks.index(subject) == 1 and toks[0] in {"a", "an", "the", "this", "that"}:
                         pred = toks[2:]
                         if pred:
-                            return f"A {subject} {' '.join(pred)}.", 0.76, {"selected_sources": [c.get("source") for c in selected]}
-                return cleaned[:1].upper() + cleaned[1:] + ("." if not cleaned.endswith(".") else ""), 0.72, {"selected_sources": [c.get("source") for c in selected]}
+                            return f"A {subject} {' '.join(pred)}.", 0.76, _answer_meta(selected)
+                return cleaned[:1].upper() + cleaned[1:] + ("." if not cleaned.endswith(".") else ""), 0.72, _answer_meta(selected)
         if best_text:
-            return best_text[:1].upper() + best_text[1:] + ("." if not best_text.endswith(".") else ""), 0.52, {"selected_sources": [c.get("source") for c in selected]}
+            return best_text[:1].upper() + best_text[1:] + ("." if not best_text.endswith(".") else ""), 0.52, _answer_meta(selected)
 
     if qtype == "what_is":
         if best_text:
             cleaned = best_text.rstrip(" .")
-            return cleaned[:1].upper() + cleaned[1:] + ".", 0.68, {"selected_sources": [c.get("source") for c in selected]}
+            return cleaned[:1].upper() + cleaned[1:] + ".", 0.68, _answer_meta(selected)
 
     if best_text:
         cleaned = best_text.rstrip(" .")
-        return cleaned[:1].upper() + cleaned[1:] + ".", 0.55, {"selected_sources": [c.get("source") for c in selected]}
-    return "", 0.0, {"selected_sources": []}
+        return cleaned[:1].upper() + cleaned[1:] + ".", 0.55, _answer_meta(selected)
+    return "", 0.0, {"selected_sources": [], "selected_cell_ids": []}

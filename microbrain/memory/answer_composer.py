@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import re
 import time
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
+from microbrain.memory.builder_forge import build_forge_workspace, forge_from_workspace
 from microbrain.memory.mem_cell_store import MemCellStore
 from microbrain.utils.memdir import resolve_memdir_ctx
 
@@ -14,6 +14,7 @@ QUESTION_STOPWORDS = {
     'to', 'of', 'for', 'about', 'can', 'you', 'me', 'tell', 'give', 'explain',
     'why', 'how', 'when', 'where', 'who', 'whom', 'which'
 }
+STRUCTURAL_KINDS = {'general_pattern', 'compressed_general_pattern', 'trainer_alignment'}
 
 
 def _norm(text: str) -> str:
@@ -31,6 +32,12 @@ def _focus_tokens(text: str) -> List[str]:
 
 
 def _extract_body(hit: Dict[str, Any]) -> str:
+    kind = str(hit.get('kind', '') or '')
+    meta = dict(hit.get('meta', {}) or {})
+    if kind == 'trainer_alignment':
+        desired = str(meta.get('desired_utterance', '') or '').strip()
+        if desired:
+            return desired
     anchor = hit.get('anchor', {}) if isinstance(hit.get('anchor', {}), dict) else {}
     anchor_text = str(hit.get('anchor_text', '') or anchor.get('ref', '') or '').strip()
     refs = hit.get('refs', []) if isinstance(hit.get('refs', []), list) else []
@@ -40,6 +47,28 @@ def _extract_body(hit: Dict[str, Any]) -> str:
         if isinstance(ref, str) and ref.strip():
             return ref.strip()
     return ''
+
+
+def _render_pattern(hit: Dict[str, Any]) -> str:
+    meta = dict(hit.get('meta', {}) or {})
+    slots = dict(meta.get('slots', {}) or {})
+    pattern_type = str(meta.get('pattern_type', '') or '').strip()
+    if pattern_type == 'assert_attribute':
+        subject = str(slots.get('subject', '') or '').strip()
+        attribute = str(slots.get('attribute', '') or '').strip()
+        copula = str(slots.get('copula', 'is') or 'is').strip() or 'is'
+        deixis = str(slots.get('deixis', '') or '').strip()
+        subject_text = ' '.join([p for p in [deixis, subject] if p]).strip()
+        if subject_text and attribute:
+            return f'{subject_text} {copula} {attribute}'.strip()
+    if pattern_type == 'assert_existence':
+        entity = str(slots.get('entity', '') or '').strip()
+        copula = str(slots.get('copula', 'is') or 'is').strip() or 'is'
+        deixis = str(slots.get('deixis', '') or '').strip()
+        entity_text = ' '.join([p for p in [deixis, entity] if p]).strip()
+        if entity_text:
+            return f'There {copula} {entity_text}'.strip()
+    return _extract_body(hit)
 
 
 def _dedupe_keep_order(items: Sequence[str], *, limit: int = 6) -> List[str]:
@@ -78,69 +107,57 @@ async def compose_answer_from_memory(ctx, query_text: str) -> Dict[str, Any]:
         return {'ok': False, 'reason': 'no_mem_cell_store', 'text': ''}
 
     search_query = ' '.join(focus) if focus else query_text
-    hits = store.search_text_cells(search_query, limit=10, tiers=('long', 'now', 'short'))
+    hits = store.search_text_cells(search_query, limit=12, tiers=('learned', 'long', 'now', 'short'))
     if not hits and search_query != query_text:
-        hits = store.search_text_cells(query_text, limit=10, tiers=('long', 'now', 'short'))
+        hits = store.search_text_cells(query_text, limit=12, tiers=('learned', 'long', 'now', 'short'))
     if not hits:
         return {'ok': False, 'reason': 'no_hits', 'text': ''}
 
-    bodies = _dedupe_keep_order([_extract_body(h) for h in hits], limit=10)
-    focus_set = set(focus)
-    utterances = []
-    patterns = []
-    related = []
-    for hit, body in zip(hits, bodies + [''] * max(0, len(hits) - len(bodies))):
-        kind = str(hit.get('kind', '') or '')
-        body = body.strip()
-        if not body:
-            continue
-        body_norm = _norm(body)
-        if any(tok in body_norm.split() for tok in focus_set):
-            if kind == 'utterance_anchor':
-                utterances.append(body)
-            elif 'pattern' in kind:
-                patterns.append(body)
-            else:
-                related.append(body)
-        else:
-            related.append(body)
+    structural_hits = [h for h in hits if str(h.get('kind', '') or '') in STRUCTURAL_KINDS]
+    direct_hits = [
+        h for h in hits
+        if str(h.get('kind', '') or '') == 'utterance_anchor'
+        and str((h.get('meta', {}) if isinstance(h.get('meta', {}), dict) else {}).get('transport_source', '') or '') != 'reading'
+    ]
+    related_hits = [h for h in hits if h not in structural_hits and h not in direct_hits]
 
-    utterances = _dedupe_keep_order(utterances, limit=4)
-    patterns = _dedupe_keep_order(patterns, limit=5)
-    related = _dedupe_keep_order(related, limit=5)
+    structural = _dedupe_keep_order([_render_pattern(h) for h in structural_hits], limit=5)
+    direct = _dedupe_keep_order([_extract_body(h) for h in direct_hits], limit=4)
+    related = _dedupe_keep_order([_extract_body(h) for h in related_hits], limit=5)
 
-    # Heuristic answer assembly
     text = ''
     reason = 'assembled'
     focus_phrase = ' '.join(focus[:3]).strip() or 'that'
+    selected_ids: List[str] = []
 
-    # Prefer direct utterance statements that mention the focus token.
-    if utterances:
-        chosen = ''
-        for u in utterances:
-            u_norm = _norm(u)
-            if any(f" {tok} " in f" {u_norm} " for tok in focus_set):
-                chosen = u.strip()
-                break
-        chosen = chosen or utterances[0].strip()
-        if chosen.endswith('?'):
-            chosen = chosen[:-1].strip()
+    forge_workspace = build_forge_workspace(query_type='what_is' if query_text.endswith('?') else 'statement', focus_tokens=focus, candidates=hits[:6])
+    forge_bundle = forge_from_workspace(forge_workspace)
+    forge_choice = dict(forge_bundle.get('chosen', {}) or {})
+
+    if forge_choice.get('text'):
+        text = str(forge_choice.get('text', '') or '').strip()
+        reason = 'forge_match'
+        selected_ids = [str(s or '') for s in list(forge_choice.get('source_ids', []) or []) if str(s or '')]
+
+    if not text and structural:
+        chosen = structural[0].strip().rstrip('?').rstrip(' .')
         if chosen:
-            lead = chosen[0].upper() + chosen[1:] if chosen else chosen
-            if not lead.endswith('.'):
-                lead += '.'
-            text = f"I remember: {lead}"
-            reason = 'utterance_match'
+            text = chosen[:1].upper() + chosen[1:] + '.'
+            reason = 'structural_match'
+            selected_ids = [str(h.get('cell_id', '') or '') for h in structural_hits[:3] if str(h.get('cell_id', '') or '')]
 
-    if not text and patterns:
-        joined = ', '.join(patterns[:3])
-        text = f"For {focus_phrase}, I recall patterns like: {joined}."
-        reason = 'pattern_match'
+    if not text and direct:
+        chosen = direct[0].strip().rstrip('?').rstrip(' .')
+        if chosen:
+            text = f"I remember: {chosen[:1].upper() + chosen[1:]}."
+            reason = 'direct_match'
+            selected_ids = [str(h.get('cell_id', '') or '') for h in direct_hits[:3] if str(h.get('cell_id', '') or '')]
 
     if not text and related:
         joined = ', '.join(related[:3])
         text = f"For {focus_phrase}, I recall related anchors: {joined}."
         reason = 'related_match'
+        selected_ids = [str(h.get('cell_id', '') or '') for h in related_hits[:3] if str(h.get('cell_id', '') or '')]
 
     if not text:
         return {'ok': False, 'reason': 'empty_assembly', 'text': ''}
@@ -148,13 +165,17 @@ async def compose_answer_from_memory(ctx, query_text: str) -> Dict[str, Any]:
     bundle = {
         'ts': time.time(),
         'query_text': query_text,
+        'norm_query': norm_q,
         'focus_tokens': focus,
-        'hits': hits[:6],
-        'utterances': utterances[:4],
-        'patterns': patterns[:5],
+        'hits': hits[:8],
+        'structural': structural[:5],
+        'direct': direct[:4],
         'related': related[:5],
         'reason': reason,
         'answer_text': text,
+        'selected_cell_ids': selected_ids,
+        'forge_workspace': forge_workspace,
+        'forge_choice': forge_choice,
     }
     await ctx.set_kv('composer:last_answer', bundle)
     return {'ok': True, 'reason': reason, 'text': text, 'bundle': bundle}

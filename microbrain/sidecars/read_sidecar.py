@@ -338,20 +338,43 @@ class ReadSidecar:
                 piece = piece[:900].rsplit(" ", 1)[0].strip() or piece[:900]
             result = mem_cell_store.ingest_text(
                 text=piece,
-                topic="reading/text",
+                topic="percept/reading",
                 role="assistant",
                 transport_source="reading",
                 source=source_name,
-                meta={"channel": "reading"},
+                meta={
+                    "channel": "reading",
+                    "ingest_mode": "sensory",
+                    "social_pressure": False,
+                    "route": "eyes",
+                    "source_kind": "document",
+                    "source_name": source_name,
+                },
                 tier="now",
             )
-            rows = [result.get("utterance")] + list(result.get("tokens", [])) + list(result.get("patterns", []))
+            rows = (
+                [result.get("utterance")]
+                + list(result.get("tokens", []))
+                + list(result.get("patterns", []))
+                + list(result.get("general_patterns", []))
+                + list(result.get("linkers", []))
+            )
             for row in rows:
                 if not isinstance(row, dict):
                     continue
-                row["activation"] = min(float(row.get("activation", 0.18) or 0.18), 0.18)
-                row["promotion"] = min(float(row.get("promotion", 0.0) or 0.0), 0.0)
-                row["trust"] = min(float(row.get("trust", 0.3) or 0.3), 0.30)
+                kind = str(row.get("kind", "") or "")
+                if kind == "utterance_anchor":
+                    row["activation"] = min(float(row.get("activation", 0.14) or 0.14), 0.14)
+                    row["promotion"] = min(float(row.get("promotion", 0.0) or 0.0), 0.0)
+                    row["trust"] = min(float(row.get("trust", 0.22) or 0.22), 0.22)
+                elif kind in {"general_pattern", "pattern_linker"}:
+                    row["activation"] = min(float(row.get("activation", 0.28) or 0.28), 0.28)
+                    row["promotion"] = min(float(row.get("promotion", 0.02) or 0.02), 0.02)
+                    row["trust"] = min(float(row.get("trust", 0.42) or 0.42), 0.42)
+                else:
+                    row["activation"] = min(float(row.get("activation", 0.18) or 0.18), 0.18)
+                    row["promotion"] = min(float(row.get("promotion", 0.0) or 0.0), 0.0)
+                    row["trust"] = min(float(row.get("trust", 0.30) or 0.30), 0.30)
                 mem_cell_store.upsert_cell(row, tier=str(row.get("tier", "now") or "now"))
             count += 1
         return count

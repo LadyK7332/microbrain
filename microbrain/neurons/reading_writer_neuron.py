@@ -12,15 +12,22 @@ NEURON_NAME = Path(__file__).stem
 
 
 class ReadingWriterNeuron(BaseNeuron):
+    """
+    Explicit reading-queue writer.
+
+    Important separation:
+      - mouth/textual output should not be mirrored into reading ingestion
+      - only dedicated reading queue events should write files here
+    """
+
     async def process(self, event: Event, ctx) -> Iterable[Event]:
-        if event.topic != 'act/speech':
+        if event.topic != 'reading/queue_text':
             return []
         payload = event.payload if isinstance(event.payload, dict) else {'text': event.payload}
         text = str(payload.get('text', '') or '').strip()
-        channel = str(payload.get('channel', 'repl') or 'repl')
-        if not text or channel in ('thought', 'internal'):
+        if not text:
             return []
-        enabled = bool(await ctx.get_kv('reading:writer_enabled', True))
+        enabled = bool(await ctx.get_kv('reading:writer_enabled', False))
         if not enabled:
             return []
         memdir = Path(await resolve_memdir_ctx(ctx, fallback=r'Z:\memory'))
@@ -37,7 +44,8 @@ class ReadingWriterNeuron(BaseNeuron):
             'ts': ts,
             'path': str(path),
             'text': text,
-            'channel': channel,
+            'channel': 'reading',
+            'source_topic': event.topic,
         })
         return []
 
@@ -45,7 +53,7 @@ class ReadingWriterNeuron(BaseNeuron):
 def build_neurons(orchestrator: Orchestrator):
     cfg = NeuronConfig(
         name=NEURON_NAME,
-        subscribed_topics=['act/speech'],
+        subscribed_topics=['reading/queue_text'],
         output_topics=[],
         priority=-4,
         cooldown_sec=0.0,

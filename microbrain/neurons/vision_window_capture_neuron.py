@@ -148,8 +148,8 @@ class VisionWindowCaptureNeuron(BaseNeuron):
         action = str(payload.get("action", "") or "").lower().strip()
 
         if action == "center":
-            await ctx.set_kv("vision:focus_xy", {"x": 0.5, "y": 0.5})
-            self.debug("vision_focus_set", x=0.5, y=0.5, mode="center")
+            await self._write_focus_state(ctx, {"x": 0.5, "y": 0.5, "radius": 0.08, "mode": "manual"})
+            self.debug("vision_focus_set", x=0.5, y=0.5, radius=0.08, mode="center")
             return []
 
         if action == "set":
@@ -160,12 +160,56 @@ class VisionWindowCaptureNeuron(BaseNeuron):
                 x, y = 0.5, 0.5
             x = max(0.0, min(1.0, x))
             y = max(0.0, min(1.0, y))
-            await ctx.set_kv("vision:focus_xy", {"x": x, "y": y})
-            self.debug("vision_focus_set", x=x, y=y, mode="manual")
+            prev_focus = await self._read_focus_state(ctx)
+            await self._write_focus_state(ctx, {"x": x, "y": y, "radius": prev_focus.get("radius", 0.08), "mode": "manual"})
+            self.debug("vision_focus_set", x=x, y=y, radius=prev_focus.get("radius", 0.08), mode="manual")
             return []
 
         self.debug("vision_focus_unknown", action=action)
         return []
+
+    async def _read_focus_state(self, ctx) -> dict[str, float | str]:
+        gaze_state = await ctx.get_kv("vision:gaze_state", None)
+        if isinstance(gaze_state, dict):
+            try:
+                x = float(gaze_state.get("x", gaze_state.get("cx", 0.5)) or 0.5)
+                y = float(gaze_state.get("y", gaze_state.get("cy", 0.5)) or 0.5)
+                radius = float(gaze_state.get("radius", 0.08) or 0.08)
+                mode = str(gaze_state.get("mode", "roam") or "roam")
+                return {
+                    "x": max(0.0, min(1.0, x)),
+                    "y": max(0.0, min(1.0, y)),
+                    "radius": max(0.03, min(0.35, radius)),
+                    "mode": mode,
+                }
+            except Exception:
+                pass
+
+        focus_xy = await ctx.get_kv("vision:focus_xy", {"x": 0.5, "y": 0.5})
+        x = 0.5
+        y = 0.5
+        if isinstance(focus_xy, dict):
+            try:
+                x = float(focus_xy.get("x", 0.5) or 0.5)
+                y = float(focus_xy.get("y", 0.5) or 0.5)
+            except Exception:
+                x, y = 0.5, 0.5
+        return {
+            "x": max(0.0, min(1.0, x)),
+            "y": max(0.0, min(1.0, y)),
+            "radius": 0.08,
+            "mode": "manual",
+        }
+
+    async def _write_focus_state(self, ctx, focus: dict[str, float | str]) -> None:
+        x = max(0.0, min(1.0, float(focus.get("x", 0.5) or 0.5)))
+        y = max(0.0, min(1.0, float(focus.get("y", 0.5) or 0.5)))
+        radius = max(0.03, min(0.35, float(focus.get("radius", 0.08) or 0.08)))
+        mode = str(focus.get("mode", "manual") or "manual")
+        gaze_state = dict(await ctx.get_kv("vision:gaze_state", {}) or {})
+        gaze_state.update({"x": x, "y": y, "radius": radius, "mode": mode})
+        await ctx.set_kv("vision:gaze_state", gaze_state)
+        await ctx.set_kv("vision:focus_xy", {"x": x, "y": y, "radius": radius, "mode": mode})
 
     async def _tick_capture(self, event: Event, ctx) -> list[Event]:
         enabled = bool(await ctx.get_kv("vision:enabled", False))
@@ -213,7 +257,7 @@ class VisionWindowCaptureNeuron(BaseNeuron):
         # Preview overlay (never saved; only displayed)
         preview = bool(await ctx.get_kv("vision:preview", False))
         if preview:
-            focus_xy = await ctx.get_kv("vision:focus_xy", {"x": 0.5, "y": 0.5})
+            focus_xy = await self._read_focus_state(ctx)
             try:
                 prev = frame.copy()
                 draw_focus_reticle(prev, focus_xy)
@@ -277,6 +321,7 @@ class VisionWindowCaptureNeuron(BaseNeuron):
             except Exception:
                 pass
 
+        focus_state = await self._read_focus_state(ctx)
         payload = {
             "ts": now,
             "frame_id": frame_id,
@@ -288,6 +333,7 @@ class VisionWindowCaptureNeuron(BaseNeuron):
                 "title": str(window.get("title", "")),
                 "rect": rect,
             },
+            "focus": focus_state,
         }
 
         return [

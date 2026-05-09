@@ -280,12 +280,16 @@ class SpeechReasonNeuron(BaseNeuron):
                 + self._style_score(text, style)
                 - (rank * 0.012),
             )
+            row_tier = str(row.get("tier", "now") or "now")
+            row_source = "trainer_alignment" if kind == "trainer_alignment" else ("mem_cell_derived" if row_tier == "derived" else "mem_cell")
             out.append({
                 "text": text,
-                "source": "trainer_alignment" if kind == "trainer_alignment" else "mem_cell",
+                "source": row_source,
                 "role": role,
                 "score": round(score, 4),
                 "kind": kind or "mem_cell",
+                "cell_id": str(row.get("cell_id", "") or ""),
+                "tier": row_tier,
             })
         return out
 
@@ -364,6 +368,21 @@ class SpeechReasonNeuron(BaseNeuron):
         pending["utterance_score"] = self._safe_float(chosen.get("score", 0.0), 0.0)
         await ctx.set_kv("drive:power_pending_request", pending)
 
+    async def _note_usage(self, ctx, chosen: Dict[str, Any]) -> None:
+        source = str(chosen.get("source", "") or "")
+        if source not in {"mem_cell", "mem_cell_derived", "trainer_alignment"}:
+            return
+        cell_id = str(chosen.get("cell_id", "") or "").strip()
+        if not cell_id:
+            return
+        mem_cell_store = await ctx.get_kv("memory:mem_cell_store", None)
+        if not isinstance(mem_cell_store, MemCellStore):
+            return
+        try:
+            mem_cell_store.note_cell_usage(cell_id, success=True)
+        except Exception as exc:
+            await ctx.log_debug(f"[{self.name}] mem-cell usage note failed", error=repr(exc), cell_id=cell_id)
+
     async def process(self, event: Event, ctx) -> Iterable[Event]:
         self.debug(
             "received",
@@ -396,6 +415,7 @@ class SpeechReasonNeuron(BaseNeuron):
             return []
 
         await self._update_pending_request(ctx, event, chosen)
+        await self._note_usage(ctx, chosen)
         await ctx.set_kv(
             "speech_reason:last",
             {

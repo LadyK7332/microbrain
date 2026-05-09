@@ -163,7 +163,13 @@ def save_jpeg(frame_bgr, out_path: str, quality: int = 85) -> None:
 def draw_focus_reticle(frame_bgr, focus_xy: dict[str, Any] | None) -> None:
     """
     Draw a clean circle reticle in-place on a BGR frame.
-    focus_xy expects normalized coords {x:0..1, y:0..1}
+
+    ``focus_xy`` accepts normalized coordinates and optional focus metadata:
+      {x:0..1, y:0..1, radius:0..1, mode:str}
+
+    The radius is interpreted as a fraction of the smaller frame dimension.
+    This lets the preview reflect MB's current attention aperture instead of
+    always drawing a fixed-size circle.
     """
     try:
         import cv2
@@ -173,22 +179,46 @@ def draw_focus_reticle(frame_bgr, focus_xy: dict[str, Any] | None) -> None:
     h, w = frame_bgr.shape[:2]
     fx = 0.5
     fy = 0.5
+    radius = 0.08
+    mode = "roam"
     if isinstance(focus_xy, dict):
         try:
             fx = float(focus_xy.get("x", 0.5))
             fy = float(focus_xy.get("y", 0.5))
+            radius = float(focus_xy.get("radius", focus_xy.get("r", 0.08)) or 0.08)
+            mode = str(focus_xy.get("mode", "roam") or "roam")
         except Exception:
-            fx, fy = 0.5, 0.5
+            fx, fy, radius, mode = 0.5, 0.5, 0.08, "roam"
 
     fx = max(0.0, min(1.0, fx))
     fy = max(0.0, min(1.0, fy))
+    radius = max(0.03, min(0.35, radius))
     cx = int(fx * w)
     cy = int(fy * h)
 
-    r = int(min(w, h) * 0.08)
+    r = max(8, int(min(w, h) * radius))
     th = max(1, int(min(w, h) * 0.004))
 
     # outer ring (white)
     cv2.circle(frame_bgr, (cx, cy), r, (255, 255, 255), th, lineType=cv2.LINE_AA)
+    # small inner ring to imply "tightening" attention as radius changes
+    inner_r = max(5, int(r * 0.35))
+    cv2.circle(frame_bgr, (cx, cy), inner_r, (255, 255, 255), max(1, th - 1), lineType=cv2.LINE_AA)
     # inner dot
     cv2.circle(frame_bgr, (cx, cy), max(2, th), (255, 255, 255), -1, lineType=cv2.LINE_AA)
+
+    # short mode label near the reticle for the viewable sidecar
+    try:
+        label = str(mode or "roam")[:12]
+        cv2.putText(
+            frame_bgr,
+            label,
+            (max(0, cx + r + 6), max(12, cy - r - 4)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (255, 255, 255),
+            1,
+            lineType=cv2.LINE_AA,
+        )
+    except Exception:
+        pass

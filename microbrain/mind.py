@@ -292,15 +292,6 @@ async def main_async(cfg: AppConfig):
     orch.kv_store.setdefault("power:act_speech_thought_cost", 0.02)
     orch.kv_store.setdefault("power:task_start_cost", 0.15)
     orch.kv_store.setdefault("power:act_motor_cost", 0.50)
-    orch.kv_store.setdefault("curiosity:utterance_explore", 0.0)
-    orch.kv_store.setdefault("curiosity:utterance_explore_base", 0.02)
-    orch.kv_store.setdefault("curiosity:utterance_explore_max", 0.22)
-    orch.kv_store.setdefault("curiosity:utterance_explore_boost_scale", 0.12)
-    orch.kv_store.setdefault("curiosity:utterance_explore_boredom_scale", 0.08)
-    orch.kv_store.setdefault("speech_reason:explore_top_k", 3)
-    orch.kv_store.setdefault("speech_reason:explore_score_band", 0.10)
-    orch.kv_store.setdefault("speech_reason:explore_recent_window_s", 480.0)
-    orch.kv_store.setdefault("speech_reason:novelty_bonus_max", 0.08)
     orch.kv_store.setdefault("probe:enabled", True)
     orch.kv_store.setdefault("probe:every_s", 300.0)
     orch.kv_store.setdefault("probe:maintenance_every_s", 1800.0)
@@ -310,6 +301,32 @@ async def main_async(cfg: AppConfig):
     orch.kv_store.setdefault("mem_cell:short_hours", 72.0)
     orch.kv_store.setdefault("mem_cell:long_hours", 96.0)
     orch.kv_store.setdefault("mem_cell:learned_hours", 336.0)
+
+    # Vision proto-object defaults: unknowns should begin curious, not important.
+    orch.kv_store.setdefault("vision:proto:enabled", True)
+    orch.kv_store.setdefault("vision:proto:crop_px", 160)
+    orch.kv_store.setdefault("vision:proto:min_repeat", 3)
+    orch.kv_store.setdefault("vision:proto:max_tracks", 32)
+    orch.kv_store.setdefault("vision:proto:stale_s", 45.0)
+    orch.kv_store.setdefault("vision:proto:match_max_bits", 10)
+    orch.kv_store.setdefault("vision:proto:focus_proximity", 0.18)
+    orch.kv_store.setdefault("vision:proto:curiosity_start", 0.72)
+    orch.kv_store.setdefault("vision:proto:importance_start", 0.15)
+    orch.kv_store.setdefault("vision:proto:self_reinforce", 0.05)
+    orch.kv_store.setdefault("vision:proto:question_threshold", 0.86)
+    orch.kv_store.setdefault("vision:proto:question_cooldown_s", 90.0)
+    orch.kv_store.setdefault("vision:proto:emit_internal_notes", True)
+    orch.kv_store.setdefault("vision:proto:speak_questions", False)
+    orch.kv_store.setdefault("concept:proto_confirm", 1)
+    orch.kv_store.setdefault("vision:gaze_state", {"x": 0.5, "y": 0.5, "radius": 0.12, "mode": "roam"})
+    orch.kv_store.setdefault("vision:gaze:budget_refill_per_s", 0.14)
+    orch.kv_store.setdefault("vision:gaze:roam_dwell_s", 1.6)
+    orch.kv_store.setdefault("vision:gaze:inspect_dwell_s", 1.0)
+    orch.kv_store.setdefault("vision:gaze:settle_s", 0.22)
+    orch.kv_store.setdefault("vision:gaze:emit_state_notes", False)
+    orch.kv_store.setdefault("vision:workspace:ttl_s", 25.0)
+    orch.kv_store.setdefault("vision:workspace:min_repeat", 3)
+    orch.kv_store.setdefault("vision:workspace:commit_stability", 0.58)
 
     # Evidence recorder / hazard gating (split raw streams; OFF unless armed).
     orch.kv_store.setdefault("er:enabled", True)
@@ -568,16 +585,6 @@ async def main_async(cfg: AppConfig):
             )
 
     asyncio.create_task(_clock_tick_loop())
-
-    # Background read organ: keep file chewing out of Textual / interaction.
-    read_sidecar = None
-    try:
-        from microbrain.sidecars.read_sidecar import ReadSidecar
-
-        read_sidecar = ReadSidecar(orch, memdir=cfg.memdir)
-        await read_sidecar.start()
-    except Exception as exc:
-        logger.warning("Read sidecar failed to start: %s", exc)
 
     if getattr(cfg, "ui", "repl") == "textual":
         logger.info("Starting Textual UI …")

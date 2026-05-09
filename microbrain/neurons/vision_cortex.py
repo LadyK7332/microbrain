@@ -17,6 +17,7 @@ class VisionCortexNeuron(BaseNeuron):
 
     Listens on:
         - "percept/vision"
+        - "vision/percept_commit"
 
     Behavior:
         - Takes structured vision events (description + objects).
@@ -36,17 +37,22 @@ class VisionCortexNeuron(BaseNeuron):
             meta=event.meta,
         )
 
-        if event.topic != "percept/vision":
+        if event.topic not in ("percept/vision", "vision/percept_commit"):
             return []
 
         payload = event.payload or {}
         if not isinstance(payload, dict):
             return []
 
-        description = str(payload.get("description", "") or "").strip()
-        objects = payload.get("objects", []) or []
-        if not isinstance(objects, list):
-            objects = [str(objects)]
+        if event.topic == "vision/percept_commit":
+            description = str(payload.get("text", "") or "").strip()
+            resolved_label = str(payload.get("resolved_label", "") or "").strip()
+            objects = [resolved_label] if resolved_label else [str(payload.get("fallback_ref", "that thing") or "that thing")]
+        else:
+            description = str(payload.get("description", "") or "").strip()
+            objects = payload.get("objects", []) or []
+            if not isinstance(objects, list):
+                objects = [str(objects)]
 
         # If we literally have nothing, don't create a ghost memory
         if not description and not objects:
@@ -60,7 +66,7 @@ class VisionCortexNeuron(BaseNeuron):
         text_parts: List[str] = []
         if description:
             text_parts.append(description)
-        if objects:
+        if objects and event.topic != "vision/percept_commit":
             obj_list = ", ".join(str(o) for o in objects[:8])
             text_parts.append(f"(I recognized: {obj_list})")
 
@@ -78,7 +84,11 @@ class VisionCortexNeuron(BaseNeuron):
             return []
 
         try:
-            node = hrm.observe(vision_text, role="vision", meta={"modality": "vision"})
+            node = hrm.observe(
+                vision_text,
+                role="vision",
+                meta={"modality": "vision", "source_topic": event.topic},
+            )
         except Exception as exc:
             await ctx.log_error(
                 f"[{self.name}] Error writing visual memory to HRM",
@@ -136,7 +146,7 @@ class VisionCortexNeuron(BaseNeuron):
 def build_neurons(orchestrator: Orchestrator):
     cfg = NeuronConfig(
         name=NEURON_NAME,
-        subscribed_topics=["percept/vision"],
+        subscribed_topics=["percept/vision", "vision/percept_commit"],
         output_topics=["reason/output", "act/speech"],
         priority=4,  # after raw percepts, before higher-level reasoning
     )

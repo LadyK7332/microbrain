@@ -7,7 +7,7 @@ import time
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from microbrain.orchestrator.neuron_base import BaseNeuron, NeuronConfig, Event
 from microbrain.memory.filters import classify_event_for_memory
@@ -54,6 +54,8 @@ class ConceptBinderNeuron(BaseNeuron):
         now = time.time()
 
         # ---- Update recent buffers ----
+        out: List[Event] = []
+
         if event.topic == "percept/text":
             guard = classify_event_for_memory(event)
             if not guard.get("allow_pattern", False):
@@ -66,20 +68,48 @@ class ConceptBinderNeuron(BaseNeuron):
                     items = items[-max_recent_text:]
                 recents["text"] = items
 
-                # If this looks like a label, attempt binding immediately.
-                if self._looks_like_label(text):
+                label_candidate = self._extract_teaching_label(text)
+                explicit_teach = label_candidate is not None
+                if label_candidate is None and self._looks_like_label(text):
+                    label_candidate = text
+
+                if label_candidate:
+                    effective_confirm = int(await ctx.get_kv("concept:proto_confirm", 1 if explicit_teach else confirm) or (1 if explicit_teach else confirm))
                     self._try_bind_label(
-                        label=text,
+                        label=label_candidate,
                         now=now,
                         window_sec=window_sec,
                         recents=recents,
                         pending=pending,
                         committed=committed,
-                        confirm=confirm,
+                        confirm=effective_confirm,
                         ctx=ctx,
                     )
 
-        elif event.topic in ("percept/vision", "percept/audio", "percept/touch"):
+                    proto_recent = self._recent_proto_object(recents=recents, now=now, window_sec=window_sec)
+                    if proto_recent is not None:
+                        proto_payload = proto_recent.get("payload", {}) if isinstance(proto_recent, dict) else {}
+                        proto_id = str((proto_payload or {}).get("proto_id", "") or "").strip()
+                        if proto_id:
+                            out.append(
+                                Event(
+                                    topic="vision/proto_label",
+                                    payload={
+                                        "proto_id": proto_id,
+                                        "label": label_candidate,
+                                        "source_text": text,
+                                        "explicit": explicit_teach,
+                                    },
+                                    source=self.name,
+                                    correlation_id=event.correlation_id,
+                                    meta={
+                                        "kind": "vision_proto_label",
+                                        "explicit": explicit_teach,
+                                    },
+                                )
+                            )
+
+        elif event.topic in ("percept/vision", "percept/audio", "percept/touch", "vision/proto_object"):
             # Keep only the latest item per channel (cheap STM)
             recents[event.topic] = {
                 "ts": now,
@@ -93,7 +123,7 @@ class ConceptBinderNeuron(BaseNeuron):
         await ctx.set_kv("concept:pending", pending)
         await ctx.set_kv("concept:committed", committed)
 
-        return []
+        return out
 
     # ----------------------------
     # Binding logic
@@ -111,7 +141,7 @@ class ConceptBinderNeuron(BaseNeuron):
     ) -> None:
         # Gather any recent sensory items in the time window
         bindings: Dict[str, Dict[str, Any]] = {}
-        for topic in ("percept/vision", "percept/audio", "percept/touch"):
+        for topic in ("vision/proto_object", "percept/vision", "percept/audio", "percept/touch"):
             item = recents.get(topic)
             if not isinstance(item, dict):
                 continue
@@ -203,6 +233,30 @@ class ConceptBinderNeuron(BaseNeuron):
         words = _WORD_RE.findall(text)
         return len(words) == 1 and words[0] == text and 1 <= len(text) <= 24
 
+
+    def _extract_teaching_label(self, text: str) -> Optional[str]:
+        patterns = [
+            re.compile(r"^(?:oh\s+)?(?:that|this|it)(?:'s|\s+is)\s+(?:an?\s+)?([a-z][a-z0-9_\-']{0,31})$"),
+            re.compile(r"^(?:that|this|it)\s+is\s+called\s+([a-z][a-z0-9_\-']{0,31})$"),
+            re.compile(r"^call\s+(?:that|this|it)\s+([a-z][a-z0-9_\-']{0,31})$"),
+        ]
+        for pat in patterns:
+            m = pat.match(text)
+            if not m:
+                continue
+            label = str(m.group(1) or '').strip().lower()
+            if label:
+                return label
+        return None
+
+    def _recent_proto_object(self, *, recents: Dict[str, Any], now: float, window_sec: float) -> Optional[Dict[str, Any]]:
+        item = recents.get('vision/proto_object')
+        if not isinstance(item, dict):
+            return None
+        if (now - float(item.get('ts', 0.0))) > window_sec:
+            return None
+        return item
+
     def _sig_for_payload(self, payload: Any) -> str:
         # Try to find an obvious stable identity first
         if isinstance(payload, dict):
@@ -224,6 +278,7 @@ def build_neurons(orchestrator):
         subscribed_topics=[
             "percept/text",
             "percept/vision",  # already used elsewhere in your stack
+            "vision/proto_object",
             "percept/audio",   # produced by cochlear_neuron
             "percept/touch",   # reserved for later tactile wiring
         ],

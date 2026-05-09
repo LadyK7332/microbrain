@@ -480,6 +480,17 @@ class NativeResponderNeuron(BaseNeuron):
             )
             answer, confidence, answer_meta = compose_answer(bundle)
             if answer:
+                selected_cell_ids = [
+                    str(cell_id or "")
+                    for cell_id in list(answer_meta.get("selected_cell_ids", []) or [])
+                    if str(cell_id or "")
+                ]
+                if selected_cell_ids and isinstance(mem_store, MemCellStore):
+                    for cell_id in selected_cell_ids[:6]:
+                        try:
+                            mem_store.note_cell_usage(cell_id, success=True)
+                        except Exception:
+                            pass
                 await ctx.set_kv(
                     "composer:last_answer_bundle",
                     {
@@ -488,6 +499,7 @@ class NativeResponderNeuron(BaseNeuron):
                         "answer": answer,
                         "confidence": confidence,
                         "meta": answer_meta,
+                        "selected_cell_ids": selected_cell_ids,
                         "ts": time.time(),
                     },
                 )
