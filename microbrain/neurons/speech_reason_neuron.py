@@ -81,13 +81,102 @@ class SpeechReasonNeuron(BaseNeuron):
         style = str(payload.get("style", "") or "")
         message = str(payload.get("message", "") or "")
         vector = payload.get("vector", {}) if isinstance(payload.get("vector", {}), dict) else {}
-        options = [need, style, message, str(vector.get("message", "") or "")]
+        pending_text = str(payload.get("pending_text", "") or "")
+        options = [need, style, message, pending_text, str(vector.get("message", "") or "")]
         if need == "power":
             options.extend(["power low", "battery low", "cookie", "charge", "need help", "power request"])
         elif need == "interaction":
             options.extend(["interaction pressure", "reply needed", "open thread", "clarify response", "social response"])
         query = " ".join(part for part in options if part)
         return self._clean_text(query)
+
+    def _syntax_lookup_text(self, payload: Dict[str, Any]) -> str:
+        pending = self._clean_text(str(payload.get("pending_text", "") or ""))
+        if pending:
+            return pending
+        message = self._clean_text(str(payload.get("message", "") or ""))
+        return message
+
+    def _meta_ddna_targets(self, meta: Dict[str, Any]) -> Dict[str, float]:
+        raw = meta.get("ddna_targets", {}) if isinstance(meta, dict) else {}
+        out: Dict[str, float] = {}
+        if isinstance(raw, dict):
+            for key, value in raw.items():
+                name = self._norm(str(key or "")).replace(" ", "_")
+                if not name:
+                    continue
+                out[name] = max(out.get(name, 0.0), abs(self._safe_float(value, 1.0)))
+        elif isinstance(raw, (list, tuple, set)):
+            for item in raw:
+                name = self._norm(str(item or "")).replace(" ", "_")
+                if name:
+                    out[name] = max(out.get(name, 0.0), 1.0)
+        return out
+
+    def _ddna_bonus(self, meta: Dict[str, Any], *, need: str, style: str) -> float:
+        targets = self._meta_ddna_targets(meta)
+        if not targets:
+            return 0.0
+        bonus = 0.0
+        need = str(need or "")
+        style = str(style or "")
+        if need == "interaction":
+            if "warmth" in targets:
+                bonus += min(0.12, targets["warmth"] * 0.035)
+            if "friendly" in targets:
+                bonus += min(0.12, targets["friendly"] * 0.035)
+            if "supportive" in targets:
+                bonus += min(0.08, targets["supportive"] * 0.025)
+        if style in ("direct_simple", "gentle_notice"):
+            if "direct" in targets:
+                bonus += min(0.06, targets["direct"] * 0.02)
+            if style == "gentle_notice" and "gentle" in targets:
+                bonus += min(0.08, targets["gentle"] * 0.025)
+        return round(min(0.28, bonus), 4)
+
+    def _syntax_guidance(self, mem_cell_store: MemCellStore | None, lookup_text: str) -> Dict[str, Any]:
+        guidance: Dict[str, Any] = {"preferred_replies": [], "avoid_replies": [], "ddna_targets": {}, "classifiers": []}
+        if not isinstance(mem_cell_store, MemCellStore) or not lookup_text:
+            return guidance
+        try:
+            hits = mem_cell_store.search_text_cells(lookup_text, limit=16, tiers=("learned", "long", "now", "short"))
+        except Exception:
+            return guidance
+        seen_reply: set[str] = set()
+        seen_avoid: set[str] = set()
+        for hit in hits:
+            if not isinstance(hit, dict):
+                continue
+            meta = hit.get("meta", {}) if isinstance(hit.get("meta", {}), dict) else {}
+            kind = str(hit.get("kind", "") or meta.get("kind", "") or "")
+            if kind not in {"syntax_rule", "trainer_alignment"}:
+                continue
+            score = self._safe_float(hit.get("score", 0.0), 0.0)
+            ddna = self._meta_ddna_targets(meta)
+            for key, value in ddna.items():
+                guidance["ddna_targets"][key] = max(float(guidance["ddna_targets"].get(key, 0.0)), value)
+            for classifier in list(meta.get("syntax_classifiers", []) or []):
+                name = self._norm(str(classifier or "")).replace(" ", "_")
+                if name and name not in guidance["classifiers"]:
+                    guidance["classifiers"].append(name)
+            reply = self._clean_text(str(meta.get("reply_text", "") or meta.get("desired_utterance", "") or ""))
+            if reply and not self._is_bad_candidate(reply):
+                norm = self._norm(reply)
+                if norm and norm not in seen_reply:
+                    seen_reply.add(norm)
+                    guidance["preferred_replies"].append({"text": reply, "score": score, "meta": meta})
+            for avoid in list(meta.get("avoid_replies", []) or []):
+                avoid_text = self._clean_text(str(avoid or ""))
+                norm = self._norm(avoid_text)
+                if avoid_text and norm and norm not in seen_avoid:
+                    seen_avoid.add(norm)
+                    guidance["avoid_replies"].append(avoid_text)
+            bad = self._clean_text(str(meta.get("bad_utterance", "") or meta.get("trainer_bad_utterance", "") or ""))
+            norm_bad = self._norm(bad)
+            if bad and norm_bad and norm_bad not in seen_avoid:
+                seen_avoid.add(norm_bad)
+                guidance["avoid_replies"].append(bad)
+        return guidance
 
     def _style_score(self, text: str, style: str) -> float:
         style = str(style or "direct_simple")
@@ -146,14 +235,31 @@ class SpeechReasonNeuron(BaseNeuron):
 
     async def _score_candidates(self, ctx, payload: Dict[str, Any], candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         recent = await self._recent_speech_state(ctx)
+        mem_cell_store = await ctx.get_kv("memory:mem_cell_store", None)
+        lookup_text = self._syntax_lookup_text(payload)
+        guidance = self._syntax_guidance(mem_cell_store if isinstance(mem_cell_store, MemCellStore) else None, lookup_text)
+        avoid_norms = {self._norm(text) for text in list(guidance.get("avoid_replies", []) or []) if self._norm(str(text or ""))}
+        need = str(payload.get("need", "") or "")
+        style = str(payload.get("style", "direct_simple") or "direct_simple")
         scored: List[Dict[str, Any]] = []
         for candidate in candidates:
             item = dict(candidate)
             score = self._safe_float(item.get("score", 0.0), 0.0)
+            cand_norm = self._norm(str(item.get("text", "") or ""))
+            if cand_norm and cand_norm in avoid_norms:
+                item["syntax_avoid"] = True
+                item["score"] = 0.0
+                scored.append(item)
+                continue
             penalty = self._repeat_penalty(payload, item, recent)
             if penalty > 0.0:
                 score = max(0.0, score - penalty)
                 item["repeat_penalty"] = penalty
+            meta = item.get("meta", {}) if isinstance(item.get("meta", {}), dict) else {}
+            ddna_bonus = self._ddna_bonus(meta, need=need, style=style)
+            if ddna_bonus:
+                score += ddna_bonus
+                item["ddna_bonus"] = ddna_bonus
             item["score"] = round(score, 4)
             scored.append(item)
         return scored
@@ -211,6 +317,7 @@ class SpeechReasonNeuron(BaseNeuron):
                 + role_bonus
                 + kind_bonus
                 + self._style_score(text, style)
+                + self._ddna_bonus(meta, need=need, style=style)
                 - rank_penalty,
             )
             out.append({
@@ -219,6 +326,7 @@ class SpeechReasonNeuron(BaseNeuron):
                 "role": role,
                 "score": round(score, 4),
                 "kind": kind or "semantic",
+                "meta": meta,
             })
         return out
 
@@ -278,6 +386,7 @@ class SpeechReasonNeuron(BaseNeuron):
                 + role_bonus
                 + trainer_bonus
                 + self._style_score(text, style)
+                + self._ddna_bonus(meta, need=need, style=style)
                 - (rank * 0.012),
             )
             row_tier = str(row.get("tier", "now") or "now")
@@ -290,6 +399,7 @@ class SpeechReasonNeuron(BaseNeuron):
                 "kind": kind or "mem_cell",
                 "cell_id": str(row.get("cell_id", "") or ""),
                 "tier": row_tier,
+                "meta": meta,
             })
         return out
 
@@ -313,6 +423,22 @@ class SpeechReasonNeuron(BaseNeuron):
         mem_cell_store = await ctx.get_kv("memory:mem_cell_store", None)
         if isinstance(mem_cell_store, MemCellStore):
             try:
+                guidance = self._syntax_guidance(mem_cell_store, self._syntax_lookup_text(payload))
+                for reply in list(guidance.get("preferred_replies", []) or [])[:4]:
+                    if not isinstance(reply, dict):
+                        continue
+                    reply_text = self._clean_text(str(reply.get("text", "") or ""))
+                    if not reply_text or self._is_bad_candidate(reply_text):
+                        continue
+                    meta = reply.get("meta", {}) if isinstance(reply.get("meta", {}), dict) else {}
+                    candidates.append({
+                        "text": reply_text,
+                        "source": "syntax_rule",
+                        "role": "assistant",
+                        "score": round(0.72 + min(0.18, self._safe_float(reply.get("score", 0.0), 0.0)), 4),
+                        "kind": "syntax_rule_reply",
+                        "meta": meta,
+                    })
                 candidates.extend(self._memcell_candidates(mem_cell_store, query=query, need=need, style=style))
             except Exception as exc:
                 await ctx.log_debug(f"[{self.name}] mem-cell candidate search failed", error=repr(exc))

@@ -38,6 +38,24 @@ def _looks_stock_reply(text: str) -> bool:
     return norm.startswith("i heard your question") or norm.startswith("i heard you")
 
 
+def _accent_from_meta(raw_meta: Mapping[str, Any]) -> tuple[float, float, str]:
+    try:
+        value = float(raw_meta.get("accent_value", 0.0) or 0.0)
+    except Exception:
+        value = 0.0
+    if value < -10.0:
+        value = -10.0
+    if value > 10.0:
+        value = 10.0
+    try:
+        intensity = float(raw_meta.get("accent_intensity", abs(value)) or abs(value))
+    except Exception:
+        intensity = abs(value)
+    intensity = max(0.0, min(10.0, intensity))
+    label = str(raw_meta.get("tone_label", "") or "").strip()
+    return value, intensity, label
+
+
 class NativeResponderNeuron(BaseNeuron):
     """
     Default non-LLM responder.
@@ -52,6 +70,101 @@ class NativeResponderNeuron(BaseNeuron):
       - whether to clarify before overcommitting
       - whether to externalize a thought at all when the request is weak
     """
+
+    def _meta_ddna_targets(self, meta: Dict[str, Any]) -> Dict[str, float]:
+        raw = meta.get("ddna_targets", {}) if isinstance(meta, Mapping) else {}
+        out: Dict[str, float] = {}
+        if isinstance(raw, Mapping):
+            for key, value in raw.items():
+                name = _norm(str(key or "")).replace(" ", "_")
+                if not name:
+                    continue
+                out[name] = max(out.get(name, 0.0), abs(_safe_float(value, 1.0)))
+        elif isinstance(raw, (list, tuple, set)):
+            for item in raw:
+                name = _norm(str(item or "")).replace(" ", "_")
+                if name:
+                    out[name] = max(out.get(name, 0.0), 1.0)
+        return out
+
+    def _ddna_bonus(self, meta: Dict[str, Any], *, warm: float = 0.0) -> float:
+        targets = self._meta_ddna_targets(meta)
+        if not targets:
+            return 0.0
+        bonus = 0.0
+        if "warmth" in targets:
+            bonus += min(0.12, targets["warmth"] * (0.025 + 0.015 * max(0.0, warm)))
+        if "friendly" in targets:
+            bonus += min(0.12, targets["friendly"] * 0.035)
+        if "supportive" in targets:
+            bonus += min(0.08, targets["supportive"] * 0.025)
+        if "gentle" in targets:
+            bonus += min(0.06, targets["gentle"] * 0.02)
+        return round(min(0.28, bonus), 4)
+
+    def _syntax_guidance(self, mem_store: Any, lookup_text: str) -> Dict[str, Any]:
+        guidance: Dict[str, Any] = {"preferred_replies": [], "avoid_replies": [], "ddna_targets": {}, "classifiers": []}
+        if not isinstance(mem_store, MemCellStore) or not str(lookup_text or "").strip():
+            return guidance
+        try:
+            hits = mem_store.search_text_cells(lookup_text, limit=16, tiers=("learned", "long", "now", "short"))
+        except Exception:
+            return guidance
+
+        seen_reply: set[str] = set()
+        seen_avoid: set[str] = set()
+        for hit in hits:
+            if not isinstance(hit, Mapping):
+                continue
+            meta = dict(hit.get("meta", {}) or {})
+            kind = str(hit.get("kind", "") or meta.get("kind", "") or "")
+            if kind not in {"syntax_rule", "trainer_alignment"}:
+                continue
+            score = _safe_float(hit.get("score", 0.0), 0.0)
+            for key, value in self._meta_ddna_targets(meta).items():
+                guidance["ddna_targets"][key] = max(float(guidance["ddna_targets"].get(key, 0.0)), value)
+            for classifier in list(meta.get("syntax_classifiers", []) or []):
+                name = _norm(str(classifier or "")).replace(" ", "_")
+                if name and name not in guidance["classifiers"]:
+                    guidance["classifiers"].append(name)
+            reply = str(meta.get("reply_text", "") or meta.get("desired_utterance", "") or "").strip()
+            if reply and not _looks_stock_reply(reply):
+                norm = _norm(reply)
+                if norm and norm not in seen_reply:
+                    seen_reply.add(norm)
+                    guidance["preferred_replies"].append({"text": reply, "score": score, "meta": meta})
+            for avoid in list(meta.get("avoid_replies", []) or []):
+                avoid_text = str(avoid or "").strip()
+                norm = _norm(avoid_text)
+                if avoid_text and norm and norm not in seen_avoid:
+                    seen_avoid.add(norm)
+                    guidance["avoid_replies"].append(avoid_text)
+            bad = str(meta.get("bad_utterance", "") or meta.get("trainer_bad_utterance", "") or "").strip()
+            norm_bad = _norm(bad)
+            if bad and norm_bad and norm_bad not in seen_avoid:
+                seen_avoid.add(norm_bad)
+                guidance["avoid_replies"].append(bad)
+        return guidance
+
+    def _preferred_rule_reply(self, guidance: Dict[str, Any], *, warm: float) -> str:
+        avoid_norms = {_norm(text) for text in list(guidance.get("avoid_replies", []) or []) if _norm(str(text or ""))}
+        best_text = ""
+        best_score = 0.0
+        for item in list(guidance.get("preferred_replies", []) or []):
+            if not isinstance(item, Mapping):
+                continue
+            text = str(item.get("text", "") or "").strip()
+            if not text:
+                continue
+            norm = _norm(text)
+            if not norm or norm in avoid_norms or _looks_stock_reply(text):
+                continue
+            meta = dict(item.get("meta", {}) or {})
+            score = _safe_float(item.get("score", 0.0), 0.0) + self._ddna_bonus(meta, warm=warm)
+            if score > best_score:
+                best_text = text
+                best_score = score
+        return best_text if best_score >= 0.35 else ""
 
     async def process(self, event: Event, ctx) -> Iterable[Event]:
         self.debug(
@@ -83,7 +196,7 @@ class NativeResponderNeuron(BaseNeuron):
         if channel in ("internal", "thought"):
             return []
 
-        shape = await self._shape_reply(ctx, text=text, channel=channel, transport_source=transport_source)
+        shape = await self._shape_reply(ctx, text=text, channel=channel, transport_source=transport_source, raw_meta=raw_meta)
         if shape.get("suppress", False):
             await ctx.log_debug(
                 f"[{self.name}] Suppressed outward native reply",
@@ -126,13 +239,17 @@ class NativeResponderNeuron(BaseNeuron):
             )
         ]
 
-    async def _shape_reply(self, ctx, *, text: str, channel: str, transport_source: str) -> Dict[str, Any]:
+    async def _shape_reply(self, ctx, *, text: str, channel: str, transport_source: str, raw_meta: Mapping[str, Any] | None = None) -> Dict[str, Any]:
         hormones = await ctx.get_kv("drive:hormones", {}) or {}
         wants = await ctx.get_kv("drive:want_vector", {}) or {}
         ddna = await ctx.get_kv("drive:ddna_modulators", {}) or {}
         atomized = await ctx.get_kv("language:last_atomized", {}) or {}
         rosehip = await ctx.get_kv("drive:rosehip", {}) or {}
         needs = await ctx.get_kv("drive:needs_stack", {}) or {}
+        social_interaction = await ctx.get_kv("drive:social_interaction", {}) or {}
+        social_experimentation = await ctx.get_kv("drive:social_experimentation", {}) or {}
+        raw_meta = raw_meta if isinstance(raw_meta, Mapping) else {}
+        accent_value, accent_intensity, tone_label = _accent_from_meta(raw_meta)
 
         text_norm = _norm(text)
         is_question = text.strip().endswith("?")
@@ -149,6 +266,8 @@ class NativeResponderNeuron(BaseNeuron):
         withhold = _safe_float(wants.get("withhold", 0.0))
         inquire = _safe_float(wants.get("inquire", 0.0))
         connect = _safe_float(wants.get("connect", 0.0))
+        social_level = _safe_float(social_interaction.get("level", 0.0), 0.0) if isinstance(social_interaction, Mapping) else 0.0
+        social_experiment_pressure = _safe_float(social_experimentation.get("pressure", 0.0), 0.0) if isinstance(social_experimentation, Mapping) else 0.0
         caution = _safe_float(hormones.get("caution", 0.0))
         affiliation = _safe_float(hormones.get("affiliation", 0.0))
         continuity = _safe_float(hormones.get("continuity", 0.0))
@@ -166,8 +285,14 @@ class NativeResponderNeuron(BaseNeuron):
             direct_bonus += 0.24
         if transport_source in ("textual", "cli", "ui", "mic"):
             direct_bonus += 0.12
+        if accent_intensity >= 7.0:
+            # High explicit tone/intensity is a stronger bid for attention, not literal content.
+            direct_bonus += min(0.14, accent_intensity / 100.0)
+        elif accent_intensity <= 0.25 and raw_meta.get("accent_source") == "acc_command":
+            # /acc 0 = intentionally flat/dead tone; treat as lower expressive pressure.
+            direct_bonus -= 0.04
 
-        outward_urge = _clamp((externalize * expression_bias) + (0.18 * connect) + (0.10 * continuity) + direct_bonus)
+        outward_urge = _clamp((externalize * expression_bias) + (0.18 * connect) + (0.10 * continuity) + (0.08 * social_level) + direct_bonus)
         brake = _clamp((withhold * restraint_bias) + (0.10 * caution))
 
         if not isinstance(rosehip, Mapping) or not rosehip:
@@ -226,6 +351,9 @@ class NativeResponderNeuron(BaseNeuron):
         warm = _clamp(
             (0.40 * affiliation)
             + (0.18 * connect)
+            + (0.10 * social_level)
+            + (0.05 * social_experiment_pressure)
+            + (0.03 * max(0.0, accent_value) / 10.0)
             + (0.12 * expression_bias)
             - (0.10 * restraint_bias)
             - (0.18 * social_brake)
@@ -280,6 +408,11 @@ class NativeResponderNeuron(BaseNeuron):
             "clarify_first": round(clarify_first, 4),
             "expression_bias": round(expression_bias, 4),
             "restraint_bias": round(restraint_bias, 4),
+            "social_level": round(social_level, 4),
+            "social_experiment_pressure": round(social_experiment_pressure, 4),
+            "accent_value": round(accent_value, 4),
+            "accent_intensity": round(accent_intensity, 4),
+            "tone_label": tone_label,
         }
 
     async def _build_response(self, ctx, *, text: str, shape: Dict[str, Any], payload: Dict[str, Any]) -> str:
@@ -307,6 +440,9 @@ class NativeResponderNeuron(BaseNeuron):
         terse = _safe_float(shape.get("terse", 0.0))
         warm = _safe_float(shape.get("warm", 0.0))
         mode = str(shape.get("mode", "direct") or "direct")
+        syntax_guidance = self._syntax_guidance(mem_store, text)
+        syntax_reply = self._preferred_rule_reply(syntax_guidance, warm=warm)
+        avoid_norms = {_norm(t) for t in list(syntax_guidance.get("avoid_replies", []) or []) if _norm(str(t or ""))}
 
         def choose(short: str, medium: str, warmish: str | None = None) -> str:
             if warm >= 0.55 and warmish:
@@ -328,7 +464,7 @@ class NativeResponderNeuron(BaseNeuron):
                     if not candidate:
                         continue
                     candidate_norm = _norm(candidate)
-                    if not candidate_norm or candidate_norm == norm or _looks_stock_reply(candidate):
+                    if not candidate_norm or candidate_norm == norm or candidate_norm in avoid_norms or _looks_stock_reply(candidate):
                         continue
                     if candidate.startswith("/") or len(candidate.split()) > 18:
                         continue
@@ -356,13 +492,17 @@ class NativeResponderNeuron(BaseNeuron):
                     if not candidate:
                         candidate = str(hit.get("anchor_text", "") or "").strip()
                     candidate_norm = _norm(candidate)
-                    if not candidate_norm or candidate_norm == norm or _looks_stock_reply(candidate):
+                    if not candidate_norm or candidate_norm == norm or candidate_norm in avoid_norms or _looks_stock_reply(candidate):
                         continue
                     if candidate.startswith("/") or len(candidate.split()) > 18:
                         continue
                     if text.strip().endswith("?") and not candidate.strip().endswith(("?", ".")):
                         candidate = candidate.rstrip() + "."
-                    score = _safe_float(hit.get("score", 0.0), 0.0) + (0.06 if role in ("assistant", "system") else 0.0)
+                    score = (
+                        _safe_float(hit.get("score", 0.0), 0.0)
+                        + (0.06 if role in ("assistant", "system") else 0.0)
+                        + self._ddna_bonus(meta, warm=warm)
+                    )
                     if score > best_score:
                         best_text = candidate
                         best_score = score
@@ -370,6 +510,9 @@ class NativeResponderNeuron(BaseNeuron):
             return best_text if best_score >= 0.48 else ""
 
         recalled_phrase = best_recalled_phrase()
+
+        if syntax_reply:
+            return syntax_reply
 
         if norm in ("hi", "hello", "hey", "yo", "howdy"):
             return choose(

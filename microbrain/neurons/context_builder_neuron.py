@@ -79,6 +79,8 @@ class ContextBuilderNeuron(BaseNeuron):
                 self.debug("semantic_lookup_failed", error=repr(exc))
 
         boredom = await ctx.get_kv("drive:boredom", {})
+        social_interaction = await ctx.get_kv("drive:social_interaction", {})
+        social_experimentation = await ctx.get_kv("drive:social_experimentation", {})
         affect = await ctx.get_kv("affect:last", {})
         relation = await ctx.get_kv("relation:last", {})
         goals_crisis = bool(await ctx.get_kv("goals:crisis_mode", False))
@@ -121,6 +123,8 @@ class ContextBuilderNeuron(BaseNeuron):
             },
             "drives": {
                 "boredom": boredom,
+                "social_interaction": social_interaction if isinstance(social_interaction, dict) else {},
+                "social_experimentation": social_experimentation if isinstance(social_experimentation, dict) else {},
             },
             "affect": affect if isinstance(affect, dict) else {},
             "relation": relation if isinstance(relation, dict) else {},
@@ -143,6 +147,8 @@ class ContextBuilderNeuron(BaseNeuron):
             assoc_top=round(top_assoc_score, 3),
             meaningful_tokens=meaningful_tokens,
             boredom=(boredom or {}).get("level", 0.0),
+            social=(social_interaction or {}).get("level", 0.0) if isinstance(social_interaction, dict) else 0.0,
+            social_experiment=(social_experimentation or {}).get("pressure", 0.0) if isinstance(social_experimentation, dict) else 0.0,
             crisis_mode=goals_crisis,
             cues=cues,
         )

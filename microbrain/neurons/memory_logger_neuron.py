@@ -8,6 +8,7 @@ from microbrain.orchestrator.neuron_base import BaseNeuron, NeuronConfig, Event
 from microbrain.orchestrator.orchestrator import Orchestrator
 from microbrain.utils.memdir import resolve_memdir_ctx
 from microbrain.memory.mem_cell_store import MemCellStore
+from microbrain.memory.filters import classify_event_for_memory
 
 
 NEURON_NAME = Path(__file__).stem
@@ -51,9 +52,10 @@ class MemoryLoggerNeuron(BaseNeuron):
         topic = event.topic
         payload = event.payload
 
-        # Skip control/system helper messages (menus, debug UI, etc.)
-        # These are useful operationally, but should not be stored as long-term memory.
-        if (event.meta or {}).get("control") and topic != "control/reinforce":
+        # Skip control/UI-plane helper messages (menus, command confirmations, errors, debug UI, etc.).
+        # These are useful for the operator, but must not become cognition-plane memory.
+        mem_class = classify_event_for_memory(event)
+        if topic != "control/reinforce" and not mem_class.get("allow_longterm", False):
             return []
 
         trainer_pending = bool(await ctx.get_kv("control:t_pending", False))

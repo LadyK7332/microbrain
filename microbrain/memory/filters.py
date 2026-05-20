@@ -6,12 +6,17 @@ from typing import Any, Dict
 from microbrain.orchestrator.neuron_base import Event
 
 _INTERNAL_CHANNELS = {"thought", "internal"}
+_CONTROL_UI_TOPICS = {"ui/status", "ui/error", "control/status", "control/error"}
 _BLOCK_KINDS = {
     "initiative_reflection",
     "internal_reflection",
     "status_introspection",
     "debug",
     "control_reply",
+    "control_status",
+    "control_error",
+    "command_status",
+    "command_error",
 }
 _JUNK_PATTERNS = [
     re.compile(r"^internal reflection only\b", re.I),
@@ -52,6 +57,12 @@ def classify_event_for_memory(event: Event) -> Dict[str, Any]:
     source = source or str(raw_meta.get("source", "") or event_meta.get("source", "") or event.source or "")
     transport_source = str(raw_meta.get("transport_source", source) or source)
     control = bool(event_meta.get("control", False) or (payload.get("control", False) if isinstance(payload, dict) else False))
+    explicit_no_memory = (
+        event_meta.get("store_in_memory") is False
+        or event_meta.get("cognitive_visible") is False
+        or (isinstance(payload, dict) and payload.get("store_in_memory") is False)
+        or (isinstance(payload, dict) and payload.get("cognitive_visible") is False)
+    )
 
     role = "user"
     if event.topic == "act/speech":
@@ -59,11 +70,20 @@ def classify_event_for_memory(event: Event) -> Dict[str, Any]:
     elif source in ("assistant", "system", "internal"):
         role = source
 
-    is_internal = (channel in _INTERNAL_CHANNELS) or (source == "internal") or (kind in _BLOCK_KINDS)
-    is_system = control or role == "system"
+    is_control_ui_topic = event.topic in _CONTROL_UI_TOPICS or event.topic.startswith("ui/")
+    is_internal = (
+        explicit_no_memory
+        or is_control_ui_topic
+        or (channel in _INTERNAL_CHANNELS)
+        or (source == "internal")
+        or (kind in _BLOCK_KINDS)
+    )
+    is_system = control or role == "system" or is_control_ui_topic
     junk_reason = ""
     if not text:
         junk_reason = "empty_text"
+    elif text.lstrip().startswith("/"):
+        junk_reason = "control_command_text"
     else:
         for pat in _JUNK_PATTERNS:
             if pat.search(text):
@@ -84,6 +104,8 @@ def classify_event_for_memory(event: Event) -> Dict[str, Any]:
         "role": role,
         "is_internal": is_internal,
         "is_system": is_system,
+        "is_control_ui_topic": is_control_ui_topic,
+        "explicit_no_memory": explicit_no_memory,
         "junk_reason": junk_reason,
         "allow_longterm": allow_longterm,
         "allow_trace": allow_trace,

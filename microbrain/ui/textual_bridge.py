@@ -41,6 +41,10 @@ async def run_textual_frontend(orch: Orchestrator, *, memdir: str | None = None)
     # - control/vision: confirmations can be emitted elsewhere; still useful
     topics = [
         "act/speech",
+        "ui/status",
+        "ui/error",
+        "control/status",
+        "control/error",
         "reason/request",
         "reason/output",
         "vision/status",

@@ -34,10 +34,15 @@ class MemCellStore:
         self.base_dir = Path(base_dir)
         self.mem_cell_dir = self.base_dir / "mem_cell"
         self.derived_dir = self.base_dir / "mem_cell_derived"
+        self.legacy_dir = self.mem_cell_dir / "_legacy_shards"
         self._stores: Dict[str, JSONLStore] = {}
+        self._tier_rows: Dict[str, List[Dict[str, Any]]] = {}
+        self._tier_index: Dict[str, Dict[str, int]] = {}
+        self._tier_loaded: set[str] = set()
         for tier in TIERS:
             (self.mem_cell_dir / tier).mkdir(parents=True, exist_ok=True)
         self.derived_dir.mkdir(parents=True, exist_ok=True)
+        self.legacy_dir.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
     def _norm_text(text: str) -> str:
@@ -47,38 +52,197 @@ class MemCellStore:
     def _tokenize(text: str) -> List[str]:
         return [t for t in TOKEN_RE.findall((text or "").lower()) if t]
 
-    def _shard_path(self, tier: str) -> Path:
+    def _coerce_tier(self, tier: str) -> str:
         tier = str(tier or "now").strip().lower()
-        if tier not in TIERS:
-            tier = "now"
-        shard = time.strftime(f"{tier}_%Y%m%d.jsonl", time.localtime())
-        return self.mem_cell_dir / tier / shard
+        return tier if tier in TIERS else "now"
+
+    def _shard_path(self, tier: str) -> Path:
+        """Return the canonical, rewritten file for one mem-cell tier.
+
+        Older builds wrote daily append shards like short_20260510.jsonl.
+        Newer builds keep one living file per tier and rewrite it atomically
+        after merging/updating existing cells.
+        """
+        tier = self._coerce_tier(tier)
+        return self.mem_cell_dir / tier / f"{tier}.jsonl"
+
+    def _legacy_paths(self, tier: str) -> List[Path]:
+        tier = self._coerce_tier(tier)
+        tier_dir = self.mem_cell_dir / tier
+        if not tier_dir.exists():
+            return []
+        canonical = self._shard_path(tier).resolve()
+        return [
+            path
+            for path in sorted(tier_dir.glob(f"{tier}_*.jsonl"))
+            if path.resolve() != canonical
+        ]
 
     def _store_for(self, tier: str) -> JSONLStore:
-        tier = str(tier or "now").strip().lower()
-        if tier not in TIERS:
-            tier = "now"
+        tier = self._coerce_tier(tier)
         if tier not in self._stores:
             self._stores[tier] = JSONLStore(str(self._shard_path(tier)))
         return self._stores[tier]
 
-    def _read_shard(self, tier: str) -> List[Dict[str, Any]]:
+    def _rebuild_tier_index(self, tier: str) -> None:
+        tier = self._coerce_tier(tier)
+        self._tier_index[tier] = {
+            str(row.get("id", "") or ""): idx
+            for idx, row in enumerate(self._tier_rows.get(tier, []))
+            if isinstance(row, dict) and str(row.get("id", "") or "")
+        }
+
+    def _merge_cell_rows(
+        self,
+        existing: Dict[str, Any],
+        incoming: Dict[str, Any],
+        *,
+        touch: bool = False,
+    ) -> Dict[str, Any]:
+        now_ts = time.time()
+        old = dict(existing or {})
+        new = dict(incoming or {})
+        merged = dict(old)
+
+        old_ts = float(old.get("ts", old.get("last_seen", now_ts)) or now_ts)
+        new_ts = float(new.get("ts", new.get("last_seen", now_ts)) or now_ts)
+        merged["ts"] = min(old_ts, new_ts)
+        merged["last_seen"] = max(
+            float(old.get("last_seen", old_ts) or old_ts),
+            float(new.get("last_seen", new_ts) or new_ts),
+            now_ts if touch else 0.0,
+        )
+        merged["tier"] = self._coerce_tier(str(new.get("tier", old.get("tier", "now")) or "now"))
+        merged["schema"] = str(new.get("schema", old.get("schema", "mem_cell.v1")) or "mem_cell.v1")
+
+        old_count = max(1, int(old.get("encounter_count", 1) or 1))
+        new_count = max(1, int(new.get("encounter_count", 1) or 1))
+        merged["encounter_count"] = max(old_count, new_count) + (1 if touch else 0)
+        merged["revision"] = max(int(old.get("revision", 0) or 0), int(new.get("revision", 0) or 0)) + (1 if touch else 0)
+
+        merged["activation"] = min(
+            1.0,
+            max(float(old.get("activation", 0.0) or 0.0), float(new.get("activation", 0.0) or 0.0))
+            + (0.08 if touch else 0.0),
+        )
+        merged["promotion"] = min(
+            1.0,
+            max(float(old.get("promotion", 0.0) or 0.0), float(new.get("promotion", 0.0) or 0.0))
+            + (0.03 if touch else 0.0),
+        )
+        merged["decay"] = min(float(old.get("decay", 1.0) or 1.0), float(new.get("decay", 1.0) or 1.0))
+        merged["trust"] = min(1.0, max(float(old.get("trust", 0.5) or 0.5), float(new.get("trust", 0.5) or 0.5)))
+        merged["usage_count"] = max(int(old.get("usage_count", 0) or 0), int(new.get("usage_count", 0) or 0))
+        merged["successful_recalls"] = max(int(old.get("successful_recalls", 0) or 0), int(new.get("successful_recalls", 0) or 0))
+        merged["last_used_ts"] = max(float(old.get("last_used_ts", 0.0) or 0.0), float(new.get("last_used_ts", 0.0) or 0.0))
+
+        for key, limit in (("refs", 32), ("modalities", 8), ("links_explicit", 24)):
+            merged[key] = self._merge_unique_list(list(old.get(key, []) or []), list(new.get(key, []) or []), limit=limit)
+
+        old_anchor = old.get("anchor", {}) if isinstance(old.get("anchor", {}), dict) else {}
+        new_anchor = new.get("anchor", {}) if isinstance(new.get("anchor", {}), dict) else {}
+        merged["anchor"] = {**old_anchor, **{k: v for k, v in new_anchor.items() if v not in (None, "", [])}}
+
+        meta = dict(old.get("meta", {}) or {})
+        meta.update(dict(new.get("meta", {}) or {}))
+        merged["meta"] = meta
+        return merged
+
+    def _dedupe_rows(self, rows: Iterable[Dict[str, Any]], tier: str) -> List[Dict[str, Any]]:
+        tier = self._coerce_tier(tier)
+        by_id: Dict[str, Dict[str, Any]] = {}
+        anonymous: List[Dict[str, Any]] = []
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            row = dict(row)
+            row["tier"] = tier
+            row_id = str(row.get("id", "") or "").strip()
+            if not row_id:
+                anonymous.append(row)
+                continue
+            if row_id in by_id:
+                by_id[row_id] = self._merge_cell_rows(by_id[row_id], row, touch=False)
+            else:
+                by_id[row_id] = row
+        return anonymous + list(by_id.values())
+
+    def _archive_legacy_paths(self, tier: str, paths: Sequence[Path]) -> None:
+        tier = self._coerce_tier(tier)
+        archive_dir = self.legacy_dir / tier
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        for path in paths:
+            try:
+                if not path.exists():
+                    continue
+                target = archive_dir / f"{path.name}.bak"
+                n = 1
+                while target.exists():
+                    target = archive_dir / f"{path.name}.{n}.bak"
+                    n += 1
+                path.replace(target)
+            except Exception:
+                continue
+
+    def _load_tier_rows(self, tier: str) -> List[Dict[str, Any]]:
+        tier = self._coerce_tier(tier)
+        if tier in self._tier_loaded:
+            return self._tier_rows.setdefault(tier, [])
+
         path = self._shard_path(tier)
-        if not path.exists():
-            return []
-        try:
-            return JSONLStore(str(path)).read_all()
-        except Exception:
-            return []
+        rows: List[Dict[str, Any]] = []
+        canonical_count = 0
+        if path.exists():
+            try:
+                canonical_rows = JSONLStore(str(path)).read_all()
+                canonical_count = len(canonical_rows)
+                rows.extend(canonical_rows)
+            except Exception:
+                canonical_count = 0
+
+        legacy_paths = self._legacy_paths(tier)
+        for legacy in legacy_paths:
+            try:
+                rows.extend(JSONLStore(str(legacy)).read_all())
+            except Exception:
+                continue
+
+        rows = self._dedupe_rows(rows, tier)
+        self._tier_rows[tier] = rows
+        self._rebuild_tier_index(tier)
+        self._tier_loaded.add(tier)
+
+        # If we saw legacy daily shards or duplicates, collapse them into the
+        # canonical file once and archive the old append shards.
+        if legacy_paths or (path.exists() and len(rows) != canonical_count):
+            self._write_shard(tier, rows)
+            self._archive_legacy_paths(tier, legacy_paths)
+        elif not path.exists():
+            self._write_shard(tier, rows)
+        return self._tier_rows[tier]
+
+    def _read_shard(self, tier: str) -> List[Dict[str, Any]]:
+        return [dict(row) for row in self._load_tier_rows(tier)]
 
     def _write_shard(self, tier: str, rows: List[Dict[str, Any]]) -> None:
+        tier = self._coerce_tier(tier)
         path = self._shard_path(tier)
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open('w', encoding='utf-8') as f:
+        rows = self._dedupe_rows(rows, tier)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with tmp.open("w", encoding="utf-8") as f:
             for row in rows:
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        tmp.replace(path)
+        self._tier_rows[tier] = rows
+        self._rebuild_tier_index(tier)
+        self._tier_loaded.add(tier)
         if tier in self._stores:
             self._stores[tier] = JSONLStore(str(path))
+
+    def flush_tier(self, tier: str) -> None:
+        tier = self._coerce_tier(tier)
+        self._write_shard(tier, self._load_tier_rows(tier))
 
     def _derived_path(self) -> Path:
         shard = time.strftime("derived_%Y%m%d.jsonl", time.localtime())
@@ -126,11 +290,25 @@ class MemCellStore:
         return out
 
     def append_cell(self, cell: Dict[str, Any], tier: str = "now") -> None:
+        # Canonical memory is update/merge based. append_cell remains as a
+        # compatibility wrapper, but it no longer sprays duplicate rows.
+        self.upsert_cell(cell, tier=tier, touch=True, flush=True)
+
+    def upsert_cell(
+        self,
+        cell: Dict[str, Any],
+        tier: str = "now",
+        *,
+        touch: bool = True,
+        flush: bool = True,
+    ) -> Dict[str, Any]:
         row = dict(cell or {})
+        tier = self._coerce_tier(str(tier or row.get("tier", "now") or "now"))
         row.setdefault("tier", tier)
         row.setdefault("schema", "mem_cell.v1")
-        row.setdefault("ts", time.time())
-        row.setdefault("last_seen", row["ts"])
+        now_ts = time.time()
+        row.setdefault("ts", now_ts)
+        row.setdefault("last_seen", now_ts)
         row.setdefault("encounter_count", 1)
         row.setdefault("revision", 0)
         row.setdefault("links_explicit", [])
@@ -143,66 +321,25 @@ class MemCellStore:
         row.setdefault("usage_count", 0)
         row.setdefault("successful_recalls", 0)
         row.setdefault("last_used_ts", 0.0)
-        self._store_for(tier).append(row)
 
-    def upsert_cell(self, cell: Dict[str, Any], tier: str = "now") -> Dict[str, Any]:
-        row = dict(cell or {})
-        tier = str(tier or row.get('tier', 'now') or 'now').lower()
-        if tier not in TIERS:
-            tier = 'now'
-        row.setdefault('tier', tier)
-        row.setdefault('schema', 'mem_cell.v1')
-        now_ts = time.time()
-        row.setdefault('ts', now_ts)
-        row.setdefault('last_seen', now_ts)
-        row.setdefault('encounter_count', 1)
-        row.setdefault('revision', 0)
-        row.setdefault('links_explicit', [])
-        row.setdefault('refs', [])
-        row.setdefault('modalities', [])
-        row.setdefault('activation', 1.0)
-        row.setdefault('promotion', 0.0)
-        row.setdefault('decay', 1.0)
-        row.setdefault('trust', 0.5)
-        row.setdefault('usage_count', 0)
-        row.setdefault('successful_recalls', 0)
-        row.setdefault('last_used_ts', 0.0)
+        rows = self._load_tier_rows(tier)
+        index = self._tier_index.setdefault(tier, {})
+        row_id = str(row.get("id", "") or "").strip()
 
-        rows = self._read_shard(tier)
-        row_id = str(row.get('id', '') or '')
-        existing_idx = -1
-        for i, existing in enumerate(rows):
-            if isinstance(existing, dict) and str(existing.get('id', '') or '') == row_id:
-                existing_idx = i
-                break
-
-        if existing_idx < 0:
+        if not row_id or row_id not in index:
             rows.append(row)
-            self._write_shard(tier, rows)
+            if row_id:
+                index[row_id] = len(rows) - 1
+            if flush:
+                self._write_shard(tier, rows)
             return row
 
-        existing = dict(rows[existing_idx] or {})
-        existing['last_seen'] = now_ts
-        existing['ts'] = existing.get('ts', now_ts)
-        existing['encounter_count'] = int(existing.get('encounter_count', 1) or 1) + 1
-        existing['revision'] = int(existing.get('revision', 0) or 0) + 1
-        existing['activation'] = min(1.0, float(existing.get('activation', 0.5) or 0.5) + 0.08)
-        existing['promotion'] = min(1.0, float(existing.get('promotion', 0.0) or 0.0) + 0.03)
-        existing['trust'] = min(1.0, max(float(existing.get('trust', 0.5) or 0.5), float(row.get('trust', 0.5) or 0.5)))
-        existing['usage_count'] = max(int(existing.get('usage_count', 0) or 0), int(row.get('usage_count', 0) or 0))
-        existing['successful_recalls'] = max(int(existing.get('successful_recalls', 0) or 0), int(row.get('successful_recalls', 0) or 0))
-        existing['last_used_ts'] = max(float(existing.get('last_used_ts', 0.0) or 0.0), float(row.get('last_used_ts', 0.0) or 0.0))
-        existing['refs'] = self._merge_unique_list(list(existing.get('refs', []) or []), list(row.get('refs', []) or []), limit=24)
-        existing['modalities'] = self._merge_unique_list(list(existing.get('modalities', []) or []), list(row.get('modalities', []) or []), limit=8)
-        existing['links_explicit'] = self._merge_unique_list(list(existing.get('links_explicit', []) or []), list(row.get('links_explicit', []) or []), limit=16)
-
-        # merge meta shallowly while preserving prior values
-        meta = dict(existing.get('meta', {}) or {})
-        meta.update(dict(row.get('meta', {}) or {}))
-        existing['meta'] = meta
-        rows[existing_idx] = existing
-        self._write_shard(tier, rows)
-        return existing
+        existing_idx = index[row_id]
+        merged = self._merge_cell_rows(dict(rows[existing_idx] or {}), row, touch=touch)
+        rows[existing_idx] = merged
+        if flush:
+            self._write_shard(tier, rows)
+        return merged
 
 
     @staticmethod
@@ -708,11 +845,11 @@ class MemCellStore:
         utterance = self.make_text_cell(
             text=text, topic=topic, role=role, transport_source=transport_source, source=source, meta=meta, tier=tier
         )
-        utterance = self.upsert_cell(utterance, tier=tier)
-        token_cells = [self.upsert_cell(c, tier=tier) for c in self.make_token_cells(text=text, parent_id=str(utterance.get('id','')), role=role, tier=tier)]
-        pattern_cells = [self.upsert_cell(c, tier=tier) for c in self.make_pattern_cells(text=text, parent_id=str(utterance.get('id','')), token_cells=token_cells, role=role, tier=tier)]
+        utterance = self.upsert_cell(utterance, tier=tier, touch=True, flush=False)
+        token_cells = [self.upsert_cell(c, tier=tier, touch=True, flush=False) for c in self.make_token_cells(text=text, parent_id=str(utterance.get('id','')), role=role, tier=tier)]
+        pattern_cells = [self.upsert_cell(c, tier=tier, touch=True, flush=False) for c in self.make_pattern_cells(text=text, parent_id=str(utterance.get('id','')), token_cells=token_cells, role=role, tier=tier)]
         general_pattern_cells = [
-            self.upsert_cell(c, tier=tier)
+            self.upsert_cell(c, tier=tier, touch=True, flush=False)
             for c in self.make_general_pattern_cells(
                 text=text,
                 parent_id=str(utterance.get('id','')),
@@ -723,7 +860,7 @@ class MemCellStore:
             )
         ]
         linker_cells = [
-            self.upsert_cell(c, tier=tier)
+            self.upsert_cell(c, tier=tier, touch=True, flush=False)
             for c in self.make_linker_cells(
                 parent_id=str(utterance.get('id','')),
                 general_pattern_cells=general_pattern_cells,
@@ -748,7 +885,8 @@ class MemCellStore:
                 ],
                 limit=16,
             )
-            utterance = self.upsert_cell(utterance, tier=tier)
+            utterance = self.upsert_cell(utterance, tier=tier, touch=False, flush=False)
+        self.flush_tier(tier)
         return {
             'utterance': utterance,
             'tokens': token_cells,
@@ -1150,19 +1288,8 @@ class MemCellStore:
         return {"probed": len(source_rows), "pruned": pruned, "kept": len(kept)}
 
     def _iter_rows(self, tier: str) -> Iterable[Dict[str, Any]]:
-        tier = str(tier or "now").strip().lower()
-        if tier not in TIERS:
-            return []
-        tier_dir = self.mem_cell_dir / tier
-        if not tier_dir.exists():
-            return []
-        rows: List[Dict[str, Any]] = []
-        for path in sorted(tier_dir.glob(f"{tier}_*.jsonl")):
-            try:
-                rows.extend(JSONLStore(str(path)).read_all())
-            except Exception:
-                continue
-        return rows
+        tier = self._coerce_tier(tier)
+        return [dict(row) for row in self._load_tier_rows(tier)]
 
     def search_text_cells(
         self,

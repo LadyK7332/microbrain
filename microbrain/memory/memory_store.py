@@ -18,8 +18,8 @@ except Exception:
 
 class JSONLStore:
     def __init__(self, path: str):
-        self.path = path
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self.path = str(path)
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
         if not os.path.exists(self.path):
             with open(self.path, "w", encoding="utf-8"):  # create empty file
                 pass
@@ -31,6 +31,14 @@ class JSONLStore:
         with self._lock:
             with open(self.path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+    def write_all(self, rows: list[dict]) -> None:
+        tmp = self.path + ".tmp"
+        with self._lock:
+            with open(tmp, "w", encoding="utf-8") as f:
+                for row in rows or []:
+                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            os.replace(tmp, self.path)
 
     def read_all(self) -> list[dict]:
         with self._lock:
@@ -236,6 +244,20 @@ class MemoryStore:
             row = self._ensure_memory_schema(row)
             self.episodic.append(row)
 
+        compact_semantic = self._compact_loaded_memory(self.semantic)
+        if len(compact_semantic) != len(self.semantic):
+            self.semantic = compact_semantic
+            self.sem_file.write_all(self.semantic)
+        else:
+            self.semantic = compact_semantic
+
+        compact_episodic = self._compact_loaded_memory(self.episodic)
+        if len(compact_episodic) != len(self.episodic):
+            self.episodic = compact_episodic
+            self.epi_file.write_all(self.episodic)
+        else:
+            self.episodic = compact_episodic
+
 
     def _ensure_memory_schema(self, item: dict) -> dict:
         """
@@ -293,6 +315,11 @@ class MemoryStore:
             sal.setdefault("salience_updated_ts", item.get("ts", time.time()))
             sal.setdefault("decay_half_life_s", 6.0 * 3600.0)
 
+        item.setdefault("memory_key", self._memory_key(item.get("text", ""), item.get("meta", {})))
+        item.setdefault("last_seen", item.get("ts", time.time()))
+        item.setdefault("encounter_count", 1)
+        item.setdefault("revision", 0)
+
         return item
 
     @staticmethod
@@ -338,6 +365,120 @@ class MemoryStore:
             "age_s": age_s,
         }
 
+    @staticmethod
+    def _norm_memory_text(text: str) -> str:
+        return " ".join(str(text or "").lower().split()).strip()
+
+    def _memory_key(self, text: str, meta: dict | None = None) -> str:
+        meta = meta if isinstance(meta, dict) else {}
+        role = str(meta.get("role", "") or "").strip().lower()
+        kind = str(meta.get("kind", "") or "").strip().lower()
+        channel = str(meta.get("channel", "") or "").strip().lower()
+        norm = self._norm_memory_text(text)[:500]
+        digest = hashlib.blake2b(f"{role}|{kind}|{channel}|{norm}".encode("utf-8", errors="ignore"), digest_size=12).hexdigest()
+        return f"m{digest}"
+
+    @staticmethod
+    def _merge_unique(left: list, right: list, limit: int = 32) -> list:
+        out = []
+        seen = set()
+        for item in list(left or []) + list(right or []):
+            key = json.dumps(item, sort_keys=True, ensure_ascii=False) if isinstance(item, (dict, list)) else repr(item)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(item)
+            if len(out) >= limit:
+                break
+        return out
+
+    def _merge_memory_item(self, existing: dict, incoming: dict) -> dict:
+        now_ts = time.time()
+        old = self._ensure_memory_schema(dict(existing or {}))
+        new = self._ensure_memory_schema(dict(incoming or {}))
+        merged = dict(old)
+        merged["memory_key"] = str(old.get("memory_key") or new.get("memory_key") or self._memory_key(new.get("text", ""), new.get("meta", {})))
+        merged["text"] = str(new.get("text") or old.get("text") or "")
+        if new.get("vec"):
+            merged["vec"] = new.get("vec")
+        merged["ts"] = min(float(old.get("ts", now_ts) or now_ts), float(new.get("ts", now_ts) or now_ts))
+        merged["last_seen"] = max(float(old.get("last_seen", old.get("ts", now_ts)) or now_ts), float(new.get("last_seen", new.get("ts", now_ts)) or now_ts), now_ts)
+        merged["encounter_count"] = max(1, int(old.get("encounter_count", 1) or 1)) + 1
+        merged["revision"] = int(old.get("revision", 0) or 0) + 1
+
+        old_meta = dict(old.get("meta", {}) or {})
+        old_meta.update(dict(new.get("meta", {}) or {}))
+        old_meta.setdefault("schema_ver", 2)
+        merged["meta"] = old_meta
+
+        for ch in ("vision", "audio", "touch", "proprio"):
+            merged.setdefault("senses_present", {}).setdefault(ch, False)
+            merged.setdefault("senses", {}).setdefault(ch, [])
+            merged["senses_present"][ch] = bool(
+                old.get("senses_present", {}).get(ch, False) or new.get("senses_present", {}).get(ch, False)
+            )
+            merged["senses"][ch] = self._merge_unique(
+                list((old.get("senses", {}) or {}).get(ch, []) or []),
+                list((new.get("senses", {}) or {}).get(ch, []) or []),
+                limit=24,
+            )
+
+        old_sal = dict(old.get("salience", {}) or {})
+        new_sal = dict(new.get("salience", {}) or {})
+        sal = dict(old_sal)
+        for k in ("score", "valence", "satisfaction", "arousal"):
+            sal[k] = max(self._safe_float(old_sal.get(k, 0.0), 0.0), self._safe_float(new_sal.get(k, 0.0), 0.0))
+        sal["reinforce_sum"] = self._safe_float(old_sal.get("reinforce_sum", 0.0), 0.0) + self._safe_float(new_sal.get("reinforce_sum", 0.0), 0.0)
+        sal["reinforce_count"] = max(0, int(old_sal.get("reinforce_count", 0) or 0)) + max(0, int(new_sal.get("reinforce_count", 0) or 0))
+        sal["last_reinforced_ts"] = max(
+            self._safe_float(old_sal.get("last_reinforced_ts", 0.0), 0.0),
+            self._safe_float(new_sal.get("last_reinforced_ts", 0.0), 0.0),
+        ) or None
+        sal["reinforcement_pts"] = max(
+            self._safe_float(old_sal.get("reinforcement_pts", 0.0), 0.0),
+            self._safe_float(new_sal.get("reinforcement_pts", 0.0), 0.0),
+        )
+        sal["salience_updated_ts"] = now_ts
+        sal.setdefault("decay_half_life_s", old_sal.get("decay_half_life_s", new_sal.get("decay_half_life_s", 6.0 * 3600.0)))
+        merged["salience"] = sal
+        return self._ensure_memory_schema(merged)
+
+    def _compact_loaded_memory(self, rows: list[dict]) -> list[dict]:
+        by_key: dict[str, dict] = {}
+        anonymous: list[dict] = []
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            row = self._ensure_memory_schema(dict(row))
+            key = str(row.get("memory_key") or self._memory_key(row.get("text", ""), row.get("meta", {})))
+            row["memory_key"] = key
+            if not key:
+                anonymous.append(row)
+                continue
+            if key in by_key:
+                by_key[key] = self._merge_memory_item(by_key[key], row)
+            else:
+                by_key[key] = row
+        return anonymous + list(by_key.values())
+
+    def _upsert_memory_item(self, rows: list[dict], store: JSONLStore, item: dict) -> dict:
+        item = self._ensure_memory_schema(dict(item))
+        key = str(item.get("memory_key") or self._memory_key(item.get("text", ""), item.get("meta", {})))
+        item["memory_key"] = key
+        for idx, existing in enumerate(rows):
+            if not isinstance(existing, dict):
+                continue
+            existing_key = str(existing.get("memory_key") or self._memory_key(existing.get("text", ""), existing.get("meta", {})))
+            if existing_key != key:
+                continue
+            merged = self._merge_memory_item(existing, item)
+            rows[idx] = merged
+            store.write_all(rows)
+            return merged
+        rows.append(item)
+        store.write_all(rows)
+        return item
+
     def add_semantic(self, text: str, meta: dict | None = None, salience: dict | None = None):
         # Try Ollama embeddings first; if unavailable, fall back to local
         try:
@@ -352,25 +493,25 @@ class MemoryStore:
             self.dim = len(vec)
 
         item = {"text": text, "vec": vec, "meta": meta or {}, "ts": time.time()}
+        item["memory_key"] = self._memory_key(text, meta or {})
         if salience is not None:
             salience = dict(salience)
             salience.setdefault("salience_updated_ts", item["ts"])
             salience.setdefault("reinforcement_pts", max(0.0, self._safe_float(salience.get("reinforcement_pts", (0.20 * max(0.0, self._safe_float(salience.get("reinforce_sum", 0.0), 0.0))) + (0.08 * max(0.0, self._safe_float(salience.get("reinforce_count", 0.0), 0.0)))), 0.0)))
             item["salience"] = salience
         item = self._ensure_memory_schema(item)
-        self.semantic.append(item)        
-        self.sem_file.append(item)
+        self._upsert_memory_item(self.semantic, self.sem_file, item)
 
     def add_episodic(self, text: str, meta: dict | None = None, salience: dict | None = None):
         item = {"text": text, "meta": meta or {}, "ts": time.time()}
+        item["memory_key"] = self._memory_key(text, meta or {})
         if salience is not None:
             salience = dict(salience)
             salience.setdefault("salience_updated_ts", item["ts"])
             salience.setdefault("reinforcement_pts", max(0.0, self._safe_float(salience.get("reinforcement_pts", (0.20 * max(0.0, self._safe_float(salience.get("reinforce_sum", 0.0), 0.0))) + (0.08 * max(0.0, self._safe_float(salience.get("reinforce_count", 0.0), 0.0)))), 0.0)))
             item["salience"] = salience
         item = self._ensure_memory_schema(item)
-        self.episodic.append(item)
-        self.epi_file.append(item)
+        self._upsert_memory_item(self.episodic, self.epi_file, item)
 
     def _cosine(self, a: list[float], b: list[float]) -> float:
         if not a or not b:

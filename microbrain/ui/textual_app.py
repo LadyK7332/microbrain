@@ -156,7 +156,11 @@ class MicroBrainUI(App):
             effective_channel = payload_channel or channel
             effective_source = payload_source or transport_source
 
-            if msg.topic == "act/speech" and effective_channel == "thought" and text is not None:
+            if msg.topic in ("ui/error", "control/error") and text is not None:
+                log.write(f"[red]error>[/red] {text}")
+            elif msg.topic in ("ui/status", "control/status") and text is not None:
+                log.write(f"[dim]status>[/dim] {text}")
+            elif msg.topic == "act/speech" and effective_channel == "thought" and text is not None:
                 log.write(f"[magenta]thought>[/magenta] {text}")
             elif msg.topic == "act/speech" and text is not None:
                 log.write(f"[cyan]{self._assistant_label}>[/cyan] {text}")

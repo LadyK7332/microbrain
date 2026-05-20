@@ -35,6 +35,32 @@ def _display_power_pct(pct: Any) -> int:
     return max(0, min(95, bucket))
 
 
+def _clamp_float(value: Any, lo: float, hi: float, default: float = 0.0) -> float:
+    try:
+        v = float(value)
+    except Exception:
+        v = float(default)
+    if v < lo:
+        return lo
+    if v > hi:
+        return hi
+    return v
+
+
+def _tone_label(value: float) -> str:
+    """Human-readable text prosody label for /acc metadata."""
+    mag = abs(float(value or 0.0))
+    if mag <= 0.25:
+        return "flat_dead"
+    if mag < 3.0:
+        return "subdued" if value < 0 else "light"
+    if mag < 7.0:
+        return "normal_expressive" if value >= 0 else "low_energy"
+    if mag < 8.0:
+        return "strong_emphasis"
+    return "high_intensity" if value >= 0 else "high_suppressed_intensity"
+
+
 class TextInputNeuron(BaseNeuron):
     """
     First-stop neuron for incoming text.
@@ -92,8 +118,6 @@ class TextInputNeuron(BaseNeuron):
             )
             return []
 
-        command_root = text_norm.split(maxsplit=1)[0].lower()
-
         # ----------------------------------------------
         # 2) Derive source/channel & merge metadata
         # ----------------------------------------------
@@ -112,6 +136,47 @@ class TextInputNeuron(BaseNeuron):
             source = "user"
         merged_meta["transport_source"] = transport_source
 
+        # ----------------------------------------------
+        # 2.1) /acc textual accent command
+        # ----------------------------------------------
+        # /acc is a control-plane wrapper that supplies tone/prosody metadata
+        # for an otherwise normal text input. The literal command must not
+        # enter cognition or memory; only the cleaned text does.
+        acc_applied = False
+        acc_match = re.match(r"^/acc\s+([+-]?\d+(?:\.\d+)?)\s+(.+)$", text_norm, re.IGNORECASE | re.DOTALL)
+        if text_norm.lower() == "/acc" or text_norm.lower().startswith("/acc "):
+            if not acc_match:
+                return [
+                    self._speech_control(
+                        "Usage: /acc -10..10 <text>  (example: /acc +8 EXACTLY!)",
+                        channel=channel,
+                        correlation_id=event.correlation_id,
+                    )
+                ]
+
+            acc_value = _clamp_float(acc_match.group(1), -10.0, 10.0, 0.0)
+            cleaned = str(acc_match.group(2) or "").strip()
+            if not cleaned:
+                return [
+                    self._speech_control(
+                        "Usage: /acc -10..10 <text>  (text cannot be empty)",
+                        channel=channel,
+                        correlation_id=event.correlation_id,
+                    )
+                ]
+
+            text_norm = cleaned
+            acc_applied = True
+            merged_meta["input_mode"] = "textual_accent"
+            merged_meta["accent_source"] = "acc_command"
+            merged_meta["accent_value"] = acc_value
+            merged_meta["accent_intensity"] = abs(acc_value)
+            merged_meta["accent_scale"] = "-10..10"
+            merged_meta["tone_label"] = _tone_label(acc_value)
+            merged_meta["control_text_stripped"] = True
+
+        command_root = text_norm.split(maxsplit=1)[0].lower()
+
         # Record recent interaction mode so speech output can choose an adapter
         # without forcing the reasoner to know about transport details.
         try:
@@ -124,6 +189,12 @@ class TextInputNeuron(BaseNeuron):
                     "channel": channel,
                     "modality": "text",
                     "text": text_norm[:160],
+                    "accent": {
+                        "applied": bool(acc_applied),
+                        "value": merged_meta.get("accent_value"),
+                        "intensity": merged_meta.get("accent_intensity"),
+                        "tone_label": merged_meta.get("tone_label"),
+                    } if acc_applied else None,
                 },
             )
         except Exception:
@@ -133,7 +204,7 @@ class TextInputNeuron(BaseNeuron):
         # 2.5) Reinforcement snapshot latch (/r ...)
         # ----------------------------------------------
         r_pending = bool(await ctx.get_kv("control:r_pending", False))
-        is_r_command = text_norm == "/r" or text_norm.startswith("/r ")
+        is_r_command = (not acc_applied) and (text_norm == "/r" or text_norm.startswith("/r "))
 
         # If a /r menu is open, refuse non-/r input until it is resolved.
         if r_pending and not is_r_command:
@@ -145,7 +216,7 @@ class TextInputNeuron(BaseNeuron):
             ]
 
         # Handle /r commands here so they don't become percept/text (no HRM/memory pollution).
-        if text_norm == "/r" or text_norm.startswith("/r "):
+        if (not acc_applied) and (text_norm == "/r" or text_norm.startswith("/r ")):
             return await self._handle_r_command(
                 cmd_text=text_norm,
                 ctx=ctx,
@@ -155,7 +226,7 @@ class TextInputNeuron(BaseNeuron):
 
         # /t trainer latch: pause outward chatter and treat the NEXT user input as a correction.
         t_pending = bool(await ctx.get_kv("control:t_pending", False))
-        is_t_command = text_norm == "/t" or text_norm.startswith("/t ")
+        is_t_command = (not acc_applied) and (text_norm == "/t" or text_norm.startswith("/t "))
         if t_pending and not is_t_command:
             return await self._handle_t_capture(
                 correction_text=text_norm,
@@ -164,7 +235,7 @@ class TextInputNeuron(BaseNeuron):
                 correlation_id=event.correlation_id,
             )
 
-        if text_norm == "/t" or text_norm.startswith("/t "):
+        if (not acc_applied) and (text_norm == "/t" or text_norm.startswith("/t ")):
             return await self._handle_t_command(
                 cmd_text=text_norm,
                 ctx=ctx,
@@ -173,7 +244,7 @@ class TextInputNeuron(BaseNeuron):
             )
 
         # Handle /user commands here so they don't become percept/text.
-        if command_root == "/user":
+        if (not acc_applied) and command_root == "/user":
             return await self._handle_user_command(
                 cmd_text=text_norm,
                 ctx=ctx,
@@ -182,7 +253,7 @@ class TextInputNeuron(BaseNeuron):
             )
 
         # Handle /power commands here so they don't become percept/text.
-        if command_root == "/power":
+        if (not acc_applied) and command_root == "/power":
             return await self._handle_power_command(
                 cmd_text=text_norm,
                 ctx=ctx,
@@ -191,7 +262,7 @@ class TextInputNeuron(BaseNeuron):
             )
 
         # Handle /cookie here so it feeds virtual power without memory pollution.
-        if command_root == "/cookie":
+        if (not acc_applied) and command_root == "/cookie":
             return await self._handle_cookie_command(
                 cmd_text=text_norm,
                 ctx=ctx,
@@ -200,7 +271,7 @@ class TextInputNeuron(BaseNeuron):
             )
 
         # Handle /read commands here so they don't become percept/text.
-        if text_norm == "/read" or text_norm.startswith("/read "):
+        if (not acc_applied) and (text_norm == "/read" or text_norm.startswith("/read ")):
             return await self._handle_read_command(
                 cmd_text=text_norm,
                 ctx=ctx,
@@ -209,7 +280,7 @@ class TextInputNeuron(BaseNeuron):
             )
         
         # Handle /vision commands here so they don't become percept/text (babble can't see them).
-        if command_root == "/vision":
+        if (not acc_applied) and command_root == "/vision":
             return await self._handle_vision_command(
                 cmd_text=text_norm,
                 ctx=ctx,
@@ -218,7 +289,7 @@ class TextInputNeuron(BaseNeuron):
             )
 
         # Handle /focus commands here so they don't become percept/text (babble can't see them).
-        if command_root == "/focus":
+        if (not acc_applied) and command_root == "/focus":
             return await self._handle_focus_command(
                 cmd_text=text_norm,
                 ctx=ctx,
@@ -257,6 +328,9 @@ class TextInputNeuron(BaseNeuron):
                 "kind": "percept",
                 "modality": "text",
                 "normalized": True,
+                "accent_applied": bool(acc_applied),
+                "accent_value": merged_meta.get("accent_value") if acc_applied else None,
+                "accent_intensity": merged_meta.get("accent_intensity") if acc_applied else None,
             },
         )
 
@@ -1020,6 +1094,8 @@ class TextInputNeuron(BaseNeuron):
           /r a 5        -> show last 5 ASSISTANT items (snapshot opens, MB waits)
           /r +3 2       -> apply +3 to snapshot index #2 (then snapshot clears, resume)
           /r -5 1       -> apply -5 to snapshot index #1 (then snapshot clears, resume)
+          /r +3 2 "IF USER says moin THEN CLASSIFY social_greeting, warmth AND REPLY good morning"
+                         -> score + send structured teaching note to syntax_learning
           /r clear      -> clear snapshot and resume
         """
         line = (cmd_text or "").strip()
@@ -1029,7 +1105,7 @@ class TextInputNeuron(BaseNeuron):
         if len(parts) == 1:
             return [
                 self._speech_control(
-                    "Usage:\n  /r u 5   (last 5 user)\n  /r a 5   (last 5 assistant)\n  /r +3 2  (score index)\n  /r clear",
+                    "Usage:\n  /r u 5   (last 5 user)\n  /r a 5   (last 5 assistant)\n  /r +3 2  (score index)\n  /r +3 2 \"IF USER says moin THEN CLASSIFY social_greeting, warmth AND REPLY good morning\"\n  /r clear",
                     channel=channel,
                     correlation_id=correlation_id,
                 )
@@ -1092,7 +1168,7 @@ class TextInputNeuron(BaseNeuron):
                 preview = (it.get('text', '') or '').replace('\n', ' ').strip()
                 if len(preview) > 90:
                     preview = preview[:90] + "…"
-                lines.append(f"{i}) idx={it.get('hrm_idx')}  {preview}")
+                lines.append(f"{i}) hrm_idx={it.get('hrm_idx')}  {preview}")
             lines.append("")
             lines.append("Score one item:")
             lines.append("  /r +3 2   or   /r -2 4")
@@ -1106,9 +1182,10 @@ class TextInputNeuron(BaseNeuron):
                 )
             ]
 
-        # /r +W I   or   /r -W I
+        # /r +W I ["teaching note"]   or   /r -W I ["teaching note"]
+        score_parts = line.split(maxsplit=3)
         try:
-            weight = int(sub)  # works for "+3" and "-2"
+            weight = int(score_parts[1])  # works for "+3" and "-2"
         except Exception:
             weight = None
 
@@ -1123,7 +1200,7 @@ class TextInputNeuron(BaseNeuron):
 
         weight = max(-5, min(5, weight))
 
-        if len(parts) < 3:
+        if len(score_parts) < 3:
             return [
                 self._speech_control(
                     "Missing index. Example: `/r +3 2`",
@@ -1133,9 +1210,18 @@ class TextInputNeuron(BaseNeuron):
             ]
 
         try:
-            which = int(parts[2])
+            which = int(score_parts[2])
         except Exception:
             which = -1
+
+        teaching_note = ""
+        if len(score_parts) >= 4:
+            teaching_note = score_parts[3].strip()
+            if (len(teaching_note) >= 2) and (
+                (teaching_note[0] == teaching_note[-1] == '"')
+                or (teaching_note[0] == teaching_note[-1] == "'")
+            ):
+                teaching_note = teaching_note[1:-1].strip()
 
         snap = await ctx.get_kv("control:r_snapshot", None)
         items = snap.get("items", []) if isinstance(snap, dict) else []
@@ -1160,7 +1246,7 @@ class TextInputNeuron(BaseNeuron):
         target = items[which - 1]
         await ctx.set_kv(
             "reinforce:last",
-            {"ts": time.time(), "weight": weight, "target": target, "nonce": snap.get("nonce")},
+            {"ts": time.time(), "weight": weight, "target": target, "nonce": snap.get("nonce"), "teaching_note": teaching_note},
         )
 
         reinforce_event = Event(
@@ -1171,6 +1257,7 @@ class TextInputNeuron(BaseNeuron):
                 "target_role": snap.get("role"),
                 "target": target,
                 "nonce": snap.get("nonce"),
+                "teaching_note": teaching_note,
             },
             source=self.name,
             correlation_id=correlation_id,
@@ -1185,7 +1272,9 @@ class TextInputNeuron(BaseNeuron):
         return [
             reinforce_event,
             self._speech_control(
-                f"Applied {weight:+d} to item #{which}. Snapshot cleared. Resuming.",
+                f"Applied {weight:+d} to item #{which}"
+                + (" with teaching note" if teaching_note else "")
+                + ". Snapshot cleared. Resuming.",
                 channel=channel,
                 correlation_id=correlation_id,
             ),

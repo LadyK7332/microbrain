@@ -44,11 +44,16 @@ class ActionSelectorNeuron(BaseNeuron):
         associations = list(context.get("associations", []) or [])
         association_meta = dict(context.get("association_meta", {}) or {})
         meaningful_tokens = list(input_block.get("meaningful_tokens", []) or [])
-        boredom = ((context.get("drives", {}) or {}).get("boredom", {}) or {})
+        drives = context.get("drives", {}) or {}
+        boredom = (drives.get("boredom", {}) or {})
+        social_interaction = (drives.get("social_interaction", {}) or {})
+        social_experimentation = (drives.get("social_experimentation", {}) or {})
         constraints = context.get("constraints", {}) or {}
 
         crisis_mode = bool(constraints.get("crisis_mode", False))
         boredom_level = float(boredom.get("level", 0.0) or 0.0)
+        social_level = float(social_interaction.get("level", 0.0) or 0.0)
+        social_experiment_pressure = float(social_experimentation.get("pressure", 0.0) or 0.0)
         association_count = len(associations)
         top_assoc_score = float(association_meta.get("top_score", 0.0) or 0.0)
         llm_enabled = bool(await ctx.get_kv("llm:enabled", False))
@@ -62,6 +67,8 @@ class ActionSelectorNeuron(BaseNeuron):
             direct_priority += 0.25
         if cues.get("direct_address"):
             direct_priority += 0.15
+        if social_level >= 0.45 and (cues.get("is_greeting") or cues.get("needs_social_reply") or cues.get("direct_address")):
+            direct_priority += min(0.18, social_level * 0.16)
 
         memory_priority = min(0.75, top_assoc_score + (0.08 * association_count))
         if len(meaningful_tokens) < 2:
@@ -70,6 +77,9 @@ class ActionSelectorNeuron(BaseNeuron):
         score = 0.20
         score += min(0.25, float(trigger.get("pressure", 0.0) or 0.0) * 0.25)
         score += min(0.15, boredom_level * 0.10)
+        score += min(0.12, social_level * 0.08)
+        if social_experiment_pressure >= 0.55:
+            score += min(0.10, social_experiment_pressure * 0.08)
         if crisis_mode:
             score += 0.20
         score += min(0.25, direct_priority * 0.10)
@@ -83,6 +93,8 @@ class ActionSelectorNeuron(BaseNeuron):
             memory_priority=round(memory_priority, 3),
             use_assoc=should_use_association,
             boredom=round(boredom_level, 3),
+            social=round(social_level, 3),
+            social_experiment=round(social_experiment_pressure, 3),
             assoc_n=association_count,
             assoc_top=round(top_assoc_score, 3),
             llm_enabled=llm_enabled,
@@ -99,6 +111,8 @@ class ActionSelectorNeuron(BaseNeuron):
                 "trigger": trigger,
                 "direct_priority": direct_priority,
                 "memory_priority": memory_priority,
+                "social_level": social_level,
+                "social_experiment_pressure": social_experiment_pressure,
             },
         )
 
@@ -113,6 +127,8 @@ class ActionSelectorNeuron(BaseNeuron):
                     "assoc_n": association_count,
                     "assoc_top": top_assoc_score,
                     "boredom": boredom_level,
+                    "social": social_level,
+                    "social_experiment": social_experiment_pressure,
                     "crisis_mode": crisis_mode,
                     "trigger_kind": trigger.get("kind", "contextual"),
                 },
