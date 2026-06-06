@@ -81,6 +81,10 @@ class ContextBuilderNeuron(BaseNeuron):
         boredom = await ctx.get_kv("drive:boredom", {})
         social_interaction = await ctx.get_kv("drive:social_interaction", {})
         social_experimentation = await ctx.get_kv("drive:social_experimentation", {})
+        thought_momentum = await ctx.get_kv("thought:momentum", {})
+        scene_expectation_delta = await ctx.get_kv("scene:expectation:last_delta", {})
+        scene_expectation = await ctx.get_kv("scene:expectation:last_exp", {})
+        unresolved_questions = await ctx.get_kv("question:unresolved:recent", [])
         affect = await ctx.get_kv("affect:last", {})
         relation = await ctx.get_kv("relation:last", {})
         goals_crisis = bool(await ctx.get_kv("goals:crisis_mode", False))
@@ -126,6 +130,12 @@ class ContextBuilderNeuron(BaseNeuron):
                 "social_interaction": social_interaction if isinstance(social_interaction, dict) else {},
                 "social_experimentation": social_experimentation if isinstance(social_experimentation, dict) else {},
             },
+            "thought_momentum": thought_momentum if isinstance(thought_momentum, dict) else {},
+            "scene_expectation": {
+                "last_exp": scene_expectation if isinstance(scene_expectation, dict) else {},
+                "last_delta": scene_expectation_delta if isinstance(scene_expectation_delta, dict) else {},
+                "unresolved_questions": unresolved_questions[-8:] if isinstance(unresolved_questions, list) else [],
+            },
             "affect": affect if isinstance(affect, dict) else {},
             "relation": relation if isinstance(relation, dict) else {},
             "constraints": {
@@ -149,6 +159,10 @@ class ContextBuilderNeuron(BaseNeuron):
             boredom=(boredom or {}).get("level", 0.0),
             social=(social_interaction or {}).get("level", 0.0) if isinstance(social_interaction, dict) else 0.0,
             social_experiment=(social_experimentation or {}).get("pressure", 0.0) if isinstance(social_experimentation, dict) else 0.0,
+            momentum=(thought_momentum or {}).get("pressure", 0.0) if isinstance(thought_momentum, dict) else 0.0,
+            momentum_intent=(thought_momentum or {}).get("dominant_intent", "") if isinstance(thought_momentum, dict) else "",
+            scene_delta=(scene_expectation_delta or {}).get("magnitude", 0.0) if isinstance(scene_expectation_delta, dict) else 0.0,
+            unresolved_q=len(unresolved_questions) if isinstance(unresolved_questions, list) else 0,
             crisis_mode=goals_crisis,
             cues=cues,
         )

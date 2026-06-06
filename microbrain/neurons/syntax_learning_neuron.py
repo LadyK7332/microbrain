@@ -58,18 +58,19 @@ class SyntaxLearningNeuron(BaseNeuron):
     """
     Parses structured /r teaching notes into connected memory objects.
 
-    This organ only listens to control/reinforce. It does not treat the quoted
-    teaching text as normal user speech, and it writes rule-like memory with
-    classifier links and DDNA/personality targets.
+    This organ listens to manual reinforcement (control/reinforce) and
+    document curriculum ingestion (control/slearn). It does not treat the
+    quoted teaching text as normal user speech, and it writes rule-like memory
+    with classifier links and DDNA/personality targets.
     """
 
     async def process(self, event: Event, ctx) -> Iterable[Event]:
         self.debug("received", topic=event.topic, payload=event.payload, source=event.source, meta=event.meta)
 
-        if event.topic != "control/reinforce" or not isinstance(event.payload, dict):
+        if event.topic not in {"control/reinforce", "control/slearn"} or not isinstance(event.payload, dict):
             return []
 
-        note = str(event.payload.get("teaching_note", "") or "").strip()
+        note = str(event.payload.get("teaching_note", "") or event.payload.get("rule", "") or "").strip()
         if not note:
             return []
 
@@ -96,6 +97,10 @@ class SyntaxLearningNeuron(BaseNeuron):
         parsed["target_hrm_idx"] = target.get("hrm_idx")
         parsed["nonce"] = str(event.payload.get("nonce", "") or "")
         parsed["teaching_note"] = note
+        parsed["source_mode"] = "slearn" if event.topic == "control/slearn" else "reinforcement"
+        parsed["source_name"] = str(event.payload.get("source_name", "") or "")
+        parsed["source_path"] = str(event.payload.get("source_path", "") or "")
+        parsed["source_line"] = event.payload.get("source_line")
         parsed["ts"] = time.time()
 
         store = await self._mem_cell_store(ctx)
@@ -208,6 +213,10 @@ class SyntaxLearningNeuron(BaseNeuron):
                     "ddna_targets": ddna_map,
                     "condition_text": condition,
                     "reinforce_weight": weight,
+                    "source_mode": str(rule.get("source_mode", "reinforcement") or "reinforcement"),
+                    "source_name": str(rule.get("source_name", "") or ""),
+                    "source_path": str(rule.get("source_path", "") or ""),
+                    "source_line": rule.get("source_line"),
                 },
                 tier="learned",
             )
@@ -254,6 +263,10 @@ class SyntaxLearningNeuron(BaseNeuron):
                 "avoid_replies": list(rule.get("avoid_replies", []) or []),
                 "reinforce_weight": weight,
                 "target_text": str(rule.get("target_text", "") or ""),
+                "source_mode": str(rule.get("source_mode", "reinforcement") or "reinforcement"),
+                "source_name": str(rule.get("source_name", "") or ""),
+                "source_path": str(rule.get("source_path", "") or ""),
+                "source_line": rule.get("source_line"),
             },
             "ts": now_ts,
             "last_seen": now_ts,
@@ -266,11 +279,11 @@ class SyntaxLearningNeuron(BaseNeuron):
 
     def _status(self, text: str, event: Event) -> Event:
         return Event(
-            topic="act/speech",
+            topic="ui/status",
             payload={"text": text, "style": "system", "channel": "default"},
             source=self.name,
             correlation_id=event.correlation_id,
-            meta={"control": True, "kind": "syntax_learning_status", "store_in_memory": False},
+            meta={"control": True, "kind": "syntax_learning_status", "store_in_memory": False, "reinforcement_eligible": False, "self_output_track": False, "cognitive_visible": False},
         )
 
 
@@ -286,8 +299,8 @@ def jsonish(value: Any) -> str:
 def build_neurons(orchestrator: Orchestrator):
     cfg = NeuronConfig(
         name=NEURON_NAME,
-        subscribed_topics=["control/reinforce"],
-        output_topics=["act/speech"],
+        subscribed_topics=["control/reinforce", "control/slearn"],
+        output_topics=["ui/status"],
         priority=-4,
     )
     yield SyntaxLearningNeuron(cfg)

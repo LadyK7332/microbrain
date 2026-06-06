@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 from typing import Any, Dict, Iterable
 
 from microbrain.orchestrator.neuron_base import BaseNeuron, NeuronConfig, Event
@@ -30,7 +32,7 @@ class TextRouterNeuron(BaseNeuron):
 
     1) Slash commands (text starting with "/"):
        - /echo <msg>     → act/speech with <msg>
-       - /help           → act/speech with a help blurb
+       - /help           → ui/status with a help blurb
        - unknown /cmd    → small error message
 
     2) Short greetings:
@@ -111,10 +113,9 @@ class TextRouterNeuron(BaseNeuron):
         if text.startswith("/"):
             cmd_line = text[1:].strip()
             if not cmd_line:
-                return [self._speech(
+                return [self._ui_error(
                     "Empty command. Try /help.",
                     channel=channel,
-                    style="system",
                     event=event,
                 )]
 
@@ -128,26 +129,70 @@ class TextRouterNeuron(BaseNeuron):
                     f"[{self.name}] Handling /echo locally",
                     channel=channel,
                 )
-                return [self._speech(
+                return [self._ui_status(
                     message,
                     channel=channel,
-                    style="default",
                     event=event,
+                    kind="command_echo",
                 )]
 
             if cmd in ("help", "?"):
                 help_text = (
-                    'Available commands:\n  /echo <text>            - echo back text quickly\n  /help                   - show this help\n  /status                 - describe my current brain state\n  /reflect                - reflect on my own status\n  /why                    - explain why I answered the way I did\n  /cookie                 - feed me a virtual snack (+5% power)\n  /power                  - show current power status\n  /power pct <0-100>      - set battery percent\n  /power set <0-100>      - alias for /power pct\n  /power charging on|off  - toggle charging state\n  /power sleep on|off     - toggle sleep state\n  /read on|off            - toggle reading mode\n  /read status            - show reading progress\n  /read next              - force one reading chunk\n  /user <name>            - set your display name\n  /user clear             - clear saved display name\n  /vision list            - list capturable windows\n  /vision select <x>      - select window by index or title\n  /vision on|off          - enable or disable vision capture\n  /vision preview on|off  - toggle vision preview\n  /focus center           - center the vision focus point\n  /focus <x> <y>          - set normalized focus coordinates\n  /as_audio <text>        - inject text as microphone-style input\n  /acc <n> <text>         - send text with explicit tone/intensity (-10..10)\n  /r u <n>                - snapshot recent user items for scoring\n  /r a <n>                - snapshot recent assistant items for scoring\n  /r +W <i>               - reinforce snapshot item with weight\n  /r clear                - close reinforcement snapshot\nOther messages are sent to my reasoning core.'
+                    "Available commands:\n"
+                    "  /echo <text>            - echo back text quickly\n"
+                    "  /help                   - show this help\n"
+                    "  /quit or /exit          - close the Textual UI\n"
+                    "  /status                 - describe my current brain state\n"
+                    "  /reflect                - reflect on my own status\n"
+                    "  /why                    - explain why I answered the way I did\n"
+                    "  /cookie                 - feed me a virtual snack (+5% power)\n"
+                    "  /power                  - show current power status\n"
+                    "  /power pct <0-100>      - set battery percent\n"
+                    "  /power set <0-100>      - alias for /power pct\n"
+                    "  /power charging on|off  - toggle charging state\n"
+                    "  /power sleep on|off     - toggle sleep state\n"
+                    "  /read on|off            - toggle reading mode\n"
+                    "  /read status            - show reading progress\n"
+                    "  /read next              - force one reading chunk\n"
+                    "  /slearn on|off          - toggle structured CAPS learning sheets\n"
+                    "  /slearn status          - show structured learning progress\n"
+                    "  /slearn next            - force one structured learning chunk\n"
+                    "  /slearn dir <path>      - set structured learning sheet folder\n"
+                    "  /slearn template        - show sheet format examples\n"
+                    "  /user <name>            - set your display name\n"
+                    "  /user clear             - clear saved display name\n"
+                    "  /vision list            - list capturable windows\n"
+                    "  /vision select <x>      - select window by index or title\n"
+                    "  /vision on|off          - enable or disable window vision capture\n"
+                    "  /vision preview on|off  - toggle window vision preview\n"
+                    "  /camera list            - list webcam/camera devices\n"
+                    "  /camera select <index>  - select webcam by index\n"
+                    "  /camera on|off          - enable or disable webcam capture\n"
+                    "  /camera preview on|off  - toggle webcam preview\n"
+                    "  /focus center           - center the vision focus point\n"
+                    "  /focus <x> <y>          - set normalized focus coordinates\n"
+                    "  /as_audio <text>        - inject text as microphone-style input\n"
+                    "  /acc <n> <text>         - send text with signed tone (-10..10: +=positive, -=correction)\n"
+                    "  /t                      - arm trainer correction for the last assistant utterance\n"
+                    "  /t status               - show trainer latch status\n"
+                    "  /t cancel               - cancel trainer correction\n"
+                    "  /r u <n>                - snapshot recent user items for scoring\n"
+                    "  /r a <n>                - snapshot recent assistant items for scoring\n"
+                    "  /r +W <i> or /r -W <i>  - score snapshot item with weight\n"
+                    "  /r +W <i> \"IF ...\"     - score item and attach structured teaching note\n"
+                    "  /r clear                - close reinforcement snapshot\n"
+                    "Other messages are sent to my reasoning core.\n"
+                    "Note: /vision is window/screen capture; /camera is webcam capture."
                 )
                 await ctx.log_debug(
                     f"[{self.name}] Handling /help locally",
                     channel=channel,
                 )
-                return [self._speech(
+                return [self._ui_status(
                     help_text,
                     channel=channel,
-                    style="system",
                     event=event,
+                    kind="command_help",
                 )]
             if cmd in ("status", "brain", "who"):
                 await ctx.log_debug(
@@ -224,13 +269,13 @@ class TextRouterNeuron(BaseNeuron):
                         payload={"add_pct": 5.0, "reason": "cookie"},
                         source=self.name,
                         correlation_id=event.correlation_id,
-                        meta={"control": True, "kind": "power_control", "feed": "cookie"},
+                        meta={**self._control_meta(kind="power_control"), "feed": "cookie"},
                     ),
-                    self._speech(
+                    self._ui_status(
                         "Cookie received. Power +5.0%.",
                         channel=channel,
-                        style="system",
                         event=event,
+                        kind="command_power",
                     ),
                 ]
 
@@ -239,10 +284,9 @@ class TextRouterNeuron(BaseNeuron):
                 # Treat the rest of the line as if it came from microphone STT.
                 spoken_text = arg.strip()
                 if not spoken_text:
-                    return [self._speech(
+                    return [self._ui_error(
                         "Usage: /as_audio <what you would have said out loud>",
                         channel=channel,
-                        style="system",
                         event=event,
                     )]
 
@@ -270,16 +314,23 @@ class TextRouterNeuron(BaseNeuron):
                     correlation_id=event.correlation_id,
                 )
 
-                return [audio_event]
+                return [
+                    audio_event,
+                    self._ui_status(
+                        "Injected text as microphone-style input.",
+                        channel=channel,
+                        event=event,
+                        kind="command_as_audio",
+                    ),
+                ]
 
             
             if cmd == "vision":
                 sub = (arg or "").strip()
                 if not sub:
-                    return [self._speech(
+                    return [self._ui_error(
                         "Usage: /vision list | /vision select <n|title> | /vision on|off | /vision preview on|off",
                         channel=channel,
-                        style="system",
                         event=event,
                     )]
 
@@ -292,19 +343,18 @@ class TextRouterNeuron(BaseNeuron):
                         from microbrain.utils.mb_vision.window_grabber import list_windows
                         wins = list_windows()
                     except Exception as e:
-                        return [self._speech(
+                        return [self._ui_error(
                             f"Vision list failed: {e!r}",
                             channel=channel,
-                            style="system",
                             event=event,
                         )]
 
                     if not wins:
-                        return [self._speech(
+                        return [self._ui_status(
                             "No windows found.",
                             channel=channel,
-                            style="system",
                             event=event,
+                            kind="vision_status",
                         )]
 
                     lines = ["Windows:"]
@@ -316,14 +366,13 @@ class TextRouterNeuron(BaseNeuron):
                     if len(wins) > 25:
                         lines.append(f"...and {len(wins) - 25} more")
                     lines.append("Pick one with: /vision select <index|title_substring>")
-                    return [self._speech("\n".join(lines), channel=channel, style="system", event=event)]
+                    return [self._ui_status("\n".join(lines), channel=channel, event=event, kind="vision_status")]
 
                 if subcmd == "select":
                     if not rest:
-                        return [self._speech(
+                        return [self._ui_error(
                             "Usage: /vision select <index|title_substring>",
                             channel=channel,
-                            style="system",
                             event=event,
                         )]
                     return [
@@ -332,13 +381,13 @@ class TextRouterNeuron(BaseNeuron):
                             payload={"action": "select", "selector": rest},
                             source=self.name,
                             correlation_id=event.correlation_id,
-                            meta={"kind": "vision_control"},
+                            meta=self._control_meta(kind="vision_control"),
                         ),
-                        self._speech(
+                        self._ui_status(
                             f"Selecting window: {rest!r}",
                             channel=channel,
-                            style="system",
                             event=event,
+                            kind="vision_status",
                         ),
                     ]
 
@@ -349,13 +398,13 @@ class TextRouterNeuron(BaseNeuron):
                             payload={"action": subcmd},
                             source=self.name,
                             correlation_id=event.correlation_id,
-                            meta={"kind": "vision_control"},
+                            meta=self._control_meta(kind="vision_control"),
                         ),
-                        self._speech(
+                        self._ui_status(
                             f"Vision {subcmd}.",
                             channel=channel,
-                            style="system",
                             event=event,
+                            kind="vision_status",
                         ),
                     ]
 
@@ -368,36 +417,166 @@ class TextRouterNeuron(BaseNeuron):
                                 payload={"action": act},
                                 source=self.name,
                                 correlation_id=event.correlation_id,
-                                meta={"kind": "vision_control"},
+                                meta=self._control_meta(kind="vision_control"),
                             ),
-                            self._speech(
+                            self._ui_status(
                                 f"Vision preview {rest.lower()}.",
                                 channel=channel,
-                                style="system",
                                 event=event,
+                                kind="vision_status",
                             ),
                         ]
-                    return [self._speech(
+                    return [self._ui_error(
                         "Usage: /vision preview on|off",
                         channel=channel,
-                        style="system",
                         event=event,
                     )]
 
-                return [self._speech(
+                return [self._ui_error(
                     "Unknown /vision subcommand. Try: list, select, on, off, preview on|off",
                     channel=channel,
-                    style="system",
+                    event=event,
+                )]
+
+            if cmd == "camera":
+                sub = (arg or "").strip()
+                if not sub:
+                    enabled = bool(await ctx.get_kv("camera:enabled", False))
+                    selected = await ctx.get_kv("camera:selected", None)
+                    selected_text = "-"
+                    if isinstance(selected, dict):
+                        selected_text = f"{selected.get('index', '?')}: {selected.get('name', 'Camera')}"
+                    msg = (
+                        f"camera: {'on' if enabled else 'off'} | selected={selected_text}\n"
+                        "Usage: /camera list | /camera select <index> | /camera on|off | /camera preview on|off | /camera status"
+                    )
+                    return [self._ui_status(msg, channel=channel, event=event, kind="camera_status")]
+
+                parts2 = sub.split()
+                subcmd = parts2[0].lower()
+                rest = " ".join(parts2[1:]).strip()
+
+                if subcmd in ("status", "state"):
+                    enabled = bool(await ctx.get_kv("camera:enabled", False))
+                    preview = bool(await ctx.get_kv("camera:preview", False))
+                    selected = await ctx.get_kv("camera:selected", None)
+                    selected_text = "-"
+                    if isinstance(selected, dict):
+                        selected_text = f"{selected.get('index', '?')}: {selected.get('name', 'Camera')}"
+                    fps = await ctx.get_kv("camera:fps", 2.0)
+                    msg = f"camera: {'on' if enabled else 'off'} | preview={'on' if preview else 'off'} | selected={selected_text} | fps={fps}"
+                    return [self._ui_status(msg, channel=channel, event=event, kind="camera_status")]
+
+                if subcmd == "list":
+                    try:
+                        from microbrain.utils.mb_vision.camera_grabber import list_cameras
+                        cams = list_cameras()
+                        try:
+                            await ctx.set_kv("camera:devices_last", [c.as_dict() for c in cams])
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        return [self._ui_error(f"Camera list failed: {e!r}", channel=channel, event=event)]
+
+                    if not cams:
+                        return [self._ui_status(
+                            "No cameras found. Install/check opencv-python and camera permissions if this seems wrong.",
+                            channel=channel,
+                            event=event,
+                            kind="camera_status",
+                        )]
+
+                    lines = ["Cameras:"]
+                    for cam in cams[:25]:
+                        desc = f"  [{cam.index}] {cam.name}"
+                        if cam.width and cam.height:
+                            desc += f" ({cam.width}x{cam.height})"
+                        if cam.backend:
+                            desc += f" [{cam.backend}]"
+                        lines.append(desc)
+                    if len(cams) > 25:
+                        lines.append(f"...and {len(cams) - 25} more")
+                    lines.append("Pick one with: /camera select <index>")
+                    return [self._ui_status("\n".join(lines), channel=channel, event=event, kind="camera_status")]
+
+                if subcmd == "select":
+                    if not rest:
+                        return [self._ui_error("Usage: /camera select <index>", channel=channel, event=event)]
+                    try:
+                        idx = int(rest)
+                    except Exception:
+                        return [self._ui_error("Usage: /camera select <index>  (index must be a number)", channel=channel, event=event)]
+                    if idx < 0 or idx > 32:
+                        return [self._ui_error("Camera index out of safe probe range 0..32.", channel=channel, event=event)]
+
+                    chosen = {"index": idx, "name": f"Camera {idx}", "ts": time.time()}
+                    try:
+                        cached = await ctx.get_kv("camera:devices_last", None)
+                        if isinstance(cached, list):
+                            for row in cached:
+                                if isinstance(row, dict) and int(row.get("index", -1)) == idx:
+                                    chosen.update(row)
+                                    break
+                    except Exception:
+                        pass
+
+                    await ctx.set_kv("camera:selected", chosen)
+                    await ctx.set_kv("camera:selected_index", idx)
+                    return [
+                        Event(
+                            topic="control/camera",
+                            payload={"action": "select", "index": idx, "camera": chosen},
+                            source=self.name,
+                            correlation_id=event.correlation_id,
+                            meta=self._control_meta(kind="camera_control"),
+                        ),
+                        self._ui_status(
+                            f"Selected camera: {idx} ({chosen.get('name', 'Camera')}).",
+                            channel=channel,
+                            event=event,
+                            kind="camera_status",
+                        ),
+                    ]
+
+                if subcmd in ("on", "off"):
+                    return [
+                        Event(
+                            topic="control/camera",
+                            payload={"action": subcmd},
+                            source=self.name,
+                            correlation_id=event.correlation_id,
+                            meta=self._control_meta(kind="camera_control"),
+                        ),
+                        self._ui_status(f"Camera {subcmd}.", channel=channel, event=event, kind="camera_status"),
+                    ]
+
+                if subcmd == "preview":
+                    if rest.lower() in ("on", "off"):
+                        act = "preview_on" if rest.lower() == "on" else "preview_off"
+                        return [
+                            Event(
+                                topic="control/camera",
+                                payload={"action": act},
+                                source=self.name,
+                                correlation_id=event.correlation_id,
+                                meta=self._control_meta(kind="camera_control"),
+                            ),
+                            self._ui_status(f"Camera preview {rest.lower()}.", channel=channel, event=event, kind="camera_status"),
+                        ]
+                    return [self._ui_error("Usage: /camera preview on|off", channel=channel, event=event)]
+
+                return [self._ui_error(
+                    "Unknown /camera subcommand. Try: list, select, on, off, preview on|off, status",
+                    channel=channel,
                     event=event,
                 )]
 
             if cmd == "focus":
                 sub = (arg or "").strip()
                 if not sub:
-                    return [self._speech(
+                    return [self._ui_error(
                         "Usage: /focus center | /focus <x> <y> (normalized 0..1)",
                         channel=channel,
-                        style="system",
                         event=event,
                     )]
 
@@ -408,27 +587,25 @@ class TextRouterNeuron(BaseNeuron):
                             payload={"action": "center"},
                             source=self.name,
                             correlation_id=event.correlation_id,
-                            meta={"kind": "focus_control"},
+                            meta=self._control_meta(kind="focus_control"),
                         ),
-                        self._speech("Focus set to center.", channel=channel, style="system", event=event),
+                        self._ui_status("Focus set to center.", channel=channel, event=event),
                     ]
 
                 pts = sub.split()
                 if len(pts) != 2:
-                    return [self._speech(
+                    return [self._ui_error(
                         "Usage: /focus <x> <y> (normalized 0..1)",
                         channel=channel,
-                        style="system",
                         event=event,
                     )]
                 try:
                     x = float(pts[0])
                     y = float(pts[1])
                 except Exception:
-                    return [self._speech(
+                    return [self._ui_error(
                         "Couldn't parse numbers. Example: /focus 0.5 0.5",
                         channel=channel,
-                        style="system",
                         event=event,
                     )]
 
@@ -438,9 +615,9 @@ class TextRouterNeuron(BaseNeuron):
                         payload={"action": "set", "x": x, "y": y},
                         source=self.name,
                         correlation_id=event.correlation_id,
-                        meta={"kind": "focus_control"},
+                        meta=self._control_meta(kind="focus_control"),
                     ),
-                    self._speech(f"Focus set to ({x:.3f}, {y:.3f}).", channel=channel, style="system", event=event),
+                    self._ui_status(f"Focus set to ({x:.3f}, {y:.3f}).", channel=channel, event=event),
                 ]
 
 # Unknown command
@@ -449,10 +626,9 @@ class TextRouterNeuron(BaseNeuron):
                 cmd=cmd,
                 channel=channel,
             )
-            return [self._speech(
+            return [self._ui_error(
                 f"I don't know the command '/{cmd}'. Try /help.",
                 channel=channel,
-                style="system",
                 event=event,
             )]
 
@@ -661,6 +837,43 @@ class TextRouterNeuron(BaseNeuron):
     # Helper to build speech events
     # ------------------------------
     
+    def _control_meta(self, *, kind: str) -> Dict[str, Any]:
+        return {
+            "control": True,
+            "kind": kind,
+            "memory_source": "system_telemetry",
+            "store_in_memory": False,
+            "reinforcement_eligible": False,
+            "self_output_track": False,
+            "cognitive_visible": False,
+        }
+
+    def _ui_status(self, text: str, channel: str, event: Event, kind: str = "command_status") -> Event:
+        return Event(
+            topic="ui/status",
+            payload={
+                "text": text,
+                "channel": channel,
+                "style": "system",
+            },
+            source=self.name,
+            correlation_id=event.correlation_id,
+            meta=self._control_meta(kind=kind),
+        )
+
+    def _ui_error(self, text: str, channel: str, event: Event) -> Event:
+        return Event(
+            topic="ui/error",
+            payload={
+                "text": text,
+                "channel": channel,
+                "style": "system",
+            },
+            source=self.name,
+            correlation_id=event.correlation_id,
+            meta=self._control_meta(kind="command_error"),
+        )
+
     def _speech(self, text: str, channel: str, style: str, event: Event) -> Event:
         return Event(
             topic="act/speech",
@@ -678,7 +891,7 @@ def build_neurons(orchestrator: Orchestrator):
     cfg = NeuronConfig(
         name="text_router",
         subscribed_topics=["percept/text", "act/speech"],
-        output_topics=["reason/request", "act/speech"],
+        output_topics=["reason/request", "act/speech", "ui/status", "ui/error"],
         priority=5,
     )
     yield TextRouterNeuron(cfg)

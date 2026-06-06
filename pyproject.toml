@@ -13,7 +13,10 @@ authors = [{ name = "Joseph W. Brugh" }]
 dependencies = [
     "vosk==0.3.45",
     "sounddevice==0.4.6",
-    "numpy>=1.24"
+    "numpy>=1.24",
+    "mss>=9.0.0",
+    "pygetwindow>=0.0.9",
+    "opencv-python>=4.8.0",
 ]
 
 [project.scripts]

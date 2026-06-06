@@ -15,6 +15,44 @@ from microbrain.orchestrator.neuron_base import BaseNeuron, NeuronConfig, Event
 from microbrain.orchestrator.orchestrator import Orchestrator
 
 
+
+
+_LEADING_SLASH_COMMANDS = {
+    "/r",
+    "/t",
+    "/user",
+    "/power",
+    "/cookie",
+    "/read",
+    "/slearn",
+    "/vision",
+    "/camera",
+    "/focus",
+    "/acc",
+    "/echo",
+    "/say",
+    "/help",
+    "/?",
+    "/status",
+    "/brain",
+    "/who",
+    "/reflect",
+    "/introspect",
+    "/self",
+    "/why",
+    "/explain",
+    "/because",
+    "/as_audio",
+    "/audio",
+}
+
+
+def _leading_slash_command(text: str) -> str:
+    stripped = str(text or "").lstrip()
+    if not stripped.startswith("/"):
+        return ""
+    return stripped.split(maxsplit=1)[0].lower()
+
 def _coerce_power_state(raw: Any) -> Dict[str, Any]:
     if isinstance(raw, dict):
         state = dict(raw)
@@ -48,17 +86,28 @@ def _clamp_float(value: Any, lo: float, hi: float, default: float = 0.0) -> floa
 
 
 def _tone_label(value: float) -> str:
-    """Human-readable text prosody label for /acc metadata."""
-    mag = abs(float(value or 0.0))
+    """Human-readable signed valence/emphasis label for /acc metadata."""
+    v = float(value or 0.0)
+    mag = abs(v)
     if mag <= 0.25:
-        return "flat_dead"
+        return "neutral"
+    if v > 0:
+        if mag < 3.0:
+            return "mild_positive_emphasis"
+        if mag < 7.0:
+            return "positive_emphasis"
+        if mag < 8.0:
+            return "strong_positive_emphasis"
+        return "positive_salience_spike"
+
+    # Negative /acc means unwanted/bad/corrective severity, not quietness.
     if mag < 3.0:
-        return "subdued" if value < 0 else "light"
+        return "mild_negative_correction"
     if mag < 7.0:
-        return "normal_expressive" if value >= 0 else "low_energy"
+        return "negative_correction"
     if mag < 8.0:
-        return "strong_emphasis"
-    return "high_intensity" if value >= 0 else "high_suppressed_intensity"
+        return "strong_negative_correction"
+    return "negative_salience_warning"
 
 
 class TextInputNeuron(BaseNeuron):
@@ -118,6 +167,8 @@ class TextInputNeuron(BaseNeuron):
             )
             return []
 
+        command_root = text_norm.split(maxsplit=1)[0].lower()
+
         # ----------------------------------------------
         # 2) Derive source/channel & merge metadata
         # ----------------------------------------------
@@ -139,16 +190,20 @@ class TextInputNeuron(BaseNeuron):
         # ----------------------------------------------
         # 2.1) /acc textual accent command
         # ----------------------------------------------
-        # /acc is a control-plane wrapper that supplies tone/prosody metadata
-        # for an otherwise normal text input. The literal command must not
-        # enter cognition or memory; only the cleaned text does.
+        # /acc is a control-plane wrapper that supplies signed tone/valence
+        # metadata for an otherwise normal text input. The literal command
+        # must not enter cognition or memory; only the cleaned text does.
+        #
+        #   +N = positive emphasis / salience / preference pull
+        #   -N = unwanted/bad/corrective severity / preference push-away
+        #    0 = neutral explicit marker
         acc_applied = False
         acc_match = re.match(r"^/acc\s+([+-]?\d+(?:\.\d+)?)\s+(.+)$", text_norm, re.IGNORECASE | re.DOTALL)
         if text_norm.lower() == "/acc" or text_norm.lower().startswith("/acc "):
             if not acc_match:
                 return [
-                    self._speech_control(
-                        "Usage: /acc -10..10 <text>  (example: /acc +8 EXACTLY!)",
+                    self._speech_error(
+                        "Usage: /acc -10..10 <text>  (+ = positive emphasis, - = correction severity)",
                         channel=channel,
                         correlation_id=event.correlation_id,
                     )
@@ -158,7 +213,7 @@ class TextInputNeuron(BaseNeuron):
             cleaned = str(acc_match.group(2) or "").strip()
             if not cleaned:
                 return [
-                    self._speech_control(
+                    self._speech_error(
                         "Usage: /acc -10..10 <text>  (text cannot be empty)",
                         channel=channel,
                         correlation_id=event.correlation_id,
@@ -167,38 +222,24 @@ class TextInputNeuron(BaseNeuron):
 
             text_norm = cleaned
             acc_applied = True
+            magnitude = abs(acc_value)
+            positive = max(0.0, acc_value)
+            negative_severity = abs(min(0.0, acc_value))
+            direction = "positive" if acc_value > 0 else ("negative" if acc_value < 0 else "neutral")
+
             merged_meta["input_mode"] = "textual_accent"
             merged_meta["accent_source"] = "acc_command"
             merged_meta["accent_value"] = acc_value
-            merged_meta["accent_intensity"] = abs(acc_value)
-            merged_meta["accent_scale"] = "-10..10"
+            merged_meta["accent_magnitude"] = magnitude
+            merged_meta["accent_intensity"] = magnitude  # backward-compatible magnitude field
+            merged_meta["accent_positive"] = positive
+            merged_meta["accent_negative_severity"] = negative_severity
+            merged_meta["accent_direction"] = direction
+            merged_meta["accent_scale"] = "-10..10 signed: +=positive emphasis, -=negative correction"
             merged_meta["tone_label"] = _tone_label(acc_value)
+            merged_meta["salience_delta"] = round(acc_value / 10.0, 4)
+            merged_meta["preference_delta"] = round(acc_value / 10.0, 4)
             merged_meta["control_text_stripped"] = True
-
-        command_root = text_norm.split(maxsplit=1)[0].lower()
-
-        # Record recent interaction mode so speech output can choose an adapter
-        # without forcing the reasoner to know about transport details.
-        try:
-            await ctx.set_kv(
-                "interaction:last_input",
-                {
-                    "ts": time.time(),
-                    "source": source,
-                    "transport_source": transport_source,
-                    "channel": channel,
-                    "modality": "text",
-                    "text": text_norm[:160],
-                    "accent": {
-                        "applied": bool(acc_applied),
-                        "value": merged_meta.get("accent_value"),
-                        "intensity": merged_meta.get("accent_intensity"),
-                        "tone_label": merged_meta.get("tone_label"),
-                    } if acc_applied else None,
-                },
-            )
-        except Exception:
-            pass
 
         # ----------------------------------------------
         # 2.5) Reinforcement snapshot latch (/r ...)
@@ -209,9 +250,10 @@ class TextInputNeuron(BaseNeuron):
         # If a /r menu is open, refuse non-/r input until it is resolved.
         if r_pending and not is_r_command:
             return [
-                self._speech_control(
+                self._speech_error(
                     "Reinforcement menu is still open. Use `/r +3 2`, `/r -2 4`, or `/r clear`.",
                     channel=channel,
+                    correlation_id=event.correlation_id,
                 )
             ]
 
@@ -278,10 +320,28 @@ class TextInputNeuron(BaseNeuron):
                 channel=channel,
                 correlation_id=event.correlation_id,
             )
+
+        # Handle /slearn commands here so structured curriculum ingestion stays control-plane.
+        if (not acc_applied) and (text_norm == "/slearn" or text_norm.startswith("/slearn ")):
+            return await self._handle_slearn_command(
+                cmd_text=text_norm,
+                ctx=ctx,
+                channel=channel,
+                correlation_id=event.correlation_id,
+            )
         
         # Handle /vision commands here so they don't become percept/text (babble can't see them).
         if (not acc_applied) and command_root == "/vision":
             return await self._handle_vision_command(
+                cmd_text=text_norm,
+                ctx=ctx,
+                channel=channel,
+                correlation_id=event.correlation_id,
+            )
+
+        # Handle /camera commands here so webcam input stays control-plane until frames emit percept/vision.
+        if (not acc_applied) and command_root == "/camera":
+            return await self._handle_camera_command(
                 cmd_text=text_norm,
                 ctx=ctx,
                 channel=channel,
@@ -297,6 +357,60 @@ class TextInputNeuron(BaseNeuron):
                 correlation_id=event.correlation_id,
             )
 
+        # Leading slash is command plane only. Unknown leading-slash commands
+        # are operator/UI errors and must never become percept/text, memory,
+        # boredom/social input, or learned conversation. A slash inside normal
+        # text (e.g. C:/tools or 3/4) remains valid conversational text.
+        leading_cmd = _leading_slash_command(text_norm)
+        leading_slash_command = bool(leading_cmd) and not acc_applied
+        if leading_slash_command:
+            if leading_cmd not in _LEADING_SLASH_COMMANDS:
+                return [
+                    self._speech_error(
+                        f"I don't know the command '{leading_cmd}'. Try /help.",
+                        channel=channel,
+                        correlation_id=event.correlation_id,
+                    )
+                ]
+
+            # Known commands that are still routed through router_text are marked
+            # as control-plane packets so all cognition/memory/drive consumers can
+            # ignore them defensively.
+            merged_meta["control"] = True
+            merged_meta["memory_source"] = "system_telemetry"
+            merged_meta["store_in_memory"] = False
+            merged_meta["reinforcement_eligible"] = False
+            merged_meta["self_output_track"] = False
+            merged_meta["cognitive_visible"] = False
+            merged_meta["command_text"] = True
+            merged_meta["command_root"] = leading_cmd
+
+        # Record recent interaction mode only for cognition-plane text. Commands
+        # are operator controls, not social/contact input.
+        if not leading_slash_command:
+            try:
+                await ctx.set_kv(
+                    "interaction:last_input",
+                    {
+                        "ts": time.time(),
+                        "source": source,
+                        "transport_source": transport_source,
+                        "channel": channel,
+                        "modality": "text",
+                        "text": text_norm[:160],
+                        "accent": {
+                            "applied": bool(acc_applied),
+                            "value": merged_meta.get("accent_value"),
+                            "direction": merged_meta.get("accent_direction"),
+                            "magnitude": merged_meta.get("accent_magnitude"),
+                            "positive": merged_meta.get("accent_positive"),
+                            "negative_severity": merged_meta.get("accent_negative_severity"),
+                            "tone_label": merged_meta.get("tone_label"),
+                        } if acc_applied else None,
+                    },
+                )
+            except Exception:
+                pass
 
         # Attach current speaker identity (noun_id) for downstream binding/recall.
         if source == "user":
@@ -325,12 +439,22 @@ class TextInputNeuron(BaseNeuron):
             source=self.name,
             correlation_id=event.correlation_id,
             meta={
-                "kind": "percept",
+                "kind": "command_text" if leading_slash_command else "percept",
                 "modality": "text",
                 "normalized": True,
+                "control": bool(leading_slash_command),
+                "memory_source": "system_telemetry" if leading_slash_command else None,
+                "store_in_memory": False if leading_slash_command else None,
+                "reinforcement_eligible": False if leading_slash_command else None,
+                "self_output_track": False if leading_slash_command else None,
+                "cognitive_visible": False if leading_slash_command else None,
+                "command_text": bool(leading_slash_command),
+                "command_root": leading_cmd if leading_slash_command else None,
                 "accent_applied": bool(acc_applied),
                 "accent_value": merged_meta.get("accent_value") if acc_applied else None,
-                "accent_intensity": merged_meta.get("accent_intensity") if acc_applied else None,
+                "accent_direction": merged_meta.get("accent_direction") if acc_applied else None,
+                "accent_positive": merged_meta.get("accent_positive") if acc_applied else None,
+                "accent_negative_severity": merged_meta.get("accent_negative_severity") if acc_applied else None,
             },
         )
 
@@ -396,7 +520,7 @@ class TextInputNeuron(BaseNeuron):
         speech_reason_last = await ctx.get_kv("speech_reason:last", None)
         target = self._trainer_target_snapshot(last_spoken, speech_reason_last)
         if not str(target.get("utterance", "") or "").strip():
-            return [self._speech_control("No recent assistant utterance to correct.", channel=channel, correlation_id=correlation_id)]
+            return [self._speech_error("No recent assistant utterance to correct.", channel=channel, correlation_id=correlation_id)]
 
         prev_allow = bool(await ctx.get_kv("attention:allow_babble", True))
         await ctx.set_kv("control:t_prev_allow_babble", prev_allow)
@@ -753,6 +877,175 @@ class TextInputNeuron(BaseNeuron):
         )]
 
     # ------------------------------------------------------------------
+    # /camera: control webcam capture without generating command percept/text
+    # ------------------------------------------------------------------
+    async def _handle_camera_command(
+        self,
+        cmd_text: str,
+        ctx,
+        channel: str,
+        correlation_id: str,
+    ) -> List[Event]:
+        line = (cmd_text or "").strip()
+        parts = line.split(maxsplit=2)  # "/camera", "<subcmd>", "<rest...>"
+
+        if len(parts) == 1:
+            enabled = bool(await ctx.get_kv("camera:enabled", False))
+            selected = await ctx.get_kv("camera:selected", None)
+            selected_text = "-"
+            if isinstance(selected, dict):
+                selected_text = f"{selected.get('index', '?')}: {selected.get('name', 'Camera')}"
+            msg = (
+                f"camera: {'on' if enabled else 'off'} | selected={selected_text}\n"
+                "Usage: /camera list | /camera select <index> | /camera on|off | /camera preview on|off | /camera status"
+            )
+            return [self._speech_control(msg, channel=channel, correlation_id=correlation_id)]
+
+        subcmd = (parts[1] or "").strip().lower()
+        rest = (parts[2] or "").strip() if len(parts) > 2 else ""
+
+        if subcmd in ("status", "state"):
+            enabled = bool(await ctx.get_kv("camera:enabled", False))
+            preview = bool(await ctx.get_kv("camera:preview", False))
+            selected = await ctx.get_kv("camera:selected", None)
+            selected_text = "-"
+            if isinstance(selected, dict):
+                selected_text = f"{selected.get('index', '?')}: {selected.get('name', 'Camera')}"
+            fps = await ctx.get_kv("camera:fps", 2.0)
+            msg = f"camera: {'on' if enabled else 'off'} | preview={'on' if preview else 'off'} | selected={selected_text} | fps={fps}"
+            return [self._speech_control(msg, channel=channel, correlation_id=correlation_id)]
+
+        if subcmd == "list":
+            try:
+                from microbrain.utils.mb_vision.camera_grabber import list_cameras
+                cams = list_cameras()
+                try:
+                    await ctx.set_kv("camera:devices_last", [c.as_dict() for c in cams])
+                except Exception:
+                    pass
+            except Exception as e:
+                return [self._speech_error(
+                    f"Camera list failed: {e!r}",
+                    channel=channel,
+                    correlation_id=correlation_id,
+                )]
+
+            if not cams:
+                return [self._speech_control(
+                    "No cameras found. Install/check opencv-python and camera permissions if this seems wrong.",
+                    channel=channel,
+                    correlation_id=correlation_id,
+                )]
+
+            lines = ["Cameras:"]
+            for cam in cams[:25]:
+                desc = f"  [{cam.index}] {cam.name}"
+                if cam.width and cam.height:
+                    desc += f" ({cam.width}x{cam.height})"
+                if cam.backend:
+                    desc += f" [{cam.backend}]"
+                lines.append(desc)
+            if len(cams) > 25:
+                lines.append(f"...and {len(cams) - 25} more")
+            lines.append("Pick one with: /camera select <index>")
+            return [self._speech_control("\n".join(lines), channel=channel, correlation_id=correlation_id)]
+
+        if subcmd == "select":
+            if not rest:
+                return [self._speech_error(
+                    "Usage: /camera select <index>",
+                    channel=channel,
+                    correlation_id=correlation_id,
+                )]
+            try:
+                idx = int(rest)
+            except Exception:
+                return [self._speech_error(
+                    "Usage: /camera select <index>  (index must be a number)",
+                    channel=channel,
+                    correlation_id=correlation_id,
+                )]
+            if idx < 0 or idx > 32:
+                return [self._speech_error(
+                    "Camera index out of safe probe range 0..32.",
+                    channel=channel,
+                    correlation_id=correlation_id,
+                )]
+
+            chosen = {"index": idx, "name": f"Camera {idx}", "ts": time.time()}
+            try:
+                cached = await ctx.get_kv("camera:devices_last", None)
+                if isinstance(cached, list):
+                    for row in cached:
+                        if isinstance(row, dict) and int(row.get("index", -1)) == idx:
+                            chosen.update(row)
+                            break
+            except Exception:
+                pass
+
+            await ctx.set_kv("camera:selected", chosen)
+            await ctx.set_kv("camera:selected_index", idx)
+            return [
+                Event(
+                    topic="control/camera",
+                    payload={"action": "select", "index": idx, "camera": chosen},
+                    source=self.name,
+                    correlation_id=correlation_id,
+                    meta={"control": True, "kind": "camera_control"},
+                ),
+                self._speech_control(
+                    f"Selected camera: {idx} ({chosen.get('name', 'Camera')}).",
+                    channel=channel,
+                    correlation_id=correlation_id,
+                ),
+            ]
+
+        if subcmd in ("on", "off"):
+            return [
+                Event(
+                    topic="control/camera",
+                    payload={"action": subcmd},
+                    source=self.name,
+                    correlation_id=correlation_id,
+                    meta={"control": True, "kind": "camera_control"},
+                ),
+                self._speech_control(
+                    f"Camera {subcmd}.",
+                    channel=channel,
+                    correlation_id=correlation_id,
+                ),
+            ]
+
+        if subcmd == "preview":
+            if rest.lower() in ("on", "off"):
+                act = "preview_on" if rest.lower() == "on" else "preview_off"
+                return [
+                    Event(
+                        topic="control/camera",
+                        payload={"action": act},
+                        source=self.name,
+                        correlation_id=correlation_id,
+                        meta={"control": True, "kind": "camera_control"},
+                    ),
+                    self._speech_control(
+                        f"Camera preview {rest.lower()}.",
+                        channel=channel,
+                        correlation_id=correlation_id,
+                    ),
+                ]
+            return [self._speech_error(
+                "Usage: /camera preview on|off",
+                channel=channel,
+                correlation_id=correlation_id,
+            )]
+
+        return [self._speech_error(
+            "Unknown /camera subcommand. Try: list, select, on, off, preview on|off, status",
+            channel=channel,
+            correlation_id=correlation_id,
+        )]
+
+    # ------------------------------------------------------------------
     # /focus: set vision reticle focus (normalized 0..1), no percept/text
     # ------------------------------------------------------------------
     async def _handle_focus_command(
@@ -872,7 +1165,7 @@ class TextInputNeuron(BaseNeuron):
             try:
                 v = float(rest)
             except Exception:
-                return [self._speech_control("Usage: /power pct <0-100> or /power set <0-100>", channel=channel, correlation_id=correlation_id)]
+                return [self._speech_error("Usage: /power pct <0-100> or /power set <0-100>", channel=channel, correlation_id=correlation_id)]
             v = max(0.0, min(100.0, v))
 
             # Immediately persist state so /power status reflects it right away
@@ -902,7 +1195,7 @@ class TextInputNeuron(BaseNeuron):
         
         if subcmd == "charging":
             if rest.lower() not in ("on", "off", "true", "false", "1", "0"):
-                return [self._speech_control("Usage: /power charging on|off", channel=channel, correlation_id=correlation_id)]
+                return [self._speech_error("Usage: /power charging on|off", channel=channel, correlation_id=correlation_id)]
             val = rest.lower() in ("on", "true", "1")
 
             # Immediately persist state so /power status reflects it right away
@@ -929,7 +1222,7 @@ class TextInputNeuron(BaseNeuron):
         
         if subcmd == "sleep":
             if rest.lower() not in ("on", "off", "true", "false", "1", "0"):
-                return [self._speech_control("Usage: /power sleep on|off", channel=channel, correlation_id=correlation_id)]
+                return [self._speech_error("Usage: /power sleep on|off", channel=channel, correlation_id=correlation_id)]
             val = rest.lower() in ("on", "true", "1")
 
             # Immediately persist state so /power status reflects it right away
@@ -954,7 +1247,7 @@ class TextInputNeuron(BaseNeuron):
                 self._speech_control(f"Sleep {'on' if val else 'off'}.", channel=channel, correlation_id=correlation_id),
             ]
         
-        return [self._speech_control("Unknown /power subcommand. Try: status, pct, set, charging, sleep", channel=channel, correlation_id=correlation_id)]
+        return [self._speech_error("Unknown /power subcommand. Try: status, pct, set, charging, sleep", channel=channel, correlation_id=correlation_id)]
 
     async def _handle_cookie_command(
         self,
@@ -1065,18 +1358,107 @@ class TextInputNeuron(BaseNeuron):
                 self._speech_control("Read next chunk requested.", channel=channel, correlation_id=correlation_id),
             ]
 
-        return [self._speech_control("Unknown /read subcommand. Try: on, off, status, next", channel=channel, correlation_id=correlation_id)]
+        return [self._speech_error("Unknown /read subcommand. Try: on, off, status, next", channel=channel, correlation_id=correlation_id)]
 
 
     def _speech_user_profile(self, text: str, channel: str, correlation_id: str) -> Event:
-        return Event(
-            topic="act/speech",
-            payload={"text": text, "style": "system", "channel": channel},
-            source=self.name,
+        return self._control_status(
+            text,
+            channel=channel,
             correlation_id=correlation_id,
-            meta={"control": True, "kind": "user_profile"},
+            kind="user_profile",
         )
 
+
+
+    # ------------------------------------------------------------------
+    # /slearn: structured CAPS learning sheets
+    # ------------------------------------------------------------------
+    async def _handle_slearn_command(
+        self,
+        cmd_text: str,
+        ctx,
+        channel: str,
+        correlation_id: str,
+    ) -> List[Event]:
+        line = (cmd_text or "").strip()
+        parts = line.split(maxsplit=2)
+        sub = parts[1].lower() if len(parts) >= 2 else "status"
+        rest = parts[2].strip() if len(parts) >= 3 else ""
+
+        if sub in ("status", "stat", "state"):
+            enabled = bool(await ctx.get_kv("slearn:enabled", False))
+            directory = str(await ctx.get_kv("slearn:dir", "") or "")
+            weight = int(await ctx.get_kv("slearn:default_weight", 3) or 3)
+            last = await ctx.get_kv("slearn:last_result", None)
+            msg = f"Structured learning: {'on' if enabled else 'off'} | weight=+{weight} | dir={directory or '(default Z:\\memory\\slearn_dir)'}"
+            if isinstance(last, dict):
+                msg += f"\nLast: {last.get('summary', last)}"
+            msg += "\nUsage: /slearn on|off|status|next|dir <path>|weight <1-5>|template"
+            return [self._speech_control(msg, channel=channel, correlation_id=correlation_id)]
+
+        if sub in ("on", "start"):
+            await ctx.set_kv("slearn:enabled", True)
+            return [
+                Event(
+                    topic="control/slearn",
+                    payload={"command": "on"},
+                    source=self.name,
+                    correlation_id=correlation_id,
+                    meta=self._control_meta(kind="slearn_control"),
+                ),
+                self._speech_control("Structured learning on. Drop .txt/.md/.slearn files into the slearn_dir.", channel=channel, correlation_id=correlation_id),
+            ]
+
+        if sub in ("off", "stop"):
+            await ctx.set_kv("slearn:enabled", False)
+            return [
+                Event(
+                    topic="control/slearn",
+                    payload={"command": "off"},
+                    source=self.name,
+                    correlation_id=correlation_id,
+                    meta=self._control_meta(kind="slearn_control"),
+                ),
+                self._speech_control("Structured learning off.", channel=channel, correlation_id=correlation_id),
+            ]
+
+        if sub in ("next", "step"):
+            return [
+                Event(
+                    topic="control/slearn",
+                    payload={"command": "next"},
+                    source=self.name,
+                    correlation_id=correlation_id,
+                    meta=self._control_meta(kind="slearn_control"),
+                ),
+                self._speech_control("Structured learning next chunk requested.", channel=channel, correlation_id=correlation_id),
+            ]
+
+        if sub == "dir":
+            if not rest:
+                return [self._speech_error("Usage: /slearn dir <folder>", channel=channel, correlation_id=correlation_id)]
+            await ctx.set_kv("slearn:dir", rest)
+            return [self._speech_control(f"Structured learning directory set: {rest}", channel=channel, correlation_id=correlation_id)]
+
+        if sub == "weight":
+            try:
+                weight = max(1, min(5, int(rest)))
+            except Exception:
+                return [self._speech_error("Usage: /slearn weight <1-5>", channel=channel, correlation_id=correlation_id)]
+            await ctx.set_kv("slearn:default_weight", weight)
+            return [self._speech_control(f"Structured learning default weight set to +{weight}.", channel=channel, correlation_id=correlation_id)]
+
+        if sub == "template":
+            template = (
+                "Structured learning sheet format: one rule per line. Lines beginning with # are ignored.\n"
+                "IF USER says moin THEN CLASSIFY social_greeting, warmth, friendly AND REPLY good morning\n"
+                "IF USER says thanks THEN CLASSIFY gratitude, warmth, friendly AND REPLY you're welcome\n"
+                "IF USER says stop THEN CLASSIFY boundary, user_serious AND NOT REPLY playful"
+            )
+            return [self._speech_control(template, channel=channel, correlation_id=correlation_id)]
+
+        return [self._speech_error("Unknown /slearn subcommand. Try: on, off, status, next, dir, weight, template", channel=channel, correlation_id=correlation_id)]
 
     # ------------------------------------------------------------------
     # /r reinforcement: ephemeral snapshot menu + apply weight + clear
@@ -1306,13 +1688,48 @@ class TextInputNeuron(BaseNeuron):
                 break
         return out
 
-    def _speech_control(self, text: str, channel: str, correlation_id: str) -> Event:
+    def _control_meta(self, *, kind: str) -> Dict[str, Any]:
+        return {
+            "control": True,
+            "kind": kind,
+            "memory_source": "system_telemetry",
+            "store_in_memory": False,
+            "reinforcement_eligible": False,
+            "self_output_track": False,
+            "cognitive_visible": False,
+        }
+
+    def _control_status(
+        self,
+        text: str,
+        *,
+        channel: str,
+        correlation_id: str,
+        kind: str = "command_status",
+    ) -> Event:
         return Event(
-            topic="act/speech",
+            topic="ui/status",
             payload={"text": text, "style": "system", "channel": channel},
             source=self.name,
             correlation_id=correlation_id,
-            meta={"control": True, "kind": "reinforcement"},
+            meta=self._control_meta(kind=kind),
+        )
+
+    def _speech_control(self, text: str, channel: str, correlation_id: str) -> Event:
+        return self._control_status(
+            text,
+            channel=channel,
+            correlation_id=correlation_id,
+            kind="command_status",
+        )
+
+    def _speech_error(self, text: str, channel: str, correlation_id: str) -> Event:
+        return Event(
+            topic="ui/error",
+            payload={"text": text, "style": "system", "channel": channel},
+            source=self.name,
+            correlation_id=correlation_id,
+            meta=self._control_meta(kind="command_error"),
         )
 
 

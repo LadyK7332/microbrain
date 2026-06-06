@@ -143,13 +143,13 @@ class NeedReleaseVectorNeuron(BaseNeuron):
         urgency = _safe_float(pressure.get("urgency", 0.0), 0.0)
         if urgency >= 0.85:
             style = "urgent_direct"
-            message = "Power is critically low. I need a cookie or charge soon."
+            message = "I need to charge soon."
         elif urgency >= 0.55:
             style = "direct_simple"
-            message = "Power is getting low. A cookie would help."
+            message = "My power is getting low."
         else:
             style = "gentle_notice"
-            message = "Power is dipping a bit. A cookie would help later."
+            message = "Power is dipping a bit."
 
         chosen.update({
             "need": "power",
@@ -163,7 +163,8 @@ class NeedReleaseVectorNeuron(BaseNeuron):
     async def _emit_request(self, ctx, event: Event, pressure: Dict[str, Any], vector: Dict[str, Any], now: float) -> list[Event]:
         outlet = vector.get("outlet")
         style = str(vector.get("style", "direct_simple") or "direct_simple")
-        message = str(vector.get("message", "Power is getting low. A cookie would help.") or "Power is getting low. A cookie would help.")
+        message = str(vector.get("message", "I need to charge.") or "I need to charge.")
+        thought_text = self._need_thought_text(pressure, style)
 
         pending = {
             "need": "power",
@@ -173,6 +174,7 @@ class NeedReleaseVectorNeuron(BaseNeuron):
             "outlet": outlet,
             "style": style,
             "message": message,
+            "thought_text": thought_text,
             "correlation_id": event.correlation_id,
         }
         await ctx.set_kv("drive:power_pending_request", pending)
@@ -180,6 +182,29 @@ class NeedReleaseVectorNeuron(BaseNeuron):
         await ctx.set_kv("drive:power:last_signal_style", style)
 
         outputs = [
+            Event(
+                topic="thought/internal",
+                payload={
+                    "text": thought_text,
+                    "kind": "need_state",
+                    "source_need": "power",
+                    "urgency": _safe_float(pressure.get("urgency", 0.0), 0.0),
+                    "pressure": pressure,
+                    "style": style,
+                    "threshold_band": self._threshold_band(_safe_float(pressure.get("urgency", 0.0), 0.0)),
+                },
+                source=self.name,
+                correlation_id=event.correlation_id,
+                meta={
+                    "channel": "thought",
+                    "kind": "need_state_thought",
+                    "need": "power",
+                    "store_in_memory": False,
+                    "reinforcement_eligible": False,
+                    "self_output_track": False,
+                    "cognitive_visible": False,
+                },
+            ),
             Event(
                 topic="drive/power_request",
                 payload=pending,
@@ -204,6 +229,24 @@ class NeedReleaseVectorNeuron(BaseNeuron):
             ),
         ]
         return outputs
+
+    def _threshold_band(self, urgency: float) -> str:
+        if urgency >= 0.85:
+            return "critical"
+        if urgency >= 0.55:
+            return "active"
+        if urgency > 0.0:
+            return "rising"
+        return "inactive"
+
+    def _need_thought_text(self, pressure: Dict[str, Any], style: str) -> str:
+        pct = _safe_float(pressure.get("pct", 100.0), 100.0)
+        urgency = _safe_float(pressure.get("urgency", 0.0), 0.0)
+        if style == "urgent_direct" or urgency >= 0.85:
+            return f"Power is critical at {pct:.0f}%. I need to charge."
+        if style == "direct_simple" or urgency >= 0.55:
+            return f"Power is low at {pct:.0f}%. I need to charge."
+        return f"Power is dipping at {pct:.0f}%. I should top up soon."
 
     async def process(self, event: Event, ctx) -> Iterable[Event]:
         now = time.time()
@@ -251,7 +294,7 @@ def build_neurons(orchestrator: Orchestrator):
     cfg = NeuronConfig(
         name=NEURON_NAME,
         subscribed_topics=["clock/tick", "control/power", "event/relief/power"],
-        output_topics=["drive/power_request", "speech/reason"],
+        output_topics=["thought/internal", "drive/power_request", "speech/reason"],
         priority=8,
         cooldown_sec=0.0,
     )

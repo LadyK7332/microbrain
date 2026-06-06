@@ -160,6 +160,8 @@ class MicroBrainUI(App):
                 log.write(f"[red]error>[/red] {text}")
             elif msg.topic in ("ui/status", "control/status") and text is not None:
                 log.write(f"[dim]status>[/dim] {text}")
+            elif msg.topic == "thought/internal" and text is not None:
+                log.write(f"[magenta]thought>[/magenta] {text}")
             elif msg.topic == "act/speech" and effective_channel == "thought" and text is not None:
                 log.write(f"[magenta]thought>[/magenta] {text}")
             elif msg.topic == "act/speech" and text is not None:

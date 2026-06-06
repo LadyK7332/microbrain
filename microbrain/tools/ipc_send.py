@@ -32,7 +32,7 @@ def main() -> int:
         out = writer.publish(topic, {"drawer": args.drawer, "data_ref": args.data_ref})
     else:
         if not args.topic:
-            if not args.topic:
+            raise SystemExit("--topic is required unless --done is used")
         payload = json.loads(args.payload)
         dedupe_key = args.dedupe_key if args.dedupe_key else None
         out = writer.publish(args.topic, payload, dedupe_key=dedupe_key)

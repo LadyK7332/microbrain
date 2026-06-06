@@ -38,22 +38,29 @@ def _looks_stock_reply(text: str) -> bool:
     return norm.startswith("i heard your question") or norm.startswith("i heard you")
 
 
-def _accent_from_meta(raw_meta: Mapping[str, Any]) -> tuple[float, float, str]:
+def _accent_from_meta(raw_meta: Mapping[str, Any]) -> tuple[float, float, float, float, str]:
+    """Return signed /acc metadata.
+
+    + values are positive emphasis / preference pull.
+    - values are correction severity / preference push-away.
+    Magnitude still records how strong the user marked the tone.
+    """
     try:
         value = float(raw_meta.get("accent_value", 0.0) or 0.0)
     except Exception:
         value = 0.0
-    if value < -10.0:
-        value = -10.0
-    if value > 10.0:
-        value = 10.0
+    value = max(-10.0, min(10.0, value))
+
     try:
-        intensity = float(raw_meta.get("accent_intensity", abs(value)) or abs(value))
+        magnitude = float(raw_meta.get("accent_magnitude", raw_meta.get("accent_intensity", abs(value))) or abs(value))
     except Exception:
-        intensity = abs(value)
-    intensity = max(0.0, min(10.0, intensity))
+        magnitude = abs(value)
+    magnitude = max(0.0, min(10.0, magnitude))
+
+    positive = max(0.0, value)
+    negative_severity = abs(min(0.0, value))
     label = str(raw_meta.get("tone_label", "") or "").strip()
-    return value, intensity, label
+    return value, magnitude, positive, negative_severity, label
 
 
 class NativeResponderNeuron(BaseNeuron):
@@ -248,8 +255,9 @@ class NativeResponderNeuron(BaseNeuron):
         needs = await ctx.get_kv("drive:needs_stack", {}) or {}
         social_interaction = await ctx.get_kv("drive:social_interaction", {}) or {}
         social_experimentation = await ctx.get_kv("drive:social_experimentation", {}) or {}
+        thought_momentum = await ctx.get_kv("thought:momentum", {}) or {}
         raw_meta = raw_meta if isinstance(raw_meta, Mapping) else {}
-        accent_value, accent_intensity, tone_label = _accent_from_meta(raw_meta)
+        accent_value, accent_magnitude, accent_positive, accent_negative_severity, tone_label = _accent_from_meta(raw_meta)
 
         text_norm = _norm(text)
         is_question = text.strip().endswith("?")
@@ -268,6 +276,8 @@ class NativeResponderNeuron(BaseNeuron):
         connect = _safe_float(wants.get("connect", 0.0))
         social_level = _safe_float(social_interaction.get("level", 0.0), 0.0) if isinstance(social_interaction, Mapping) else 0.0
         social_experiment_pressure = _safe_float(social_experimentation.get("pressure", 0.0), 0.0) if isinstance(social_experimentation, Mapping) else 0.0
+        momentum_pressure = _safe_float(thought_momentum.get("pressure", 0.0), 0.0) if isinstance(thought_momentum, Mapping) else 0.0
+        momentum_intent = str(thought_momentum.get("dominant_intent", "") or "") if isinstance(thought_momentum, Mapping) else ""
         caution = _safe_float(hormones.get("caution", 0.0))
         affiliation = _safe_float(hormones.get("affiliation", 0.0))
         continuity = _safe_float(hormones.get("continuity", 0.0))
@@ -285,12 +295,19 @@ class NativeResponderNeuron(BaseNeuron):
             direct_bonus += 0.24
         if transport_source in ("textual", "cli", "ui", "mic"):
             direct_bonus += 0.12
-        if accent_intensity >= 7.0:
-            # High explicit tone/intensity is a stronger bid for attention, not literal content.
-            direct_bonus += min(0.14, accent_intensity / 100.0)
-        elif accent_intensity <= 0.25 and raw_meta.get("accent_source") == "acc_command":
-            # /acc 0 = intentionally flat/dead tone; treat as lower expressive pressure.
-            direct_bonus -= 0.04
+        if accent_positive >= 7.0:
+            # Positive /acc is a stronger emphasis/preference bid, not literal content.
+            direct_bonus += min(0.14, accent_positive / 100.0)
+        elif accent_negative_severity >= 7.0:
+            # Negative /acc is important as correction, but it should not become
+            # a positive salience/preference boost for repeating the content.
+            direct_bonus -= min(0.10, accent_negative_severity / 120.0)
+        elif accent_magnitude <= 0.25 and raw_meta.get("accent_source") == "acc_command":
+            # /acc 0 = explicitly neutral tone; do not add salience.
+            direct_bonus -= 0.02
+
+        if momentum_pressure >= 0.20:
+            direct_bonus += min(0.08, momentum_pressure * 0.07)
 
         outward_urge = _clamp((externalize * expression_bias) + (0.18 * connect) + (0.10 * continuity) + (0.08 * social_level) + direct_bonus)
         brake = _clamp((withhold * restraint_bias) + (0.10 * caution))
@@ -324,10 +341,14 @@ class NativeResponderNeuron(BaseNeuron):
         outward_scale = max(0.05, _safe_float(rosehip.get("outward_scale", 1.0), 1.0))
         direct_reply_floor = _safe_float(rosehip.get("direct_reply_floor", 0.0))
         external_bias = _safe_float(rosehip.get("external_bias", 0.0))
+        accent_negative_brake = min(0.18, accent_negative_severity / 70.0)
+        accent_positive_push = min(0.12, accent_positive / 85.0)
 
         release_score = _clamp(
             (outward_urge * outward_scale)
             + (0.10 * external_bias)
+            + accent_positive_push
+            - accent_negative_brake
             - brake
             - (0.18 * expression_brake)
             - (0.10 * social_brake)
@@ -342,6 +363,7 @@ class NativeResponderNeuron(BaseNeuron):
         terse = _clamp(
             (0.55 * restraint_bias)
             + (0.22 * caution)
+            + (0.10 * accent_negative_severity / 10.0)
             + (0.24 * expression_brake)
             + (0.18 * redundancy_brake)
             + (0.14 * interrupt_brake)
@@ -353,7 +375,9 @@ class NativeResponderNeuron(BaseNeuron):
             + (0.18 * connect)
             + (0.10 * social_level)
             + (0.05 * social_experiment_pressure)
-            + (0.03 * max(0.0, accent_value) / 10.0)
+            + (0.04 * momentum_pressure if momentum_intent in {"social_continuity", "seek_social_contact", "social_experiment"} else 0.0)
+            + (0.03 * accent_positive / 10.0)
+            - (0.05 * accent_negative_severity / 10.0)
             + (0.12 * expression_bias)
             - (0.10 * restraint_bias)
             - (0.18 * social_brake)
@@ -365,6 +389,8 @@ class NativeResponderNeuron(BaseNeuron):
             + (0.10 * withhold)
             - (0.08 * connect)
             + (0.22 * clarify_bias)
+            + (0.05 * momentum_pressure if momentum_intent in {"understand_user", "resolve_thread", "curiosity"} else 0.0)
+            + (0.06 * accent_negative_severity / 10.0)
             - (0.10 * redundancy_brake)
         )
 
@@ -410,8 +436,12 @@ class NativeResponderNeuron(BaseNeuron):
             "restraint_bias": round(restraint_bias, 4),
             "social_level": round(social_level, 4),
             "social_experiment_pressure": round(social_experiment_pressure, 4),
+            "thought_momentum_pressure": round(momentum_pressure, 4),
+            "thought_momentum_intent": momentum_intent,
             "accent_value": round(accent_value, 4),
-            "accent_intensity": round(accent_intensity, 4),
+            "accent_magnitude": round(accent_magnitude, 4),
+            "accent_positive": round(accent_positive, 4),
+            "accent_negative_severity": round(accent_negative_severity, 4),
             "tone_label": tone_label,
         }
 
@@ -584,18 +614,28 @@ class NativeResponderNeuron(BaseNeuron):
             rel = relations[0]
             subj = str(rel.get("subject", "") or "something")
             relation = str(rel.get("relation", "") or "related to")
-            obj = str(rel.get("object", "") or "something")
-            if obj:
-                return choose(
-                    f"I got: {subj} {relation} {obj}.",
-                    f"I parsed a relation that looks like: {subj} {relation} {obj}.",
-                    f"I parsed a relation that looks like: {subj} {relation} {obj}.",
-                )
-            return choose(
-                f"I got: {subj} {relation}.",
-                f"I parsed a relation centered on {subj} and {relation}.",
-                f"I parsed a relation centered on {subj} and {relation}.",
-            )
+            obj = str(rel.get("object", "") or "")
+            relation_text = f"{subj} {relation} {obj}".strip() if obj else f"{subj} {relation}".strip()
+            await ctx.emit(Event(
+                topic="thought/internal",
+                payload={
+                    "text": f"parsed relation: {relation_text}",
+                    "kind": "relation_parse",
+                    "subject": subj,
+                    "relation": relation,
+                    "object": obj,
+                },
+                source=self.name,
+                meta={
+                    "channel": "thought",
+                    "kind": "relation_parse",
+                    "store_in_memory": False,
+                    "reinforcement_eligible": False,
+                    "self_output_track": False,
+                    "cognitive_visible": False,
+                },
+            ))
+            return ""
 
         if mode == "noun_reflect" and noun_candidates:
             lemmas = [str(n.get("lemma", "")) for n in noun_candidates[:3] if str(n.get("lemma", ""))]

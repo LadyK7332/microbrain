@@ -33,9 +33,11 @@ def _is_control_or_internal(event: Event) -> bool:
     meta = dict(event.meta or {})
     payload = event.payload if isinstance(event.payload, dict) else {}
     channel = str(payload.get("channel", "") or meta.get("channel", "") or "")
+    text = _text_from_event(event)
     return (
         bool(meta.get("control", False))
         or bool(meta.get("cognitive_visible") is False)
+        or text.lstrip().startswith("/")
         or event.topic.startswith("ui/")
         or event.topic.startswith("control/")
         or channel in {"internal", "thought"}

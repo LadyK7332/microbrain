@@ -71,7 +71,7 @@ class SpeechReasonNeuron(BaseNeuron):
     def _need_lexicon(self, need: str) -> set[str]:
         lowered = str(need or "").lower()
         if lowered == "power":
-            return {"power", "low", "cookie", "charge", "battery", "help"}
+            return {"power", "low", "charge", "battery", "recharge", "top", "help"}
         if lowered == "interaction":
             return {"answer", "reply", "respond", "clarify", "question", "hello", "hey", "here", "want", "feel"}
         return set()
@@ -84,7 +84,7 @@ class SpeechReasonNeuron(BaseNeuron):
         pending_text = str(payload.get("pending_text", "") or "")
         options = [need, style, message, pending_text, str(vector.get("message", "") or "")]
         if need == "power":
-            options.extend(["power low", "battery low", "cookie", "charge", "need help", "power request"])
+            options.extend(["power low", "battery low", "charge", "recharge", "need help", "power request"])
         elif need == "interaction":
             options.extend(["interaction pressure", "reply needed", "open thread", "clarify response", "social response"])
         query = " ".join(part for part in options if part)
@@ -184,18 +184,52 @@ class SpeechReasonNeuron(BaseNeuron):
         n = len(clean)
         if style == "urgent_direct":
             score = 0.10 if n <= 72 else 0.02
-            if any(tok in clean.lower() for tok in ("need", "soon", "critical", "low", "charge", "cookie")):
+            if any(tok in clean.lower() for tok in ("need", "soon", "critical", "low", "charge", "recharge")):
                 score += 0.10
             return score
         if style == "gentle_notice":
             score = 0.08 if n <= 96 else 0.03
-            if any(tok in clean.lower() for tok in ("later", "bit", "dipping", "help")):
+            if any(tok in clean.lower() for tok in ("soon", "bit", "dipping", "top", "charge")):
                 score += 0.08
             return score
         score = 0.10 if n <= 88 else 0.03
-        if any(tok in clean.lower() for tok in ("power", "low", "cookie", "help", "charge")):
+        if any(tok in clean.lower() for tok in ("power", "low", "help", "charge", "recharge")):
             score += 0.08
         return score
+
+    def _fallback_variants(self, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+        need = str(payload.get("need", "") or "")
+        style = str(payload.get("style", "direct_simple") or "direct_simple")
+        if need != "power":
+            return [self._base_candidate(payload)]
+        if style == "urgent_direct":
+            texts = [
+                "I need to charge soon.",
+                "Power is critical; I may need to slow down.",
+                "I need help reaching charge.",
+            ]
+        elif style == "gentle_notice":
+            texts = [
+                "Power is dipping a bit.",
+                "I should top up soon.",
+                "Charging later would help.",
+            ]
+        else:
+            texts = [
+                "My power is getting low.",
+                "I should recharge soon.",
+                "Can you help me charge?",
+            ]
+        out: List[Dict[str, Any]] = []
+        for idx, text in enumerate(texts):
+            out.append({
+                "text": text,
+                "source": "fallback",
+                "role": "assistant",
+                "score": round(0.18 - (idx * 0.015), 4),
+                "kind": "fallback_need_variant",
+            })
+        return out
 
     def _base_candidate(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         text = self._clean_text(str(payload.get("message", "") or ""))
@@ -255,6 +289,10 @@ class SpeechReasonNeuron(BaseNeuron):
             if penalty > 0.0:
                 score = max(0.0, score - penalty)
                 item["repeat_penalty"] = penalty
+                if str(payload.get("need", "") or "") and self._norm(str(item.get("text", "") or "")) == self._norm(str(recent.get("utterance", "") or "")):
+                    # Need-state speech must not repeat the same attempt without a new result.
+                    score = 0.0
+                    item["repeat_blocked"] = True
             meta = item.get("meta", {}) if isinstance(item.get("meta", {}), dict) else {}
             ddna_bonus = self._ddna_bonus(meta, need=need, style=style)
             if ddna_bonus:
@@ -409,9 +447,9 @@ class SpeechReasonNeuron(BaseNeuron):
         query = self._query_text(payload)
 
         candidates: List[Dict[str, Any]] = []
-        fallback = self._base_candidate(payload)
-        if not self._is_bad_candidate(fallback["text"]):
-            candidates.append(fallback)
+        for fallback in self._fallback_variants(payload):
+            if not self._is_bad_candidate(fallback["text"]):
+                candidates.append(fallback)
 
         mem_store = await ctx.get_kv("memory:store", None)
         if isinstance(mem_store, MemoryStore):
@@ -536,8 +574,30 @@ class SpeechReasonNeuron(BaseNeuron):
             reverse=True,
         )
         chosen = self._select_candidate(payload, candidates)
+        chosen_score = self._safe_float(chosen.get("score", 0.0), 0.0)
         utterance = self._clean_text(chosen.get("text", "") or payload.get("message", ""))
-        if not utterance:
+        if (not utterance) or (str(payload.get("need", "") or "") and chosen_score <= 0.0):
+            need = str(payload.get("need", "") or "")
+            if need:
+                await ctx.emit(Event(
+                    topic="thought/internal",
+                    payload={
+                        "text": f"The {need} need is unresolved, but the last expression was stale. I need a different route.",
+                        "kind": "need_expression_blocked",
+                        "source_need": need,
+                    },
+                    source=self.name,
+                    correlation_id=event.correlation_id,
+                    meta={
+                        "channel": "thought",
+                        "kind": "need_expression_blocked",
+                        "need": need,
+                        "store_in_memory": False,
+                        "reinforcement_eligible": False,
+                        "self_output_track": False,
+                        "cognitive_visible": False,
+                    },
+                ))
             return []
 
         await self._update_pending_request(ctx, event, chosen)

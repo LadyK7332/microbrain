@@ -48,12 +48,15 @@ class ActionSelectorNeuron(BaseNeuron):
         boredom = (drives.get("boredom", {}) or {})
         social_interaction = (drives.get("social_interaction", {}) or {})
         social_experimentation = (drives.get("social_experimentation", {}) or {})
+        thought_momentum = context.get("thought_momentum", {}) or {}
         constraints = context.get("constraints", {}) or {}
 
         crisis_mode = bool(constraints.get("crisis_mode", False))
         boredom_level = float(boredom.get("level", 0.0) or 0.0)
         social_level = float(social_interaction.get("level", 0.0) or 0.0)
         social_experiment_pressure = float(social_experimentation.get("pressure", 0.0) or 0.0)
+        momentum_pressure = float(thought_momentum.get("pressure", 0.0) or 0.0) if isinstance(thought_momentum, dict) else 0.0
+        momentum_intent = str(thought_momentum.get("dominant_intent", "") or "") if isinstance(thought_momentum, dict) else ""
         association_count = len(associations)
         top_assoc_score = float(association_meta.get("top_score", 0.0) or 0.0)
         llm_enabled = bool(await ctx.get_kv("llm:enabled", False))
@@ -80,6 +83,10 @@ class ActionSelectorNeuron(BaseNeuron):
         score += min(0.12, social_level * 0.08)
         if social_experiment_pressure >= 0.55:
             score += min(0.10, social_experiment_pressure * 0.08)
+        if momentum_pressure >= 0.25:
+            score += min(0.10, momentum_pressure * 0.09)
+            if momentum_intent in {"understand_user", "resolve_thread", "await_result"}:
+                direct_priority += min(0.10, momentum_pressure * 0.08)
         if crisis_mode:
             score += 0.20
         score += min(0.25, direct_priority * 0.10)
@@ -95,6 +102,8 @@ class ActionSelectorNeuron(BaseNeuron):
             boredom=round(boredom_level, 3),
             social=round(social_level, 3),
             social_experiment=round(social_experiment_pressure, 3),
+            momentum=round(momentum_pressure, 3),
+            momentum_intent=momentum_intent,
             assoc_n=association_count,
             assoc_top=round(top_assoc_score, 3),
             llm_enabled=llm_enabled,
@@ -113,6 +122,8 @@ class ActionSelectorNeuron(BaseNeuron):
                 "memory_priority": memory_priority,
                 "social_level": social_level,
                 "social_experiment_pressure": social_experiment_pressure,
+                "thought_momentum_pressure": momentum_pressure,
+                "thought_momentum_intent": momentum_intent,
             },
         )
 
@@ -129,6 +140,8 @@ class ActionSelectorNeuron(BaseNeuron):
                     "boredom": boredom_level,
                     "social": social_level,
                     "social_experiment": social_experiment_pressure,
+                    "thought_momentum": momentum_pressure,
+                    "thought_momentum_intent": momentum_intent,
                     "crisis_mode": crisis_mode,
                     "trigger_kind": trigger.get("kind", "contextual"),
                 },
