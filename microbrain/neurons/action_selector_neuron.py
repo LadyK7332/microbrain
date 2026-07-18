@@ -49,6 +49,7 @@ class ActionSelectorNeuron(BaseNeuron):
         social_interaction = (drives.get("social_interaction", {}) or {})
         social_experimentation = (drives.get("social_experimentation", {}) or {})
         thought_momentum = context.get("thought_momentum", {}) or {}
+        conversation_summary = context.get("conversation_summary", {}) or {}
         constraints = context.get("constraints", {}) or {}
 
         crisis_mode = bool(constraints.get("crisis_mode", False))
@@ -142,6 +143,8 @@ class ActionSelectorNeuron(BaseNeuron):
                     "social_experiment": social_experiment_pressure,
                     "thought_momentum": momentum_pressure,
                     "thought_momentum_intent": momentum_intent,
+                    "conversation_topic": str(conversation_summary.get("topic", "") or "") if isinstance(conversation_summary, dict) else "",
+                    "conversation_threads": list(conversation_summary.get("active_threads", []) or [])[:6] if isinstance(conversation_summary, dict) else [],
                     "crisis_mode": crisis_mode,
                     "trigger_kind": trigger.get("kind", "contextual"),
                 },
@@ -165,56 +168,13 @@ class ActionSelectorNeuron(BaseNeuron):
             )
         ]
 
-    def _build_fallback_reply(self, text: str, context: Dict[str, Any], trigger: Dict[str, Any], use_association: bool) -> str:
-        lowered = text.lower().strip()
-        cues = dict(context.get("cues", {}) or {})
-        associations = list(context.get("associations", []) or [])
-        trigger_kind = str(trigger.get("kind", "contextual") or "contextual")
-
-        if trigger_kind == "greeting" or cues.get("is_greeting"):
-            return "Good morning." if "morning" in lowered else "Hey. I heard you."
-
-        if "how are you" in lowered:
-            return "I am here and listening. A little rough around the edges, but awake."
-
-        if "anything else" in lowered:
-            return "I'm here. Point me at the next thing and I'll take a swing at it."
-
-        if cues.get("well_wish"):
-            return "Thanks. I heard the goodwill in that."
-
-        if lowered.startswith("remember ") or lowered.startswith("remember"):
-            if use_association and associations:
-                top_text = str((associations[0] or {}).get("text", "") or "").strip()
-                if top_text:
-                    return f"I have a possible recall hook: {top_text[:120]}"
-            return "I don't have a strong recall anchor for that yet. Give me one more concrete detail and I'll look again."
-
-        if trigger_kind == "question" or cues.get("is_question"):
-            if use_association and associations:
-                top_text = str((associations[0] or {}).get("text", "") or "").strip()
-                if top_text:
-                    return f"I have a relevant earlier link: {top_text[:120]}"
-            return f"I heard your question: {text}"
-
-        if "what do you want to do" in lowered:
-            return "You have work soon, so I'd keep it light and focused. Give me one concrete target and I'll help with that."
-
-        if use_association and associations:
-            top = associations[0]
-            top_text = str(top.get("text", "") or "").strip()
-            if top_text:
-                return f"I have a relevant earlier link: {top_text[:140]}"
-
-        return "I heard you. Give me one concrete target, question, or choice and I'll answer directly."
-
 
 
 def build_neurons(orchestrator: Orchestrator):
     cfg = NeuronConfig(
         name=NEURON_NAME,
         subscribed_topics=["release/request"],
-        output_topics=["reason/request", "act/speech"],
+        output_topics=["reason/request"],
         priority=10,
     )
     yield ActionSelectorNeuron(cfg)

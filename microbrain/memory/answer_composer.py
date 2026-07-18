@@ -14,7 +14,7 @@ QUESTION_STOPWORDS = {
     'to', 'of', 'for', 'about', 'can', 'you', 'me', 'tell', 'give', 'explain',
     'why', 'how', 'when', 'where', 'who', 'whom', 'which'
 }
-STRUCTURAL_KINDS = {'general_pattern', 'compressed_general_pattern', 'trainer_alignment'}
+STRUCTURAL_KINDS = {'general_pattern', 'compressed_general_pattern', 'thought_template', 'trainer_alignment'}
 
 
 def _norm(text: str) -> str:
@@ -68,6 +68,30 @@ def _render_pattern(hit: Dict[str, Any]) -> str:
         entity_text = ' '.join([p for p in [deixis, entity] if p]).strip()
         if entity_text:
             return f'There {copula} {entity_text}'.strip()
+    if pattern_type in {'need_action', 'query_need_action'}:
+        subject = str(slots.get('subject', '') or '').strip() or 'someone'
+        action = str(slots.get('action', '') or '').strip()
+        urgency = str(slots.get('urgency', '') or '').strip()
+        if action:
+            return ' '.join([subject, 'needs to', action, urgency]).strip()
+    if pattern_type == 'request_action':
+        action = str(slots.get('action', '') or '').strip()
+        target = str(slots.get('target', '') or '').strip()
+        if action:
+            return ' '.join(['request to', action, target]).strip()
+    if pattern_type == 'preference_action':
+        subject = str(slots.get('subject', '') or '').strip() or 'someone'
+        preference = str(slots.get('preference', 'likes') or 'likes').strip() or 'likes'
+        action = str(slots.get('action', '') or '').strip()
+        obj = str(slots.get('object', '') or '').strip()
+        if action:
+            return ' '.join([subject, preference, 'to', action, obj]).strip()
+    if pattern_type == 'action_relation':
+        subject = str(slots.get('subject', '') or '').strip()
+        action = str(slots.get('action', '') or '').strip()
+        obj = str(slots.get('object', '') or '').strip()
+        if subject and action:
+            return ' '.join([subject, action, obj]).strip()
     return _extract_body(hit)
 
 
@@ -149,13 +173,13 @@ async def compose_answer_from_memory(ctx, query_text: str) -> Dict[str, Any]:
     if not text and direct:
         chosen = direct[0].strip().rstrip('?').rstrip(' .')
         if chosen:
-            text = f"I remember: {chosen[:1].upper() + chosen[1:]}."
+            text = chosen[:1].upper() + chosen[1:] + "."
             reason = 'direct_match'
             selected_ids = [str(h.get('cell_id', '') or '') for h in direct_hits[:3] if str(h.get('cell_id', '') or '')]
 
     if not text and related:
         joined = ', '.join(related[:3])
-        text = f"For {focus_phrase}, I recall related anchors: {joined}."
+        text = joined
         reason = 'related_match'
         selected_ids = [str(h.get('cell_id', '') or '') for h in related_hits[:3] if str(h.get('cell_id', '') or '')]
 

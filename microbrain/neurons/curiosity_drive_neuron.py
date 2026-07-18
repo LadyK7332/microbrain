@@ -259,12 +259,9 @@ class CuriosityDriveNeuron(BaseNeuron):
 
             if node_text:
                 clipped = " ".join(node_text.split())[:120]
-                curiosity_text = (
-                    f"Noted. Quick check about \"{clipped}\": what should I do differently? "
-                    "Reply in 1 short sentence."
-                )
+                curiosity_text = f"curiosity_probe:correction_needed:{clipped}"
             else:
-                curiosity_text = "Noted. What should I do differently? Reply in 1 short sentence."
+                curiosity_text = "curiosity_probe:correction_needed"
 
             # Spend some boost so we don't keep probing forever
             new_boost = 0.0
@@ -274,13 +271,14 @@ class CuriosityDriveNeuron(BaseNeuron):
             llm_enabled = bool(await ctx.get_kv("llm:enabled", False))
 
             if not llm_enabled:
-                # Speak directly to the text UI when LLM is disabled
+                # No canned speech fallback. Keep the probe as an internal thought
+                # until a learned/generated response path can build words.
                 return [
                     Event(
-                        topic="act/speech",
-                        payload={"text": curiosity_text, "channel": "repl", "style": "assistant"},
+                        topic="thought/internal",
+                        payload={"kind": "curiosity_probe", "content": curiosity_text},
                         source=self.name,
-                        meta={"kind": "curiosity_probe"},
+                        meta={"channel": "thought", "kind": "curiosity_probe", "store_in_memory": False},
                     )
                 ]
 

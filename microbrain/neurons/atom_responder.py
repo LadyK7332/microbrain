@@ -20,11 +20,11 @@ def _short_concept(x: str) -> str:
 
 class AtomResponderNeuron(BaseNeuron):
     """
-    Social turn-taking for atoms:
-      - When a new entity gets typed (isa(ent, concept:...)), say it once.
-      - Then pause babble so the user can react / ask followups.
+    Atom label tracker.
 
-    This gives the "That's a pumpkin." + wait behavior.
+    The old direct speech label scaffold was removed after proving the route.
+    New labels now enter thought/internal and curiosity pressure instead of
+    speaking a canned line.
     """
 
     async def process(self, event: Event, ctx) -> Iterable[Event]:
@@ -70,16 +70,20 @@ class AtomResponderNeuron(BaseNeuron):
 
         label = _short_concept(pred)
 
-        # Speak once, then pause babble (turn-taking)
         pause_s = float(await ctx.get_kv("atoms:after_label_pause_s", 5.0) or 5.0)
 
         return [
             Event(
-                topic="act/speech",
-                payload=f"That’s a {label}.",
+                topic="thought/internal",
+                payload={
+                    "kind": "atom_label",
+                    "entity": subj,
+                    "concept": pred,
+                    "label": label,
+                },
                 source=NEURON_NAME,
                 correlation_id=event.correlation_id,
-                meta={"kind": "atom_label"},
+                meta={"channel": "thought", "kind": "atom_label", "store_in_memory": False},
             ),
             Event(
                 topic="curiosity/adjust",
@@ -95,7 +99,7 @@ def build_neurons(orchestrator: Orchestrator):
     cfg = NeuronConfig(
         name=NEURON_NAME,
         subscribed_topics=["memory/atom"],
-        output_topics=["act/speech", "curiosity/adjust"],
+        output_topics=["thought/internal", "curiosity/adjust"],
         priority=8,
     )
     yield AtomResponderNeuron(cfg)

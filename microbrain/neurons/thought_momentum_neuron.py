@@ -4,6 +4,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping
 
+from microbrain.hormone import derive_ddna_modulators
 from microbrain.orchestrator.neuron_base import BaseNeuron, Event, NeuronConfig
 from microbrain.orchestrator.orchestrator import Orchestrator
 
@@ -68,9 +69,17 @@ class ThoughtMomentumNeuron(BaseNeuron):
             return []
 
         now = time.time()
+        pdna = await ctx.get_kv("pdna:profile", None)
+        ddna_mods = await ctx.get_kv("drive:ddna_modulators", None)
+        if not isinstance(ddna_mods, dict) or not ddna_mods:
+            ddna_mods = derive_ddna_modulators(pdna)
+            await ctx.set_kv("drive:ddna_modulators", ddna_mods)
+        thought_gain = max(0.25, min(2.0, _safe_float((ddna_mods or {}).get("thought_momentum_gain"), 1.0)))
+        persistence_gain = max(0.25, min(2.0, _safe_float((ddna_mods or {}).get("drawer_persistence_gain"), 1.0)))
+
         state = await self._load_state(ctx, now)
         vectors = list(state.get("active_vectors", []) or [])
-        vectors = self._decay_vectors(vectors, now)
+        vectors = self._decay_vectors(vectors, now, decay_resistance=persistence_gain)
 
         changed = False
         additions: List[Dict[str, Any]] = []
@@ -99,6 +108,11 @@ class ThoughtMomentumNeuron(BaseNeuron):
 
         if additions:
             for vec in additions:
+                vec = dict(vec)
+                vec["strength"] = round(_clamp(_safe_float(vec.get("strength", 0.0), 0.0) * thought_gain), 4)
+                vec["decay_per_s"] = max(0.001, _safe_float(vec.get("decay_per_s", self.DEFAULT_DECAY_PER_S), self.DEFAULT_DECAY_PER_S) / persistence_gain)
+                vec["ddna_thought_gain"] = round(thought_gain, 4)
+                vec["ddna_persistence_gain"] = round(persistence_gain, 4)
                 vectors = self._upsert_vector(vectors, vec)
             changed = True
 
@@ -144,14 +158,14 @@ class ThoughtMomentumNeuron(BaseNeuron):
             active = []
         return {"active_vectors": active, "loaded_at": now}
 
-    def _decay_vectors(self, vectors: List[Dict[str, Any]], now: float) -> List[Dict[str, Any]]:
+    def _decay_vectors(self, vectors: List[Dict[str, Any]], now: float, *, decay_resistance: float = 1.0) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         for raw in vectors:
             if not isinstance(raw, Mapping):
                 continue
             vec = dict(raw)
             strength = _safe_float(vec.get("strength", 0.0), 0.0)
-            decay = _safe_float(vec.get("decay_per_s", self.DEFAULT_DECAY_PER_S), self.DEFAULT_DECAY_PER_S)
+            decay = _safe_float(vec.get("decay_per_s", self.DEFAULT_DECAY_PER_S), self.DEFAULT_DECAY_PER_S) / max(0.25, decay_resistance)
             last_ts = _safe_float(vec.get("last_update_ts", vec.get("created_at", now)), now)
             dt = max(0.0, now - last_ts)
             strength = max(0.0, strength - (decay * dt))

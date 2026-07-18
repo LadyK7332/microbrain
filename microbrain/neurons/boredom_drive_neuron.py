@@ -5,6 +5,8 @@ import re
 import time
 from typing import Iterable, Dict, Any
 
+from microbrain.hormone import derive_ddna_modulators
+from microbrain.pdna.access import profile_path
 from microbrain.orchestrator.neuron_base import BaseNeuron, NeuronConfig, Event
 from microbrain.orchestrator.orchestrator import Orchestrator
 
@@ -74,12 +76,32 @@ class BoredomDriveNeuron(BaseNeuron):
             meta=event.meta,
         )
 
-        if event.topic not in ("clock/tick", "percept/text", "percept/vision", "act/speech"):
+        if event.topic not in (
+            "clock/tick",
+            "percept/text",
+            "percept/vision",
+            "act/speech",
+            "control/reinforce",
+            "control/trainer_correction",
+            "affect/reward",
+        ):
             return []
 
         now = time.time()
         hrm_last_idx = await ctx.get_kv("hrm:last_idx", None)
         pdna_profile = await ctx.get_kv("pdna:profile", None)
+        ddna_mods = await ctx.get_kv("drive:ddna_modulators", None)
+        if not isinstance(ddna_mods, dict) or not ddna_mods:
+            ddna_mods = derive_ddna_modulators(pdna_profile)
+            await ctx.set_kv("drive:ddna_modulators", ddna_mods)
+        novelty_gain = max(0.20, min(2.0, float((ddna_mods or {}).get("novelty_gain", 1.0) or 1.0)))
+        boredom_growth_gain = max(0.20, min(2.0, float((ddna_mods or {}).get("boredom_growth_gain", 1.0) or 1.0)))
+        boredom_relief_gain = max(0.20, min(2.0, float((ddna_mods or {}).get("boredom_relief_gain", 1.0) or 1.0)))
+        boredom_relief_state = await ctx.get_kv("drive:boredom_relief", {})
+        base_idle_growth = float(profile_path(pdna_profile, "affect_model", "decay.boredom_growth_per_second_when_understimulated", 0.07) or 0.07)
+        # The profile decay value is conservative; keep the old live UI twitch
+        # if the profile is lower, but let DDNA mutate it.
+        idle_growth_per_s = max(0.012, base_idle_growth) * boredom_growth_gain
 
         state = await self.load_state(
             ctx,
@@ -118,18 +140,29 @@ class BoredomDriveNeuron(BaseNeuron):
                 user_fp = _fingerprint(_text_from_event(event))
                 if user_fp and user_fp == last_user_fp:
                     same_user_repetitions += 1
-                    novelty_delta -= min(0.08, 0.02 * same_user_repetitions)
-                    level += min(0.04, 0.01 * same_user_repetitions)
+                    novelty_delta -= min(0.08, 0.02 * same_user_repetitions) * novelty_gain
+                    level += min(0.04, 0.01 * same_user_repetitions) * boredom_growth_gain
                 else:
                     same_user_repetitions = 0
                     if user_fp:
-                        novelty_delta += 0.08
-                    level = max(0.0, level - 0.10)
+                        novelty_delta += 0.16 * novelty_gain
+                    # Novel interaction should be a visible relief pulse, not a tiny nudge.
+                    level = max(0.0, level - (0.18 * boredom_relief_gain))
+                raw_meta = payload.get("raw_meta", {}) if isinstance(payload, dict) and isinstance(payload.get("raw_meta"), dict) else {}
+                accent_positive = _clamp01(float(raw_meta.get("accent_positive", (event.meta or {}).get("accent_positive", 0.0)) or 0.0) / 10.0)
+                accent_negative = _clamp01(float(raw_meta.get("accent_negative_severity", (event.meta or {}).get("accent_negative_severity", 0.0)) or 0.0) / 10.0)
+                if accent_positive > 0.0:
+                    novelty_delta += 0.12 * accent_positive * novelty_gain
+                    level = max(0.0, level - ((0.10 + 0.22 * accent_positive) * boredom_relief_gain))
+                elif accent_negative > 0.0:
+                    # Correction is still activity/novelty, but it is not reward.
+                    novelty_delta += 0.04 * accent_negative * novelty_gain
+                    level = max(0.0, level - (0.04 * accent_negative * boredom_relief_gain))
                 if user_fp:
                     last_user_fp = user_fp
             else:
-                novelty_delta += 0.06
-                level = max(0.0, level - 0.08)
+                novelty_delta += 0.12 * novelty_gain
+                level = max(0.0, level - (0.14 * boredom_relief_gain))
 
         # Self-output novelty: repeating the same output is stale unless it changes the result later.
         if event.topic == "act/speech" and not _is_control_or_internal(event):
@@ -139,20 +172,50 @@ class BoredomDriveNeuron(BaseNeuron):
                     same_output_repetitions += 1
                     # Same output should not satisfy novelty; it becomes stale pressure.
                     penalty = min(0.16, 0.035 * same_output_repetitions)
-                    novelty_delta -= penalty
-                    level += penalty
+                    novelty_delta -= penalty * novelty_gain
+                    level += penalty * boredom_growth_gain
                 else:
                     same_output_repetitions = 0
-                    novelty_delta += 0.05
-                    level = max(0.0, level - 0.035)
+                    novelty_delta += 0.08 * novelty_gain
+                    level = max(0.0, level - (0.06 * boredom_relief_gain))
                 last_output_fp = out_fp
+
+        # Explicit reward/training events should act like successful activity and relieve boredom.
+        if event.topic == "control/reinforce":
+            payload = event.payload if isinstance(event.payload, dict) else {}
+            weight = float(payload.get("weight", 0.0) or 0.0)
+            if weight > 0.0:
+                strength = _clamp01(weight / 5.0)
+                novelty_delta += (0.10 + 0.10 * strength) * novelty_gain
+                level = max(0.0, level - ((0.16 + 0.22 * strength) * boredom_relief_gain))
+            elif weight < 0.0:
+                novelty_delta += 0.04 * novelty_gain
+
+        if event.topic == "control/trainer_correction":
+            novelty_delta += 0.18 * novelty_gain
+            level = max(0.0, level - (0.24 * boredom_relief_gain))
+
+        if event.topic == "affect/reward":
+            payload = event.payload if isinstance(event.payload, dict) else {}
+            reward_delta = float(payload.get("reward_delta", 0.0) or 0.0)
+            relief = float(payload.get("boredom_relief", 0.0) or 0.0)
+            if reward_delta > 0.0 or relief > 0.0:
+                strength = _clamp01(max(reward_delta, relief))
+                novelty_delta += 0.08 * strength * novelty_gain
+                level = max(0.0, level - (0.16 * strength * boredom_relief_gain))
+
+        if isinstance(boredom_relief_state, dict):
+            relief_level = _clamp01(float(boredom_relief_state.get("level", 0.0) or 0.0))
+            if relief_level > 0.0 and event.topic == "clock/tick":
+                novelty_delta += 0.025 * relief_level * novelty_gain
+                level = max(0.0, level - (0.035 * relief_level * boredom_relief_gain))
 
         idle = (now - last_external_ts) > 2.0
         if event.topic == "clock/tick":
             if idle:
-                level += dt * 0.07
+                level += dt * idle_growth_per_s
             else:
-                level -= dt * 0.05
+                level -= dt * 0.05 * boredom_relief_gain
 
         level = _clamp01(level)
 
@@ -167,13 +230,13 @@ class BoredomDriveNeuron(BaseNeuron):
                 playfulness = getattr(pdna_profile, "playfulness", 0.5) if pdna_profile is not None else 0.5
                 pdna_factor = 0.5 + energy * 0.3 + playfulness * 0.3
                 repetition_factor = 1.0 + min(repetitions, 20) / 20.0
-                level += base_inc * pdna_factor * repetition_factor
-                novelty_delta -= min(0.06, 0.004 * repetitions)
+                level += base_inc * pdna_factor * repetition_factor * boredom_growth_gain
+                novelty_delta -= min(0.06, 0.004 * repetitions) * novelty_gain
             else:
                 repetitions = max(0, repetitions - 1)
                 prev_idx = hrm_last_idx
-                level *= 0.8
-                novelty_delta += 0.10
+                level *= max(0.0, 0.8 - (0.05 * min(1.0, boredom_relief_gain - 1.0)))
+                novelty_delta += 0.10 * novelty_gain
 
         level = _clamp01(level)
         novelty_delta = max(-1.0, min(1.0, novelty_delta))
@@ -235,6 +298,9 @@ def build_neurons(orchestrator: Orchestrator):
             "percept/text",
             "percept/vision",
             "act/speech",
+            "control/reinforce",
+            "control/trainer_correction",
+            "affect/reward",
         ],
         output_topics=[],
         priority=-10,

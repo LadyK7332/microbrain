@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable
+from typing import Any, Dict, Iterable, List
 
 from microbrain.orchestrator.neuron_base import BaseNeuron, NeuronConfig, Event
 from microbrain.orchestrator.orchestrator import Orchestrator
@@ -160,6 +160,64 @@ class NeedReleaseVectorNeuron(BaseNeuron):
         })
         return chosen
 
+    def _status_text(self, pressure: Dict[str, Any], state: Dict[str, Any], vector: Dict[str, Any]) -> str:
+        pct = _safe_float(pressure.get("pct", state.get("pct", 100.0)), 100.0)
+        urgency = _safe_float(pressure.get("urgency", 0.0), 0.0)
+        band = self._threshold_band(urgency)
+        mode = str(state.get("mode", "active") or "active")
+        if band == "critical":
+            return f"power: critical at {pct:.0f}% | charge soon | mode={mode}"
+        if band == "active":
+            return f"power: low at {pct:.0f}% | charge soon | mode={mode}"
+        return f"power: dipping at {pct:.0f}% | watch charge | mode={mode}"
+
+    async def _emit_status(self, ctx, event: Event, pressure: Dict[str, Any], state: Dict[str, Any], vector: Dict[str, Any], now: float) -> list[Event]:
+        urgency = _safe_float(pressure.get("urgency", 0.0), 0.0)
+        band = self._threshold_band(urgency)
+        status_payload = {
+            "text": self._status_text(pressure, state, vector),
+            "kind": "power_need_status",
+            "need": "power",
+            "band": band,
+            "urgency": round(urgency, 4),
+            "pct": round(_safe_float(pressure.get("pct", state.get("pct", 100.0)), 100.0), 2),
+            "state": state,
+            "pressure": pressure,
+            "vector": vector,
+            "speech_allowed": False,
+            "ts": now,
+        }
+        await ctx.set_kv("drive:power:last_status_ts", now)
+        await ctx.set_kv("drive:power:last_status", status_payload)
+        return [
+            Event(
+                topic="ui/status",
+                payload=status_payload,
+                source=self.name,
+                correlation_id=event.correlation_id,
+                meta={
+                    "kind": "power_need_status",
+                    "need": "power",
+                    "store_in_memory": False,
+                    "reinforcement_eligible": False,
+                    "self_output_track": False,
+                },
+            )
+        ]
+
+    async def _speech_allowed(self, ctx, pressure: Dict[str, Any]) -> bool:
+        # Internal pressure is body/status first. It may seize the mouth only when
+        # explicitly enabled or genuinely critical. User-requested self-report is
+        # handled by the normal responder from the stored internal status.
+        gate_enabled = _safe_bool(await ctx.get_kv("drive:power:speech_gate_enabled", True), True)
+        if not gate_enabled:
+            return True
+        if _safe_bool(await ctx.get_kv("drive:power:allow_unsolicited_speech", False), False):
+            return True
+        urgency = _safe_float(pressure.get("urgency", 0.0), 0.0)
+        critical_threshold = _safe_float(await ctx.get_kv("drive:power:critical_speech_threshold", 0.90), 0.90)
+        return urgency >= critical_threshold
+
     async def _emit_request(self, ctx, event: Event, pressure: Dict[str, Any], vector: Dict[str, Any], now: float) -> list[Event]:
         outlet = vector.get("outlet")
         style = str(vector.get("style", "direct_simple") or "direct_simple")
@@ -277,14 +335,21 @@ class NeedReleaseVectorNeuron(BaseNeuron):
         if urgency < threshold:
             return []
 
-        last_signal_ts = _safe_float(await ctx.get_kv("drive:power:last_signal_ts", 0.0), 0.0)
-        cooldown_s = _safe_float(await ctx.get_kv("drive:power:signal_cooldown_s", 90.0), 90.0)
-        if last_signal_ts > 0.0 and (now - last_signal_ts) < cooldown_s:
-            return []
-
         last_relief_ts = _safe_float(await ctx.get_kv("drive:power:last_relief_ts", 0.0), 0.0)
         quiet_after_relief_s = _safe_float(await ctx.get_kv("drive:power:quiet_after_relief_s", 30.0), 30.0)
         if last_relief_ts > 0.0 and (now - last_relief_ts) < quiet_after_relief_s:
+            return []
+
+        if not await self._speech_allowed(ctx, pressure):
+            last_status_ts = _safe_float(await ctx.get_kv("drive:power:last_status_ts", 0.0), 0.0)
+            status_cooldown_s = _safe_float(await ctx.get_kv("drive:power:status_cooldown_s", 120.0), 120.0)
+            if last_status_ts > 0.0 and (now - last_status_ts) < status_cooldown_s:
+                return []
+            return await self._emit_status(ctx, event, pressure, state, vector, now)
+
+        last_signal_ts = _safe_float(await ctx.get_kv("drive:power:last_signal_ts", 0.0), 0.0)
+        cooldown_s = _safe_float(await ctx.get_kv("drive:power:signal_cooldown_s", 90.0), 90.0)
+        if last_signal_ts > 0.0 and (now - last_signal_ts) < cooldown_s:
             return []
 
         return await self._emit_request(ctx, event, pressure, vector, now)
@@ -294,7 +359,7 @@ def build_neurons(orchestrator: Orchestrator):
     cfg = NeuronConfig(
         name=NEURON_NAME,
         subscribed_topics=["clock/tick", "control/power", "event/relief/power"],
-        output_topics=["thought/internal", "drive/power_request", "speech/reason"],
+        output_topics=["thought/internal", "drive/power_request", "speech/reason", "ui/status"],
         priority=8,
         cooldown_sec=0.0,
     )

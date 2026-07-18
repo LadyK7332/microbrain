@@ -66,6 +66,53 @@ class InteractionReleaseVectorNeuron(BaseNeuron):
     def _clean_text(self, text: str) -> str:
         return re.sub(r"\s+", " ", str(text or "").strip())
 
+    def _fingerprint(self, text: str) -> str:
+        return re.sub(r"[^a-z0-9']+", " ", self._clean_text(text).lower()).strip()[:160]
+
+    def _external_text_from_event(self, event: Event) -> tuple[str, str, bool]:
+        """Return (text, channel, eligible) for user-facing text stimuli.
+
+        Interaction pressure is a reflex arc: external input should create
+        short-lived response pressure. Control-plane/status/thought traffic must
+        not do that, or commands and diagnostics start acting like social needs.
+        """
+        if event.topic != "percept/text":
+            return "", "default", False
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        meta = event.meta or {}
+        raw_meta = payload.get("raw_meta", {}) if isinstance(payload.get("raw_meta", {}), dict) else {}
+        text = self._clean_text(str(payload.get("text", "") or ""))
+        channel = str(raw_meta.get("channel", payload.get("channel", "default")) or "default")
+        source = str(raw_meta.get("source", payload.get("source", "user")) or "user").lower()
+        if not text:
+            return "", channel, False
+        if source in {"assistant", "system", "mb"}:
+            return text, channel, False
+        if bool(meta.get("control", False)) or bool(raw_meta.get("control", False)):
+            return text, channel, False
+        if meta.get("cognitive_visible") is False or raw_meta.get("cognitive_visible") is False:
+            return text, channel, False
+        if text.lstrip().startswith("/"):
+            return text, channel, False
+        return text, channel, True
+
+    async def _record_input_stimulus(self, ctx, event: Event, now: float) -> None:
+        text, channel, eligible = self._external_text_from_event(event)
+        if not eligible:
+            return
+        fp = self._fingerprint(text)
+        await ctx.set_kv(
+            "drive:interaction:last_input_stimulus",
+            {
+                "text": text[:280],
+                "fingerprint": fp,
+                "channel": channel,
+                "ts": now,
+                "correlation_id": event.correlation_id,
+                "source": self.name,
+            },
+        )
+
     def _looks_like_greeting(self, text: str) -> bool:
         lowered = self._clean_text(text).lower()
         return any(lowered.startswith(item) for item in _GREETING_STARTS)
@@ -94,6 +141,31 @@ class InteractionReleaseVectorNeuron(BaseNeuron):
         talk_pressure = _clamp01(initiative.get("talk_pressure", 0.0))
         think_pressure = _clamp01(initiative.get("think_pressure", 0.0))
         pending_age = max(0.0, _safe_float(initiative.get("pending_age_s", 0.0), 0.0))
+
+        # InitiativeThresholdNeuron runs later than this neuron on the same
+        # percept/text event, so a brand-new user input could otherwise be
+        # invisible until the next clock tick. Use a short-lived input stimulus
+        # as the immediate reflex source for interaction pressure.
+        stimulus = await ctx.get_kv("drive:interaction:last_input_stimulus", {}) or {}
+        if isinstance(stimulus, dict):
+            stim_text = self._clean_text(str(stimulus.get("text", "") or ""))
+            stim_ts = _safe_float(stimulus.get("ts", 0.0), 0.0)
+            stim_age = max(0.0, now - stim_ts) if stim_ts > 0.0 else 9999.0
+            stimulus_window = _safe_float(await ctx.get_kv("drive:interaction:input_stimulus_window_s", 18.0), 18.0)
+            if stim_text and stim_age <= max(1.0, stimulus_window) and not pending_text:
+                pending_text = stim_text
+                pending_age = stim_age
+                pending_flags = {
+                    "has_question": "?" in stim_text,
+                    "has_response_request": any(tok in stim_text.lower() for tok in ("respond", "reply", "speak up", "can you hear me")),
+                    "has_error_language": any(tok in stim_text.lower() for tok in ("error", "issue", "problem", "stuck", "not working")),
+                    "short_fragment": len(stim_text.split()) <= 3,
+                    "clarify_ready": False,
+                    "coherence_score": 0.20 if "?" in stim_text else 0.08,
+                    "from_input_stimulus": True,
+                }
+                talk_pressure = max(talk_pressure, _safe_float(await ctx.get_kv("drive:interaction:input_talk_floor", 0.58), 0.58))
+                think_pressure = max(think_pressure, _safe_float(await ctx.get_kv("drive:interaction:input_think_floor", 0.34), 0.34))
         clarify_ready = bool(initiative.get("clarify_ready", pending_flags.get("clarify_ready", False)))
         interruption_cost = _clamp01(initiative.get("interruption_cost", 0.0))
         answered = _safe_bool(state.get("pending_answered", False), False)
@@ -110,6 +182,8 @@ class InteractionReleaseVectorNeuron(BaseNeuron):
         base = 0.0
         if pending_text:
             base += 0.14
+            if bool(pending_flags.get("from_input_stimulus", False)):
+                base += _safe_float(await ctx.get_kv("drive:interaction:input_base_boost", 0.34), 0.34)
         if question:
             base += 0.30
         if response_request:
@@ -146,6 +220,8 @@ class InteractionReleaseVectorNeuron(BaseNeuron):
         return {
             "need": "interaction",
             "pending_text": pending_text,
+            "pending_fingerprint": self._fingerprint(pending_text),
+            "stimulus_input": bool(pending_flags.get("from_input_stimulus", False)),
             "pending_age_s": round(pending_age, 3),
             "talk_pressure": round(talk_pressure, 4),
             "think_pressure": round(think_pressure, 4),
@@ -212,22 +288,26 @@ class InteractionReleaseVectorNeuron(BaseNeuron):
         greeting = bool(pressure.get("greeting", False))
         clarify_ready = bool(pressure.get("clarify_ready", False))
 
+        stimulus_input = bool(pressure.get("stimulus_input", False))
         if greeting and urgency < 0.65:
             style = "direct_simple"
-            message = "Hey. I'm here."
+            message = "greeting_pressure"
         elif question or response_request:
             if urgency >= 0.80:
                 style = "urgent_direct"
-                message = "There's an open interaction thread and I should answer it now."
+                message = "question_pressure_urgent"
             else:
                 style = "direct_simple"
-                message = "I want to answer the open interaction thread."
+                message = "question_pressure"
+        elif stimulus_input:
+            style = "direct_simple" if urgency >= 0.50 else "gentle_notice"
+            message = "stimulus_response_pressure"
         elif clarify_ready:
             style = "gentle_notice" if urgency < 0.60 else "direct_simple"
-            message = f"I think one variable is missing around: {pending_text}" if pending_text else "I think one variable is missing and I want to clarify it."
+            message = f"missing_variable:{pending_text}" if pending_text else "missing_variable"
         else:
             style = "gentle_notice"
-            message = "There's still interaction pressure hanging open."
+            message = "interaction_pressure_open"
 
         chosen.update({
             "need": "interaction",
@@ -241,7 +321,7 @@ class InteractionReleaseVectorNeuron(BaseNeuron):
     async def _emit_request(self, ctx, event: Event, pressure: Dict[str, Any], vector: Dict[str, Any], now: float) -> list[Event]:
         outlet = vector.get("outlet")
         style = str(vector.get("style", "direct_simple") or "direct_simple")
-        message = str(vector.get("message", "There's still interaction pressure hanging open.") or "There's still interaction pressure hanging open.")
+        message = str(vector.get("message", "interaction_pressure_open") or "interaction_pressure_open")
 
         pending = {
             "need": "interaction",
@@ -257,8 +337,31 @@ class InteractionReleaseVectorNeuron(BaseNeuron):
         await ctx.set_kv("drive:interaction_pending_request", pending)
         await ctx.set_kv("drive:interaction:last_signal_ts", now)
         await ctx.set_kv("drive:interaction:last_signal_style", style)
+        await ctx.set_kv("drive:interaction:last_signal_fingerprint", str(pressure.get("pending_fingerprint", "") or ""))
 
+        thought_text = "input_response_pressure"
         return [
+            Event(
+                topic="thought/internal",
+                payload={
+                    "text": thought_text,
+                    "kind": "interaction_pressure",
+                    "source_need": "interaction",
+                    "urgency": pressure.get("urgency", 0.0),
+                    "pending_text": str(pressure.get("pending_text", "") or "")[:160],
+                },
+                source=self.name,
+                correlation_id=event.correlation_id,
+                meta={
+                    "channel": "thought",
+                    "kind": "interaction_pressure",
+                    "need": "interaction",
+                    "store_in_memory": False,
+                    "reinforcement_eligible": False,
+                    "self_output_track": False,
+                    "cognitive_visible": False,
+                },
+            ),
             Event(
                 topic="drive/interaction_request",
                 payload=pending,
@@ -285,6 +388,11 @@ class InteractionReleaseVectorNeuron(BaseNeuron):
 
     async def process(self, event: Event, ctx) -> Iterable[Event]:
         now = time.time()
+        if event.topic == "percept/text":
+            await self._record_input_stimulus(ctx, event, now)
+        elif event.topic == "event/relief/interaction":
+            await ctx.set_kv("drive:interaction:last_input_stimulus", {})
+
         power_state = await ctx.get_kv("power:state", {}) or {}
         sleeping = bool((power_state or {}).get("sleep", False))
         charging = bool((power_state or {}).get("charging", False))
@@ -315,12 +423,17 @@ class InteractionReleaseVectorNeuron(BaseNeuron):
 
         urgency = _safe_float(pressure.get("urgency", 0.0), 0.0)
         threshold = _safe_float(await ctx.get_kv("drive:interaction:signal_threshold", 0.50), 0.50)
+        if bool(pressure.get("stimulus_input", False)):
+            threshold = min(threshold, _safe_float(await ctx.get_kv("drive:interaction:input_signal_threshold", 0.36), 0.36))
         if urgency < threshold:
             return []
 
+        this_fp = str(pressure.get("pending_fingerprint", "") or "")
+        last_signal_fp = str(await ctx.get_kv("drive:interaction:last_signal_fingerprint", "") or "")
+        same_signal = bool(this_fp and last_signal_fp and this_fp == last_signal_fp)
         last_signal_ts = _safe_float(await ctx.get_kv("drive:interaction:last_signal_ts", 0.0), 0.0)
         cooldown_s = _safe_float(await ctx.get_kv("drive:interaction:signal_cooldown_s", 45.0), 45.0)
-        if last_signal_ts > 0.0 and (now - last_signal_ts) < cooldown_s:
+        if same_signal and last_signal_ts > 0.0 and (now - last_signal_ts) < cooldown_s:
             return []
 
         last_relief_ts = _safe_float(await ctx.get_kv("drive:interaction:last_relief_ts", 0.0), 0.0)

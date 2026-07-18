@@ -44,22 +44,17 @@ class RecollectionNeuron(BaseNeuron):
         return snippets
 
     def _build_native_recollection_reply(self, hits: List[Dict[str, Any]]) -> str:
+        """Return only the recalled content, not a canned memory preface."""
         if not hits:
-            return "I don't have a strong recollection anchor for that yet."
+            return ""
         lead = hits[0]
-        score = float(lead.get("score", 0.0) or 0.0)
         anchor_text = str(lead.get("anchor_text", "") or "").strip()
         refs = lead.get("refs", []) if isinstance(lead.get("refs", []), list) else []
         body = anchor_text or (str(refs[0]) if refs else "")
         if len(body) > 180:
             body = body[:177] + "..."
-        if score >= 0.70:
-            prefix = "I remember something close to that:"
-        elif score >= 0.45:
-            prefix = "I have a partial recollection:"
-        else:
-            prefix = "I only have a weak recollection:"
-        return f"{prefix} {body}"
+        return body
+
     """
     Recollection / memory search neuron (v2).
 
@@ -160,18 +155,9 @@ class RecollectionNeuron(BaseNeuron):
                     ),
                 ]
 
-            # No HRM and no mem-cell hits; fall back to a simple native response.
-            return [Event(
-                topic="act/speech",
-                payload={
-                    "text": "I don't have a reliable recollection anchor for that right now.",
-                    "channel": channel,
-                    "style": "assistant",
-                },
-                source=self.name,
-                correlation_id=event.correlation_id,
-                meta={"kind": "recollection_fallback_native"},
-            )]
+            # No HRM and no mem-cell hits: no canned fallback. Let the
+            # thought/reasoning path keep the unresolved recollection gap.
+            return []
 
         # ------------------------------
         # Build a temporary HRM query node & find neighbors

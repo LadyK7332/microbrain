@@ -110,7 +110,7 @@ def _intent_from_pattern(pattern_type: str) -> str:
         return "assert_attribute"
     if p == "assert_existence":
         return "assert_existence"
-    if p == "social_redirect":
+    if p in {"social_redirect", "request_action", "need_action", "query_need_action", "preference_action", "action_relation"}:
         return "action_assertion"
     if p == "question_about":
         return "question_about"
@@ -138,7 +138,7 @@ def build_forge_workspace(*, query_type: str, focus_tokens: Sequence[str], candi
             intent_votes[intent] = intent_votes.get(intent, 0.0) + max(0.1, score)
 
         for slot_name, slot_value in dict(meta.get("slots", {}) or {}).items():
-            if slot_name in {"subject", "attribute", "copula", "deixis", "entity", "action", "person", "location", "focus"}:
+            if slot_name in {"subject", "attribute", "copula", "deixis", "entity", "action", "person", "location", "focus", "target", "object", "urgency", "need_type"}:
                 _add_slot(slots, slot_name, slot_value, score, cell_id)
 
         parsed = _parse_text_slots(text)

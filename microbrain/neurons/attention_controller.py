@@ -191,6 +191,15 @@ class AttentionControllerNeuron(BaseNeuron):
         # Clamp boredom to [0,1] for safety
         boredom_level = max(0.0, min(1.0, boredom_level))
 
+        pdna_profile = await ctx.get_kv("pdna:profile", None)
+        ddna_mods = await ctx.get_kv("drive:ddna_modulators", None)
+        if not isinstance(ddna_mods, dict) or not ddna_mods:
+            ddna_mods = derive_ddna_modulators(pdna_profile)
+            await ctx.set_kv("drive:ddna_modulators", ddna_mods)
+        salience_gain = max(0.25, min(2.20, float((ddna_mods or {}).get("salience_gain", 1.0) or 1.0)))
+        novelty_gain = max(0.25, min(2.00, float((ddna_mods or {}).get("novelty_gain", 1.0) or 1.0)))
+        salience_decay_resistance = max(0.35, min(2.00, float((ddna_mods or {}).get("salience_decay_resistance", 1.0) or 1.0)))
+
         # ------------------------------
         # Load prior attention state
         # ------------------------------
@@ -274,11 +283,11 @@ class AttentionControllerNeuron(BaseNeuron):
         salience = max(0.0, min(1.0, salience))
 
         if is_novel:
-            novelty_boost = 0.20 + 0.40 * boredom_level  # in [0.2, 0.6]
+            novelty_boost = (0.20 + 0.40 * boredom_level) * salience_gain * novelty_gain  # base [0.2, 0.6]
             salience = salience + novelty_boost
         else:
-            base_decay = 0.04
-            decay = base_decay + 0.10 * (1.0 - boredom_level)  # ~[0.04, 0.14]
+            base_decay = float(profile_path(pdna_profile, "affect_model", "decay.salience_decay_per_second", 0.04) or 0.04)
+            decay = (base_decay + 0.10 * (1.0 - boredom_level)) / salience_decay_resistance  # ~[0.04, 0.14] before profile
             salience = salience - decay
 
         salience = max(0.0, min(1.0, salience))
@@ -294,6 +303,15 @@ class AttentionControllerNeuron(BaseNeuron):
         await self.save_state(ctx, "attention_state", state)
 
         await ctx.set_kv("affect:global_salience", salience)
+        await ctx.set_kv(
+            "affect:salience_state",
+            {
+                "level": round(max(0.0, min(1.0, salience)), 4),
+                "reason": "attention_novelty" if is_novel else "attention_decay",
+                "source_topic": event.topic,
+                "ts": now,
+            },
+        )
 
         self.debug(
             "updated_attention",

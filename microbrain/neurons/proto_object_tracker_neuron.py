@@ -175,14 +175,14 @@ class ProtoObjectTrackerNeuron(BaseNeuron):
                 track['last_question_ts'] = now
                 out.append(
                     Event(
-                        topic='act/speech',
+                        topic='thought/internal',
                         payload={
-                            'text': self._question_for_track(snapshot),
-                            'channel': 'cli',
-                            'style': 'assistant',
+                            'kind': 'vision_proto_question',
+                            'track': snapshot,
                         },
                         source=self.name,
                         correlation_id=event.correlation_id,
+                        meta={'channel': 'thought', 'kind': 'vision_proto_question', 'store_in_memory': False},
                     )
                 )
 
@@ -394,14 +394,8 @@ class ProtoObjectTrackerNeuron(BaseNeuron):
         )
 
     def _question_for_track(self, snapshot: Dict[str, Any]) -> str:
-        stability = float(snapshot.get('stability', 0.0) or 0.0)
-        seen_count = int(snapshot.get('seen_count', 1) or 1)
-        fallback = str(snapshot.get('fallback_ref', 'that thing') or 'that thing')
-        if stability < 0.35 and seen_count <= 1:
-            return '?'
-        if stability < 0.55:
-            return f'{fallback}?'
-        return f"What's {fallback}?"
+        """Canned proto-object questions removed; use thought payload instead."""
+        return ""
 
     def _render_fallback_ref(self, track: Dict[str, Any]) -> str:
         resolved = str(track.get('resolved_label', '') or '').strip().lower()
@@ -538,7 +532,7 @@ def build_neurons(orchestrator: Orchestrator) -> Iterable[BaseNeuron]:
     cfg = NeuronConfig(
         name=NEURON_NAME,
         subscribed_topics=['percept/vision', 'vision/proto_label'],
-        output_topics=['vision/proto_object', 'reason/output', 'act/speech'],
+        output_topics=['vision/proto_object', 'reason/output', 'thought/internal'],
         priority=5,
     )
     yield ProtoObjectTrackerNeuron(cfg)

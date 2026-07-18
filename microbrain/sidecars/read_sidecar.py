@@ -55,8 +55,13 @@ class ReadSidecar:
             cmd = str(payload.get("command", "") or "").strip().lower()
             if cmd == "on":
                 self.orch.kv_store["read:enabled"] = True
+                # Kick one immediate read pass so /read on feels alive instead of
+                # waiting for the idle timer. The cadence gate still controls
+                # later background chewing.
+                self.orch.kv_store["read:force_once"] = time.time()
             elif cmd == "off":
                 self.orch.kv_store["read:enabled"] = False
+                self.orch.kv_store["read:force_once"] = 0.0
             elif cmd in ("next", "step"):
                 self.orch.kv_store["read:force_once"] = time.time()
             self._wake_event.set()
@@ -86,6 +91,18 @@ class ReadSidecar:
             _on_slearn_control,
             priority=0,
         )
+
+        # Seed the visible intake paths immediately so /read status can show
+        # real folders before the first background cycle runs.
+        read_dir = self._resolve_read_dir()
+        read_ready_dir = self._resolve_read_ready_dir(read_dir)
+        slearn_dir = self._resolve_slearn_dir()
+        for path in (read_dir, read_ready_dir, self._legacy_read_dir(), slearn_dir, slearn_dir / "ready"):
+            try:
+                path.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                logger.exception("Read sidecar failed to create intake folder: %s", path)
+
         self._loop_task = asyncio.create_task(self._run_loop(), name="read_sidecar")
         logger.info("Read sidecar started.")
 
@@ -144,7 +161,7 @@ class ReadSidecar:
                 return
 
         read_dir = self._resolve_read_dir()
-        ready_dir = read_dir / "ready"
+        ready_dir = self._resolve_read_ready_dir(read_dir)
         read_dir.mkdir(parents=True, exist_ok=True)
         ready_dir.mkdir(parents=True, exist_ok=True)
 
@@ -156,13 +173,20 @@ class ReadSidecar:
         if path is None or not path.exists():
             candidates = await asyncio.to_thread(self._list_candidates, read_dir)
             if not candidates:
-                result = {"ts": now, "summary": "no readable files in read_dir"}
+                result = {
+                    "ts": now,
+                    "summary": "no readable files in read queue",
+                    "read_dir": str(read_dir),
+                    "ready_dir": str(ready_dir),
+                    "legacy_dir": str(self._legacy_read_dir()),
+                }
                 self._apply_status(result=result, active_file="", active_kind="", chunk_index=0, now=now)
                 await asyncio.to_thread(
                     self._save_state_file,
                     read_dir,
                     {"active_file": "", "chunk_index": 0, "last_result": result},
                 )
+                await self._publish_read_status(result, text=f"/read: no readable files in {read_dir}")
                 if force:
                     self.orch.kv_store["read:force_once"] = 0.0
                 return
@@ -186,6 +210,7 @@ class ReadSidecar:
                 read_dir,
                 {"active_file": "", "chunk_index": 0, "last_result": result},
             )
+            await self._publish_read_status(result, text=f"/read: completed {path.name}; moved to {target}")
             if force:
                 self.orch.kv_store["read:force_once"] = 0.0
             return
@@ -214,11 +239,12 @@ class ReadSidecar:
             },
         )
 
-        await self.orch.push_event(
-            "read/status",
-            dict(result),
-            source="read_sidecar",
-            meta={"source": "read_sidecar", "channel": "internal"},
+        await self._publish_read_status(
+            result,
+            text=(
+                f"/read: {path.name} chunk {chunk.chunk_index} ingested "
+                f"{ingested} piece(s); next_chunk={next_index}"
+            ),
         )
 
         if force:
@@ -292,12 +318,52 @@ class ReadSidecar:
                 await asyncio.to_thread(shutil.move, str(path), str(target))
             except Exception:
                 logger.exception("Structured learning sidecar failed to move completed file: %s", path)
-            result = {"ts": now, "summary": f"{path.name} moved to ready"}
+            result = {
+                "ts": now,
+                "summary": f"{path.name} completed and moved to ready",
+                "completed_file": path.name,
+                "ready_path": str(target),
+                "completed_chunks": chunk_index,
+                "audit_path": str(self._slearn_audit_path()),
+            }
             self._apply_slearn_status(result=result, active_file="", chunk_index=0, now=now)
+            result["files_completed_count"] = int(self.orch.kv_store.get("slearn:files_completed_count", 0) or 0)
+            result["rules_emitted_total"] = int(self.orch.kv_store.get("slearn:rules_emitted_total", 0) or 0)
+            result["rules_applied_total"] = int(self.orch.kv_store.get("slearn:rules_applied_total", 0) or 0)
+            await asyncio.to_thread(self._append_slearn_audit, {"event": "file_completed", **result})
             await asyncio.to_thread(
                 self._save_slearn_state_file,
                 slearn_dir,
-                {"active_file": "", "chunk_index": 0, "last_result": result},
+                {
+                    "active_file": "",
+                    "chunk_index": 0,
+                    "last_result": result,
+                    "completed_files": list(self.orch.kv_store.get("slearn:completed_files", []) or []),
+                    "files_completed_count": result["files_completed_count"],
+                    "rules_emitted_total": result["rules_emitted_total"],
+                    "rules_applied_total": result["rules_applied_total"],
+                    "audit_path": result["audit_path"],
+                },
+            )
+            await self.orch.push_event(
+                "slearn/status",
+                dict(result),
+                source="read_sidecar",
+                meta={"source": "read_sidecar", "channel": "internal", "control": True, "store_in_memory": False},
+            )
+            await self.orch.push_event(
+                "ui/status",
+                {
+                    "text": (
+                        f"/slearn: completed {path.name}; moved to ready. "
+                        f"files_done={result['files_completed_count']} emitted_total={result['rules_emitted_total']} "
+                        f"applied_total={result['rules_applied_total']} audit={result['audit_path']}"
+                    ),
+                    "style": "system",
+                    "channel": "default",
+                },
+                source="read_sidecar",
+                meta={"control": True, "kind": "slearn_status", "store_in_memory": False, "reinforcement_eligible": False, "self_output_track": False, "cognitive_visible": False},
             )
             if force:
                 self.orch.kv_store["slearn:force_once"] = 0.0
@@ -341,8 +407,14 @@ class ReadSidecar:
             "file": str(path),
             "kind": chunk.kind,
             "chunk_index": chunk.chunk_index,
+            "next_chunk_index": next_index,
+            "emitted": emitted,
+            "audit_path": str(self._slearn_audit_path()),
         }
         self._apply_slearn_status(result=result, active_file=str(path), chunk_index=next_index, now=now)
+        result["rules_emitted_total"] = int(self.orch.kv_store.get("slearn:rules_emitted_total", 0) or 0)
+        result["rules_applied_total"] = int(self.orch.kv_store.get("slearn:rules_applied_total", 0) or 0)
+        await asyncio.to_thread(self._append_slearn_audit, {"event": "chunk_emitted", **result})
         await asyncio.to_thread(
             self._save_slearn_state_file,
             slearn_dir,
@@ -357,6 +429,19 @@ class ReadSidecar:
             dict(result),
             source="read_sidecar",
             meta={"source": "read_sidecar", "channel": "internal", "control": True, "store_in_memory": False},
+        )
+        await self.orch.push_event(
+            "ui/status",
+            {
+                "text": (
+                    f"/slearn: {path.name} chunk {chunk.chunk_index} emitted {emitted} rule(s); "
+                    f"emitted_total={result['rules_emitted_total']} applied_total={result['rules_applied_total']}"
+                ),
+                "style": "system",
+                "channel": "default",
+            },
+            source="read_sidecar",
+            meta={"control": True, "kind": "slearn_status", "store_in_memory": False, "reinforcement_eligible": False, "self_output_track": False, "cognitive_visible": False},
         )
 
         if force:
@@ -375,15 +460,72 @@ class ReadSidecar:
         raw = str(self.orch.kv_store.get("read:dir", "") or "").strip()
         if raw:
             return Path(raw).expanduser()
-        default = self.memdir / "read_dir"
+        # Canonical read intake now matches the explicit reading writer:
+        #   <memdir>/reading/queue
+        # Legacy <memdir>/read_dir is still scanned by _list_candidates so old
+        # habits do not silently fail.
+        default = self.memdir / "reading" / "queue"
         self.orch.kv_store["read:dir"] = str(default)
+        self.orch.kv_store["read:legacy_dir"] = str(self._legacy_read_dir())
         return default
+
+    def _legacy_read_dir(self) -> Path:
+        return self.memdir / "read_dir"
+
+    def _resolve_read_ready_dir(self, read_dir: Path) -> Path:
+        # If read_dir is a queue folder, put completed documents beside it:
+        #   reading/queue -> reading/ready
+        # Otherwise preserve the older read_dir/ready behavior.
+        if read_dir.name.lower() == "queue":
+            return read_dir.parent / "ready"
+        return read_dir / "ready"
+
+    async def _publish_read_status(self, result: Dict[str, Any], *, text: str) -> None:
+        await self.orch.push_event(
+            "read/status",
+            dict(result),
+            source="read_sidecar",
+            meta={
+                "source": "read_sidecar",
+                "channel": "internal",
+                "control": True,
+                "store_in_memory": False,
+            },
+        )
+        await self.orch.push_event(
+            "ui/status",
+            {"text": text, "style": "system", "channel": "default"},
+            source="read_sidecar",
+            meta={
+                "control": True,
+                "kind": "read_status",
+                "store_in_memory": False,
+                "reinforcement_eligible": False,
+                "self_output_track": False,
+                "cognitive_visible": False,
+            },
+        )
 
     def _apply_slearn_status(self, *, result: Dict[str, Any], active_file: str, chunk_index: int, now: float) -> None:
         self.orch.kv_store["slearn:last_result"] = result
         self.orch.kv_store["slearn:active_file"] = active_file
         self.orch.kv_store["slearn:chunk_index"] = chunk_index
         self.orch.kv_store["slearn:last_activity_ts"] = now
+
+        emitted = int(result.get("emitted", 0) or 0) if isinstance(result, dict) else 0
+        if emitted > 0:
+            self.orch.kv_store["slearn:rules_emitted_total"] = int(self.orch.kv_store.get("slearn:rules_emitted_total", 0) or 0) + emitted
+
+        if isinstance(result, dict) and result.get("completed_file"):
+            completed = list(self.orch.kv_store.get("slearn:completed_files", []) or [])
+            completed.append({
+                "file": result.get("completed_file"),
+                "ready_path": result.get("ready_path", ""),
+                "ts": result.get("ts", now),
+                "chunks": result.get("completed_chunks", chunk_index),
+            })
+            self.orch.kv_store["slearn:completed_files"] = completed[-25:]
+            self.orch.kv_store["slearn:files_completed_count"] = int(self.orch.kv_store.get("slearn:files_completed_count", 0) or 0) + 1
 
     def _apply_status(self, *, result: Dict[str, Any], active_file: str, active_kind: str, chunk_index: int, now: float) -> None:
         self.orch.kv_store["read:last_result"] = result
@@ -410,6 +552,15 @@ class ReadSidecar:
         tmp = path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(path)
+
+    def _slearn_audit_path(self) -> Path:
+        return self.memdir / "slearn" / "slearn_audit.jsonl"
+
+    def _append_slearn_audit(self, entry: Dict[str, Any]) -> None:
+        path = self._slearn_audit_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
 
     def _state_path(self, read_dir: Path) -> Path:
         return read_dir / "_read_state.json"
@@ -444,29 +595,51 @@ class ReadSidecar:
 
     def _extract_slearn_rules(self, text: str) -> List[Tuple[int, str]]:
         rules: List[Tuple[int, str]] = []
-        rule_re = re.compile(r"^\s*IF\s+USER\s+says\s+.+?\s+THEN\s+.+$", re.IGNORECASE)
+        # /slearn accepts a broader CAPS grammar than /r did originally:
+        #   IF USER says moin THEN CLASSIFY social_greeting AND REPLY good morning
+        #   IF POWER is low THEN CLASSIFY need_power, energy_deficit
+        #   IF OBJECT detected THEN CLASSIFY base_object
+        #
+        # Safety rule: the grammar rails must remain visibly uppercase. Domain
+        # words such as "says" or "is" may remain natural language because they
+        # are condition text, not control delimiters.
+        lowercase_control_re = re.compile(r"\b(if|then|else|classify|reply|not|and|suppress)\b")
         for idx, raw in enumerate(str(text or "").splitlines()):
             line = raw.strip()
             if not line or line.startswith("#") or line.startswith("//"):
                 continue
-            # Require the rule grammar to be visibly CAPS, matching syntax_learning safety.
-            if not rule_re.match(line):
+            if not line.startswith("IF ") or " THEN " not in line:
                 continue
-            if not ("IF USER" in line and " THEN " in line):
+            if lowercase_control_re.search(line):
                 continue
             rules.append((idx, line))
         return rules
 
     def _list_candidates(self, read_dir: Path) -> List[Path]:
         out: List[Path] = []
-        for path in sorted(read_dir.iterdir()):
-            if not path.is_file():
+        roots: List[Path] = [read_dir]
+
+        # Back-compat and human-forgiveness: scan the canonical queue plus the
+        # old direct read_dir if it exists. This avoids the "/read is on but
+        # nothing happens" failure when files are dropped into the older folder.
+        legacy = self._legacy_read_dir()
+        if legacy != read_dir:
+            roots.append(legacy)
+
+        for root in roots:
+            if not root.exists() or not root.is_dir():
                 continue
-            if path.name.startswith("_read_state"):
-                continue
-            if path.suffix.lower() not in (".txt", ".pdf", ".md"):
-                continue
-            out.append(path)
+            for path in sorted(root.iterdir()):
+                if not path.is_file():
+                    continue
+                if path.name.startswith("_read_state"):
+                    continue
+                if path.suffix.lower() not in (".txt", ".pdf", ".md"):
+                    continue
+                out.append(path)
+
+        # Stable order, but prefer canonical queue over legacy when timestamps tie.
+        out.sort(key=lambda p: (p.stat().st_mtime if p.exists() else 0.0, str(p)))
         return out
 
     def _read_text_lines(self, path: Path) -> List[str]:
@@ -532,7 +705,7 @@ class ReadSidecar:
 
     def _chunk_for(self, path: Path, chunk_index: int, chunk_lines: int, chunk_chars: int) -> Optional[_Chunk]:
         suffix = path.suffix.lower()
-        if suffix in (".txt", ".md"):
+        if suffix in (".txt", ".md", ".slearn"):
             return self._txt_chunk(path, chunk_index, chunk_lines)
         if suffix == ".pdf":
             return self._pdf_chunk(path, chunk_index, chunk_chars)

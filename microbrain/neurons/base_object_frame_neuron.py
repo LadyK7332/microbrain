@@ -106,6 +106,7 @@ def build_neurons(orchestrator: Orchestrator) -> Iterable[BaseNeuron]:
         subscribed_topics=[
             "percept/text",
             "percept/vision",
+            "vision/object_delta",
             "percept/audio",
             "percept/touch",
             "vision/proto_object",

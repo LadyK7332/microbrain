@@ -15,7 +15,7 @@ class StatusIntrospectNeuron(BaseNeuron):
         - "introspect/status"
 
     Emits:
-        - "act/speech" with a short summary of the current brain state.
+        - "ui/status" with structured/system status.
 
     It uses a reference to the Orchestrator (injected at build time) to
     inspect which neurons are loaded and which topics are covered.
@@ -44,11 +44,13 @@ class StatusIntrospectNeuron(BaseNeuron):
         if isinstance(payload, dict):
             channel = str(payload.get("channel", channel))
 
-        # If we don't have an orchestrator reference, we can only report that.
+        # If we don't have an orchestrator reference, report a structured status.
         if self._orch is None:
-            text = "I don't have access to my orchestrator state yet."
-            events: List[Event] = [self._speech(text, channel, "system", event)]
-            return events
+            return [self._status(
+                {"kind": "introspect_unavailable", "channel": channel},
+                channel,
+                event,
+            )]
 
         # ------------------------------
         # 1) Gather neuron + topic info
@@ -101,8 +103,7 @@ class StatusIntrospectNeuron(BaseNeuron):
         )
 
         events: List[Event] = []
-        # Always speak the status out loud
-        events.append(self._speech(text, channel, "system", event))
+        events.append(self._status(text, channel, event))
 
         # If this was a reflective/introspective command, also emit a
         # machine-readable report for the ReflectiveReasonerNeuron.
@@ -130,20 +131,21 @@ class StatusIntrospectNeuron(BaseNeuron):
 
 
     # ------------------------------
-    # Helper to build speech events
+    # Helper to build status events
     # ------------------------------
 
-    def _speech(self, text: str, channel: str, style: str, event: Event) -> Event:
+    def _status(self, payload: Any, channel: str, event: Event) -> Event:
+        if isinstance(payload, dict):
+            data = dict(payload)
+            data.setdefault("channel", channel)
+        else:
+            data = {"text": str(payload or ""), "channel": channel, "style": "system"}
         return Event(
-            topic="act/speech",
-            payload={
-                "text": text,
-                "channel": channel,
-                "style": style,
-            },
+            topic="ui/status",
+            payload=data,
             source=self.name,
             correlation_id=event.correlation_id,
-            meta={"kind": "introspect_reply"},
+            meta={"control": True, "kind": "introspect_status"},
         )
 
 
@@ -151,7 +153,7 @@ def build_neurons(orchestrator: Orchestrator):
     cfg = NeuronConfig(
         name="status_introspect",
         subscribed_topics=["introspect/status"],
-        output_topics=["act/speech"],
+        output_topics=["ui/status", "introspect/report_text"],
         priority=10,  # runs before most general responders
     )
     neuron = StatusIntrospectNeuron(cfg, orchestrator=orchestrator)

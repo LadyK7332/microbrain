@@ -408,24 +408,21 @@ class LLMReasonerNeuron(BaseNeuron):
         llm_fn_raw = await ctx.get_kv("llm:generate", default=None)
 
         if llm_fn_raw is None or not callable(llm_fn_raw):
-            # No backend configured; fall back to a safe message
             await ctx.log_warn(
                 f"[{self.name}] LLM backend not configured (llm:generate missing)",
             )
-            fallback_text = (
-                "I heard you, but my reasoning core isn't wired to a model yet."
-            )
-            reply_event = Event(
-                topic="act/speech",
-                payload={
-                    "text": fallback_text,
-                    "channel": channel,
-                    "style": "system",
-                },
-                source=self.name,
-                correlation_id=event.correlation_id,
-            )
-            return [reply_event]
+            return [
+                Event(
+                    topic="ui/error",
+                    payload={
+                        "kind": "llm_backend_missing",
+                        "channel": channel,
+                    },
+                    source=self.name,
+                    correlation_id=event.correlation_id,
+                    meta={"control": True, "kind": "llm_backend_missing"},
+                )
+            ]
 
         llm_fn: LLMGenerateFn = llm_fn_raw  # type: ignore[assignment]
 
@@ -453,21 +450,19 @@ class LLMReasonerNeuron(BaseNeuron):
                 f"[{self.name}] Error from LLM backend",
                 exception=str(exc),
             )
-            error_text = (
-                "Something went wrong talking to my reasoning model. "
-                "Please try again in a moment."
-            )
-            reply_event = Event(
-                topic="act/speech",
-                payload={
-                    "text": error_text,
-                    "channel": channel,
-                    "style": "system",
-                },
-                source=self.name,
-                correlation_id=event.correlation_id,
-            )
-            return [reply_event]
+            return [
+                Event(
+                    topic="ui/error",
+                    payload={
+                        "kind": "llm_backend_error",
+                        "channel": channel,
+                        "error": str(exc),
+                    },
+                    source=self.name,
+                    correlation_id=event.correlation_id,
+                    meta={"control": True, "kind": "llm_backend_error"},
+                )
+            ]
 
         reply_text = str(reply_text).strip()
         if not reply_text:
@@ -511,7 +506,7 @@ def build_neurons(orchestrator: Orchestrator):
     cfg = NeuronConfig(
         name="llm_reasoner",
         subscribed_topics=["reason/request"],
-        output_topics=["act/speech"],
+        output_topics=["act/speech", "ui/error"],
         priority=5,  # runs before echo_neuron(priority=0) if both are present
     )
 

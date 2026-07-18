@@ -268,6 +268,26 @@ def build_event_object(event: Event, *, internal_state: Mapping[str, Any] | None
         if sensor:
             classifiers.append(f"sensor.{sensor}")
 
+    elif event.topic == "vision/object_delta":
+        kind = "visual.object"
+        deltas = list(payload.get("deltas", []) or []) if isinstance(payload.get("deltas", []), list) else []
+        modalities["visual_delta"] = {
+            "schema": str(payload.get("schema", "vision.object_delta.v1") or "vision.object_delta.v1"),
+            "scene_ref": str(payload.get("scene_ref", "") or ""),
+            "text": str(payload.get("text", "") or ""),
+            "delta_count": payload.get("delta_count", len(deltas)),
+            "memory_candidate": bool(payload.get("memory_candidate", False)),
+            "deltas": deltas[:8],
+            "spatial": dict(payload.get("spatial", {}) or {}) if isinstance(payload.get("spatial", {}), Mapping) else None,
+            "image_ref": str(payload.get("image_ref", "") or ""),
+            "image_ref_policy": str(payload.get("image_ref_policy", "reference_only_do_not_hardsave_by_default") or ""),
+        }
+        classifiers.extend(["visual_delta", "object_delta"])
+        if bool(payload.get("memory_candidate", False)):
+            classifiers.append("memory_candidate")
+        if isinstance(payload.get("spatial"), Mapping):
+            classifiers.append("spatial_attached")
+
     elif event.topic == "percept/audio":
         kind = "auditory.object"
         modalities["auditory"] = dict(payload)

@@ -198,47 +198,16 @@ class SpeechReasonNeuron(BaseNeuron):
         return score
 
     def _fallback_variants(self, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-        need = str(payload.get("need", "") or "")
-        style = str(payload.get("style", "direct_simple") or "direct_simple")
-        if need != "power":
-            return [self._base_candidate(payload)]
-        if style == "urgent_direct":
-            texts = [
-                "I need to charge soon.",
-                "Power is critical; I may need to slow down.",
-                "I need help reaching charge.",
-            ]
-        elif style == "gentle_notice":
-            texts = [
-                "Power is dipping a bit.",
-                "I should top up soon.",
-                "Charging later would help.",
-            ]
-        else:
-            texts = [
-                "My power is getting low.",
-                "I should recharge soon.",
-                "Can you help me charge?",
-            ]
-        out: List[Dict[str, Any]] = []
-        for idx, text in enumerate(texts):
-            out.append({
-                "text": text,
-                "source": "fallback",
-                "role": "assistant",
-                "score": round(0.18 - (idx * 0.015), 4),
-                "kind": "fallback_need_variant",
-            })
-        return out
+        """Canned fallback utterances removed after line-live testing."""
+        return []
 
     def _base_candidate(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        text = self._clean_text(str(payload.get("message", "") or ""))
         return {
-            "text": text,
-            "source": "fallback",
+            "text": "",
+            "source": "none",
             "role": "assistant",
-            "score": 0.16,
-            "kind": "fallback",
+            "score": 0.0,
+            "kind": "no_candidate",
         }
 
     async def _recent_speech_state(self, ctx) -> Dict[str, Any]:
@@ -441,15 +410,73 @@ class SpeechReasonNeuron(BaseNeuron):
             })
         return out
 
+    async def _power_speech_blocked(self, ctx, payload: Dict[str, Any]) -> bool:
+        if str(payload.get("need", "") or "") != "power":
+            return False
+        gate_enabled = bool(await ctx.get_kv("drive:power:speech_gate_enabled", True))
+        if not gate_enabled:
+            return False
+        if bool(payload.get("user_requested", False)):
+            return False
+        if bool(await ctx.get_kv("drive:power:allow_unsolicited_speech", False)):
+            return False
+        pressure = payload.get("pressure", {}) if isinstance(payload.get("pressure", {}), dict) else {}
+        urgency = self._safe_float(pressure.get("urgency", 0.0), 0.0)
+        critical_threshold = self._safe_float(await ctx.get_kv("drive:power:critical_speech_threshold", 0.90), 0.90)
+        return urgency < critical_threshold
+
+    async def _emit_power_status_if_due(self, ctx, event: Event, payload: Dict[str, Any]) -> None:
+        now = time.time()
+        last_status_ts = self._safe_float(await ctx.get_kv("drive:power:last_status_ts", 0.0), 0.0)
+        status_cooldown_s = self._safe_float(await ctx.get_kv("drive:power:status_cooldown_s", 120.0), 120.0)
+        if last_status_ts > 0.0 and (now - last_status_ts) < status_cooldown_s:
+            return
+        pressure = payload.get("pressure", {}) if isinstance(payload.get("pressure", {}), dict) else {}
+        state = payload.get("state", {}) if isinstance(payload.get("state", {}), dict) else {}
+        pct = self._safe_float(pressure.get("pct", state.get("pct", 100.0)), 100.0)
+        urgency = self._safe_float(pressure.get("urgency", 0.0), 0.0)
+        if urgency >= 0.85:
+            text = f"power: critical at {pct:.0f}% | charge soon"
+            band = "critical"
+        elif urgency >= 0.55:
+            text = f"power: low at {pct:.0f}% | charge soon"
+            band = "active"
+        else:
+            text = f"power: dipping at {pct:.0f}% | watch charge"
+            band = "rising"
+        status_payload = {
+            "text": text,
+            "kind": "power_need_status",
+            "need": "power",
+            "band": band,
+            "urgency": round(urgency, 4),
+            "pct": round(pct, 2),
+            "pressure": pressure,
+            "speech_allowed": False,
+            "ts": now,
+        }
+        await ctx.set_kv("drive:power:last_status_ts", now)
+        await ctx.set_kv("drive:power:last_status", status_payload)
+        await ctx.emit(Event(
+            topic="ui/status",
+            payload=status_payload,
+            source=self.name,
+            correlation_id=event.correlation_id,
+            meta={
+                "kind": "power_need_status",
+                "need": "power",
+                "store_in_memory": False,
+                "reinforcement_eligible": False,
+                "self_output_track": False,
+            },
+        ))
+
     async def _gather_candidates(self, ctx, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
         need = str(payload.get("need", "") or "")
         style = str(payload.get("style", "direct_simple") or "direct_simple")
         query = self._query_text(payload)
 
         candidates: List[Dict[str, Any]] = []
-        for fallback in self._fallback_variants(payload):
-            if not self._is_bad_candidate(fallback["text"]):
-                candidates.append(fallback)
 
         mem_store = await ctx.get_kv("memory:store", None)
         if isinstance(mem_store, MemoryStore):
@@ -504,20 +531,9 @@ class SpeechReasonNeuron(BaseNeuron):
     def _select_candidate(self, payload: Dict[str, Any], candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
         if not candidates:
             return self._base_candidate(payload)
-
         best = dict(candidates[0])
-        if str(best.get("source", "") or "") != "fallback":
-            return best
-
-        best_non_fallback = None
-        for candidate in candidates:
-            if str(candidate.get("source", "") or "") == "fallback":
-                continue
-            if best_non_fallback is None or self._safe_float(candidate.get("score", 0.0), 0.0) > self._safe_float(best_non_fallback.get("score", 0.0), 0.0):
-                best_non_fallback = dict(candidate)
-
-        if best_non_fallback is not None and self._safe_float(best_non_fallback.get("score", 0.0), 0.0) >= 0.14:
-            return best_non_fallback
+        if self._safe_float(best.get("score", 0.0), 0.0) <= 0.0:
+            return self._base_candidate(payload)
         return best
 
     async def _update_pending_request(self, ctx, event: Event, chosen: Dict[str, Any]) -> None:
@@ -564,6 +580,19 @@ class SpeechReasonNeuron(BaseNeuron):
         if outlet == "motion":
             return []
 
+        if await self._power_speech_blocked(ctx, payload):
+            await self._emit_power_status_if_due(ctx, event, payload)
+            await ctx.set_kv(
+                "speech_reason:last_blocked",
+                {
+                    "ts": time.time(),
+                    "need": "power",
+                    "reason": "power_status_speech_gate",
+                    "payload": payload,
+                },
+            )
+            return []
+
         candidates = await self._gather_candidates(ctx, payload)
         candidates = await self._score_candidates(ctx, payload, candidates)
         candidates.sort(
@@ -575,14 +604,16 @@ class SpeechReasonNeuron(BaseNeuron):
         )
         chosen = self._select_candidate(payload, candidates)
         chosen_score = self._safe_float(chosen.get("score", 0.0), 0.0)
-        utterance = self._clean_text(chosen.get("text", "") or payload.get("message", ""))
+        utterance = self._clean_text(chosen.get("text", ""))
         if (not utterance) or (str(payload.get("need", "") or "") and chosen_score <= 0.0):
             need = str(payload.get("need", "") or "")
             if need:
                 await ctx.emit(Event(
                     topic="thought/internal",
                     payload={
-                        "text": f"The {need} need is unresolved, but the last expression was stale. I need a different route.",
+                        "text": "",
+                        "need": need,
+                        "state": "unresolved_expression_no_candidate",
                         "kind": "need_expression_blocked",
                         "source_need": need,
                     },
@@ -645,7 +676,7 @@ def build_neurons(orchestrator: Orchestrator):
     cfg = NeuronConfig(
         name=NEURON_NAME,
         subscribed_topics=["speech/reason"],
-        output_topics=["act/speech"],
+        output_topics=["act/speech", "ui/status"],
         priority=10,
         cooldown_sec=0.0,
     )

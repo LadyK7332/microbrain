@@ -2,21 +2,53 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import threading
 import time
+import uuid
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 from microbrain.memory.memory_store import JSONLStore
 
 TIERS = ("now", "short", "long", "learned")
 TOKEN_RE = re.compile(r"[a-z0-9']+")
 
+_PROCESS_SHARD_LOCKS: Dict[str, threading.RLock] = {}
+_PROCESS_SHARD_LOCKS_GUARD = threading.Lock()
+
+
 DEIXIS_TOKENS = {"this", "that", "these", "those"}
 DETERMINERS = {"a", "an", "the"} | DEIXIS_TOKENS
 COPULA_TOKENS = {"is", "are", "was", "were", "be"}
 QUESTION_WORDS = {"what", "why", "how", "when", "where", "who", "which"}
 GREETING_TOKENS = {"hi", "hello", "hey", "yo", "howdy", "moin"}
+
+SELF_PRONOUNS = {"i", "me", "my", "mine", "myself"}
+LISTENER_PRONOUNS = {"you", "your", "yours", "yourself"}
+GROUP_PRONOUNS = {"we", "us", "our", "ours", "ourselves"}
+MODALS = {"can", "could", "would", "will", "should", "may", "might", "must"}
+NEGATIONS = {"not", "n't", "no", "never"}
+CONNECTORS = {"and", "or", "but", "because", "if", "then", "while", "although"}
+PREPOSITIONS = {"to", "from", "in", "on", "at", "with", "without", "for", "about", "of", "into", "over", "under", "between"}
+TIME_MODIFIERS = {"now", "soon", "later", "then", "today", "tomorrow", "tonight", "eventually", "currently", "already", "next"}
+INTENSIFIERS = {"very", "really", "quite", "too", "so", "extremely", "super", "highly"}
+NEED_WORDS = {"need", "needs", "needed", "require", "requires", "want", "wants", "must", "should"}
+PREFERENCE_WORDS = {"like", "likes", "love", "loves", "prefer", "prefers", "enjoy", "enjoys", "want", "wants"}
+REQUEST_ACTION_WORDS = {"patch", "fix", "update", "make", "create", "generate", "write", "explain", "review", "check", "look"}
+CHARGE_ACTION_WORDS = {"charge", "recharge", "plug"}
+REST_ACTION_WORDS = {"sleep", "rest", "pause"}
+FOOD_ACTION_WORDS = {"eat", "feed", "food"}
+MAINT_ACTION_WORDS = {"maintain", "repair", "fix", "service"}
+GENERAL_ACTION_WORDS = {
+    "answer", "ask", "build", "create", "do", "explain", "generate", "get", "give", "go",
+    "learn", "look", "make", "parse", "patch", "put", "read", "remember", "say", "show",
+    "speak", "store", "tell", "think", "use", "visit", "write",
+}
+ATTRIBUTE_WORDS = {"old", "new", "good", "bad", "fast", "slow", "low", "high", "stable", "rough", "strong", "weak"}
+DISCOURSE_MARKERS = {"well", "oh", "ah", "hey", "hello", "hi", "please", "thanks", "thank"}
 
 
 class MemCellStore:
@@ -30,8 +62,13 @@ class MemCellStore:
       - text can be decomposed into utterance, token, and simple pattern cells
     """
 
-    def __init__(self, base_dir: str | Path):
+    def __init__(self, base_dir: str | Path, *, composer_enabled: Optional[bool] = None, writer_id: Optional[str] = None):
         self.base_dir = Path(base_dir)
+        if composer_enabled is None:
+            raw_mode = os.getenv("MB_MEM_CELL_COMPOSER", "1").strip().lower()
+            composer_enabled = raw_mode not in {"0", "false", "no", "off", "direct"}
+        self.composer_enabled = bool(composer_enabled)
+        self.writer_id = str(writer_id or f"pid{os.getpid()}-thr{threading.get_ident()}-{uuid.uuid4().hex[:8]}")
         self.mem_cell_dir = self.base_dir / "mem_cell"
         self.derived_dir = self.base_dir / "mem_cell_derived"
         self.legacy_dir = self.mem_cell_dir / "_legacy_shards"
@@ -39,10 +76,175 @@ class MemCellStore:
         self._tier_rows: Dict[str, List[Dict[str, Any]]] = {}
         self._tier_index: Dict[str, Dict[str, int]] = {}
         self._tier_loaded: set[str] = set()
+        self._tier_locks: Dict[str, threading.RLock] = {}
+        self._dirty_tier_rows: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        self._dirty_seq: int = 0
         for tier in TIERS:
             (self.mem_cell_dir / tier).mkdir(parents=True, exist_ok=True)
         self.derived_dir.mkdir(parents=True, exist_ok=True)
         self.legacy_dir.mkdir(parents=True, exist_ok=True)
+
+
+    def _tier_lock(self, tier: str) -> threading.RLock:
+        tier = self._coerce_tier(tier)
+        lock = self._tier_locks.get(tier)
+        if lock is None:
+            lock = threading.RLock()
+            self._tier_locks[tier] = lock
+        return lock
+
+    def _process_shard_lock(self, path: Path) -> threading.RLock:
+        key = str(path.resolve())
+        with _PROCESS_SHARD_LOCKS_GUARD:
+            lock = _PROCESS_SHARD_LOCKS.get(key)
+            if lock is None:
+                lock = threading.RLock()
+                _PROCESS_SHARD_LOCKS[key] = lock
+            return lock
+
+    @contextmanager
+    def _file_write_lock(
+        self,
+        path: Path,
+        *,
+        timeout_s: float = 12.0,
+        stale_after_s: float = 120.0,
+    ) -> Iterator[None]:
+        """Best-effort cross-process shard writer lock.
+
+        Windows refuses os.replace() when another process has the target file
+        open.  MB can run the face, read sidecar, and maintenance organs at
+        the same time, so each shard rewrite needs one shared lock file plus
+        a short retry window instead of every writer racing on now.jsonl.tmp.
+        """
+        lock_path = path.with_suffix(path.suffix + ".lock")
+        deadline = time.monotonic() + max(0.1, float(timeout_s))
+        owner = f"pid={os.getpid()} thread={threading.get_ident()} ts={time.time():.6f}\n"
+        fd: int | None = None
+
+        while True:
+            try:
+                fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                os.write(fd, owner.encode("utf-8", errors="replace"))
+                break
+            except FileExistsError:
+                try:
+                    age_s = time.time() - lock_path.stat().st_mtime
+                    if age_s > stale_after_s:
+                        lock_path.unlink(missing_ok=True)
+                        continue
+                except OSError:
+                    pass
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"timed out waiting for mem-cell shard lock: {lock_path}")
+                time.sleep(0.05)
+
+        try:
+            yield
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            try:
+                lock_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _atomic_replace_with_retry(
+        self,
+        tmp: Path,
+        path: Path,
+        *,
+        attempts: int = 12,
+        delay_s: float = 0.05,
+    ) -> None:
+        last_exc: BaseException | None = None
+        for attempt in range(max(1, int(attempts))):
+            try:
+                tmp.replace(path)
+                return
+            except PermissionError as exc:
+                last_exc = exc
+                if attempt >= attempts - 1:
+                    break
+                time.sleep(delay_s * (attempt + 1))
+        if last_exc is not None:
+            raise last_exc
+
+
+    def _pending_dir(self, tier: str) -> Path:
+        tier = self._coerce_tier(tier)
+        return self.mem_cell_dir / "_pending" / tier
+
+    def _mark_dirty(self, tier: str, row: Dict[str, Any]) -> None:
+        """Mark a row as needing composer ingestion.
+
+        Writer instances update their own in-memory view immediately so return
+        values stay useful, but they do not rewrite canonical shard files.  The
+        memory composer goblin owns final shard writes.
+        """
+        tier = self._coerce_tier(tier)
+        if not isinstance(row, dict):
+            return
+        bucket = self._dirty_tier_rows.setdefault(tier, {})
+        row_id = str(row.get("id", "") or "").strip()
+        if not row_id:
+            self._dirty_seq += 1
+            row_id = f"anonymous:{self._dirty_seq}:{time.time_ns()}"
+        bucket[row_id] = dict(row)
+
+    def _stage_rows_for_composer(self, tier: str, rows: Sequence[Dict[str, Any]], *, touch: bool = True) -> int:
+        """Write pending upsert ops for the single memory composer.
+
+        Every writer gets a unique file.  Nobody except the composer touches the
+        canonical tier shard, which avoids Windows replace/open-handle fights.
+        """
+        tier = self._coerce_tier(tier)
+        clean_rows = [dict(row) for row in (rows or []) if isinstance(row, dict)]
+        if not clean_rows:
+            return 0
+
+        pending_dir = self._pending_dir(tier)
+        pending_dir.mkdir(parents=True, exist_ok=True)
+        op_id = f"{os.getpid()}-{threading.get_ident()}-{time.time_ns()}-{uuid.uuid4().hex}"
+        tmp = pending_dir / f".{op_id}.jsonl.tmp"
+        final = pending_dir / f"{op_id}.jsonl"
+        try:
+            with tmp.open("w", encoding="utf-8") as f:
+                for row in clean_rows:
+                    row.setdefault("tier", tier)
+                    envelope = {
+                        "schema": "mem_cell.pending_upsert.v1",
+                        "op": "upsert",
+                        "tier": tier,
+                        "touch": bool(touch),
+                        "writer_id": self.writer_id,
+                        "op_id": op_id,
+                        "queued_at": time.time(),
+                        "row": row,
+                    }
+                    f.write(json.dumps(envelope, ensure_ascii=False) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            tmp.replace(final)
+            return len(clean_rows)
+        finally:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _stage_dirty_rows(self, tier: str) -> int:
+        tier = self._coerce_tier(tier)
+        dirty = list((self._dirty_tier_rows.get(tier) or {}).values())
+        if not dirty:
+            return 0
+        staged = self._stage_rows_for_composer(tier, dirty, touch=True)
+        if staged:
+            self._dirty_tier_rows[tier] = {}
+        return staged
 
     @staticmethod
     def _norm_text(text: str) -> str:
@@ -186,40 +388,43 @@ class MemCellStore:
 
     def _load_tier_rows(self, tier: str) -> List[Dict[str, Any]]:
         tier = self._coerce_tier(tier)
-        if tier in self._tier_loaded:
-            return self._tier_rows.setdefault(tier, [])
+        with self._tier_lock(tier):
+            if tier in self._tier_loaded:
+                return self._tier_rows.setdefault(tier, [])
 
-        path = self._shard_path(tier)
-        rows: List[Dict[str, Any]] = []
-        canonical_count = 0
-        if path.exists():
-            try:
-                canonical_rows = JSONLStore(str(path)).read_all()
-                canonical_count = len(canonical_rows)
-                rows.extend(canonical_rows)
-            except Exception:
-                canonical_count = 0
+            path = self._shard_path(tier)
+            rows: List[Dict[str, Any]] = []
+            canonical_count = 0
+            if path.exists():
+                try:
+                    canonical_rows = JSONLStore(str(path)).read_all()
+                    canonical_count = len(canonical_rows)
+                    rows.extend(canonical_rows)
+                except Exception:
+                    canonical_count = 0
 
-        legacy_paths = self._legacy_paths(tier)
-        for legacy in legacy_paths:
-            try:
-                rows.extend(JSONLStore(str(legacy)).read_all())
-            except Exception:
-                continue
+            legacy_paths = self._legacy_paths(tier)
+            for legacy in legacy_paths:
+                try:
+                    rows.extend(JSONLStore(str(legacy)).read_all())
+                except Exception:
+                    continue
 
-        rows = self._dedupe_rows(rows, tier)
-        self._tier_rows[tier] = rows
-        self._rebuild_tier_index(tier)
-        self._tier_loaded.add(tier)
+            rows = self._dedupe_rows(rows, tier)
+            self._tier_rows[tier] = rows
+            self._rebuild_tier_index(tier)
+            self._tier_loaded.add(tier)
 
-        # If we saw legacy daily shards or duplicates, collapse them into the
-        # canonical file once and archive the old append shards.
-        if legacy_paths or (path.exists() and len(rows) != canonical_count):
-            self._write_shard(tier, rows)
-            self._archive_legacy_paths(tier, legacy_paths)
-        elif not path.exists():
-            self._write_shard(tier, rows)
-        return self._tier_rows[tier]
+            # If direct writer mode is active, collapse legacy daily shards into
+            # the canonical file.  In composer mode, readers/writers never rewrite
+            # canonical shards; the memory composer owns that desk job.
+            if not self.composer_enabled:
+                if legacy_paths or (path.exists() and len(rows) != canonical_count):
+                    self._write_shard(tier, rows)
+                    self._archive_legacy_paths(tier, legacy_paths)
+                elif not path.exists():
+                    self._write_shard(tier, rows)
+            return self._tier_rows[tier]
 
     def _read_shard(self, tier: str) -> List[Dict[str, Any]]:
         return [dict(row) for row in self._load_tier_rows(tier)]
@@ -227,22 +432,39 @@ class MemCellStore:
     def _write_shard(self, tier: str, rows: List[Dict[str, Any]]) -> None:
         tier = self._coerce_tier(tier)
         path = self._shard_path(tier)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        rows = self._dedupe_rows(rows, tier)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        with tmp.open("w", encoding="utf-8") as f:
-            for row in rows:
-                f.write(json.dumps(row, ensure_ascii=False) + "\n")
-        tmp.replace(path)
-        self._tier_rows[tier] = rows
-        self._rebuild_tier_index(tier)
-        self._tier_loaded.add(tier)
-        if tier in self._stores:
-            self._stores[tier] = JSONLStore(str(path))
+        with self._tier_lock(tier):
+            with self._process_shard_lock(path):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                rows = self._dedupe_rows(rows, tier)
+                tmp = path.with_name(
+                    f".{path.name}.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}.tmp"
+                )
+                try:
+                    with self._file_write_lock(path):
+                        with tmp.open("w", encoding="utf-8") as f:
+                            for row in rows:
+                                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                            f.flush()
+                            os.fsync(f.fileno())
+                        self._atomic_replace_with_retry(tmp, path)
+                finally:
+                    try:
+                        tmp.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                self._tier_rows[tier] = rows
+                self._rebuild_tier_index(tier)
+                self._tier_loaded.add(tier)
+                if tier in self._stores:
+                    self._stores[tier] = JSONLStore(str(path))
 
     def flush_tier(self, tier: str) -> None:
         tier = self._coerce_tier(tier)
-        self._write_shard(tier, self._load_tier_rows(tier))
+        with self._tier_lock(tier):
+            if self.composer_enabled:
+                self._stage_dirty_rows(tier)
+                return
+            self._write_shard(tier, self._load_tier_rows(tier))
 
     def _derived_path(self) -> Path:
         shard = time.strftime("derived_%Y%m%d.jsonl", time.localtime())
@@ -304,42 +526,45 @@ class MemCellStore:
     ) -> Dict[str, Any]:
         row = dict(cell or {})
         tier = self._coerce_tier(str(tier or row.get("tier", "now") or "now"))
-        row.setdefault("tier", tier)
-        row.setdefault("schema", "mem_cell.v1")
-        now_ts = time.time()
-        row.setdefault("ts", now_ts)
-        row.setdefault("last_seen", now_ts)
-        row.setdefault("encounter_count", 1)
-        row.setdefault("revision", 0)
-        row.setdefault("links_explicit", [])
-        row.setdefault("refs", [])
-        row.setdefault("modalities", [])
-        row.setdefault("activation", 1.0)
-        row.setdefault("promotion", 0.0)
-        row.setdefault("decay", 1.0)
-        row.setdefault("trust", 0.5)
-        row.setdefault("usage_count", 0)
-        row.setdefault("successful_recalls", 0)
-        row.setdefault("last_used_ts", 0.0)
+        with self._tier_lock(tier):
+            row.setdefault("tier", tier)
+            row.setdefault("schema", "mem_cell.v1")
+            now_ts = time.time()
+            row.setdefault("ts", now_ts)
+            row.setdefault("last_seen", now_ts)
+            row.setdefault("encounter_count", 1)
+            row.setdefault("revision", 0)
+            row.setdefault("links_explicit", [])
+            row.setdefault("refs", [])
+            row.setdefault("modalities", [])
+            row.setdefault("activation", 1.0)
+            row.setdefault("promotion", 0.0)
+            row.setdefault("decay", 1.0)
+            row.setdefault("trust", 0.5)
+            row.setdefault("usage_count", 0)
+            row.setdefault("successful_recalls", 0)
+            row.setdefault("last_used_ts", 0.0)
 
-        rows = self._load_tier_rows(tier)
-        index = self._tier_index.setdefault(tier, {})
-        row_id = str(row.get("id", "") or "").strip()
+            rows = self._load_tier_rows(tier)
+            index = self._tier_index.setdefault(tier, {})
+            row_id = str(row.get("id", "") or "").strip()
 
-        if not row_id or row_id not in index:
-            rows.append(row)
-            if row_id:
-                index[row_id] = len(rows) - 1
+            if not row_id or row_id not in index:
+                rows.append(row)
+                if row_id:
+                    index[row_id] = len(rows) - 1
+                self._mark_dirty(tier, row)
+                if flush:
+                    self.flush_tier(tier)
+                return row
+
+            existing_idx = index[row_id]
+            merged = self._merge_cell_rows(dict(rows[existing_idx] or {}), row, touch=touch)
+            rows[existing_idx] = merged
+            self._mark_dirty(tier, merged)
             if flush:
-                self._write_shard(tier, rows)
-            return row
-
-        existing_idx = index[row_id]
-        merged = self._merge_cell_rows(dict(rows[existing_idx] or {}), row, touch=touch)
-        rows[existing_idx] = merged
-        if flush:
-            self._write_shard(tier, rows)
-        return merged
+                self.flush_tier(tier)
+            return merged
 
 
     @staticmethod
@@ -364,6 +589,417 @@ class MemCellStore:
     @staticmethod
     def _canonical_text(parts: Sequence[str]) -> str:
         return " ".join([str(p or "").strip() for p in (parts or []) if str(p or "").strip()]).strip()
+
+
+    @staticmethod
+    def _word_tool_role(token: str, idx: int, tokens: Sequence[str]) -> Dict[str, str]:
+        tok = str(token or "").strip().lower()
+        prev_tok = str(tokens[idx - 1]).strip().lower() if idx > 0 and idx - 1 < len(tokens) else ""
+        next_tok = str(tokens[idx + 1]).strip().lower() if idx + 1 < len(tokens) else ""
+
+        if tok in NEGATIONS:
+            pos = "adverb"
+            tool_role = "negation_gate"
+            thought_use = "inverts_or_blocks_relation"
+        elif tok in SELF_PRONOUNS:
+            pos = "pronoun"
+            tool_role = "speaker_self_reference"
+            thought_use = "binds_current_speaker"
+        elif tok in LISTENER_PRONOUNS:
+            pos = "pronoun"
+            tool_role = "listener_reference"
+            thought_use = "binds_addressee_or_mb_when_user_speaks"
+        elif tok in GROUP_PRONOUNS:
+            pos = "pronoun"
+            tool_role = "group_self_reference"
+            thought_use = "binds_shared_actor_group"
+        elif tok in QUESTION_WORDS:
+            pos = "adverb" if tok in {"why", "how", "when", "where"} else "pronoun"
+            tool_role = "question_focus_operator"
+            thought_use = "requests_missing_slot"
+        elif tok in MODALS:
+            pos = "verb"
+            tool_role = "capability_or_permission_operator"
+            thought_use = "opens_possible_action_or_question"
+        elif tok in NEED_WORDS:
+            pos = "verb"
+            tool_role = "need_or_drive_relation"
+            thought_use = "connects_actor_to_requirement"
+        elif tok in PREFERENCE_WORDS:
+            pos = "verb"
+            tool_role = "preference_relation"
+            thought_use = "connects_actor_to_preferred_action_or_object"
+        elif tok in DISCOURSE_MARKERS:
+            pos = "interjection"
+            tool_role = "discourse_emotion_marker"
+            thought_use = "marks_social_or_emotional_frame"
+        elif tok in REQUEST_ACTION_WORDS or tok in CHARGE_ACTION_WORDS or tok in REST_ACTION_WORDS or tok in FOOD_ACTION_WORDS or tok in MAINT_ACTION_WORDS or tok in GENERAL_ACTION_WORDS:
+            pos = "verb"
+            tool_role = "action_or_process"
+            thought_use = "binds_change_or_task"
+        elif tok in ATTRIBUTE_WORDS:
+            pos = "adjective"
+            tool_role = "attribute_modifier"
+            thought_use = "modifies_entity_quality"
+        elif tok in TIME_MODIFIERS:
+            pos = "adverb"
+            tool_role = "time_or_urgency_modifier"
+            thought_use = "modifies_when_or_urgency"
+        elif tok in INTENSIFIERS:
+            pos = "adverb"
+            tool_role = "intensity_modifier"
+            thought_use = "modifies_strength"
+        elif tok in CONNECTORS:
+            pos = "conjunction"
+            tool_role = "structure_connector"
+            thought_use = "joins_structures"
+        elif tok in PREPOSITIONS:
+            pos = "preposition"
+            tool_role = "relationship_marker"
+            thought_use = "marks_path_target_or_relation"
+            if tok == "to" and next_tok:
+                thought_use = "marks_action_target_or_infinitive"
+        elif tok in DETERMINERS:
+            pos = "determiner"
+            tool_role = "deixis_or_determiner"
+            thought_use = "narrows_entity_reference"
+        elif prev_tok in DETERMINERS:
+            pos = "noun"
+            tool_role = "entity_anchor"
+            thought_use = "binds_object_or_concept"
+        elif tok.endswith("ly"):
+            pos = "adverb"
+            tool_role = "manner_modifier"
+            thought_use = "modifies_action_quality"
+        elif tok.endswith(("ing", "ed")):
+            pos = "verb"
+            tool_role = "action_or_process"
+            thought_use = "binds_change_or_task"
+        else:
+            pos = "noun"
+            tool_role = "entity_or_concept_anchor"
+            thought_use = "binds_object_or_concept"
+
+        functional_role = "unknown"
+        if tool_role.endswith("reference") or "reference" in tool_role or tool_role.startswith("entity"):
+            functional_role = "entity_binding"
+        elif "relation" in tool_role or "action" in tool_role or "operator" in tool_role:
+            functional_role = "relation_or_action_binding"
+        elif "modifier" in tool_role:
+            functional_role = "modifier_binding"
+        elif "connector" in tool_role:
+            functional_role = "structure_binding"
+        elif "gate" in tool_role:
+            functional_role = "polarity_binding"
+
+        return {
+            "part_of_speech": pos,
+            "tool_role": tool_role,
+            "functional_role": functional_role,
+            "thought_use": thought_use,
+        }
+
+    @staticmethod
+    def _reference_scope(token: str) -> str:
+        tok = str(token or "").strip().lower()
+        if tok in SELF_PRONOUNS:
+            return "speaker_self"
+        if tok in LISTENER_PRONOUNS:
+            return "listener_reference"
+        if tok in GROUP_PRONOUNS:
+            return "speaker_group"
+        return "entity_reference" if tok else "unknown_reference"
+
+    @staticmethod
+    def _need_type_for_action(action: str) -> str:
+        act = str(action or "").strip().lower()
+        if act in CHARGE_ACTION_WORDS:
+            return "power_recovery"
+        if act in REST_ACTION_WORDS:
+            return "rest_or_sleep"
+        if act in FOOD_ACTION_WORDS:
+            return "hunger_or_fuel"
+        if act in MAINT_ACTION_WORDS:
+            return "maintenance"
+        return "unspecified_need"
+
+    @staticmethod
+    def _first_token_after(tokens: Sequence[str], allowed: set[str], start: int = 0) -> str:
+        for tok in list(tokens or [])[max(0, int(start)):]:
+            tok = str(tok or "").strip().lower()
+            if tok in allowed:
+                return tok
+        return ""
+
+    @staticmethod
+    def _next_action_token(tokens: Sequence[str], start: int = 0) -> Tuple[int, str]:
+        for idx in range(max(0, int(start)), len(tokens or [])):
+            tok = str(tokens[idx] or "").strip().lower()
+            if not tok or tok in {"to", "please", "you", "i", "we"} or tok in MODALS:
+                continue
+            if tok in REQUEST_ACTION_WORDS or tok in CHARGE_ACTION_WORDS or tok in REST_ACTION_WORDS or tok in FOOD_ACTION_WORDS or tok in MAINT_ACTION_WORDS or tok in GENERAL_ACTION_WORDS:
+                return idx, tok
+            if tok.endswith(("ing", "ed")):
+                return idx, tok
+        return -1, ""
+
+    @staticmethod
+    def _object_phrase_after(tokens: Sequence[str], start: int = 0, limit: int = 4) -> str:
+        out: List[str] = []
+        for tok in list(tokens or [])[max(0, int(start)):]:
+            tok = str(tok or "").strip().lower()
+            if not tok or tok in {"to", "please"}:
+                continue
+            if tok in TIME_MODIFIERS or tok in CONNECTORS:
+                if out:
+                    break
+                continue
+            out.append(tok)
+            if len(out) >= limit:
+                break
+        return " ".join(out).strip()
+
+    def make_word_role_cells(
+        self,
+        *,
+        text: str,
+        parent_id: str,
+        token_cells: Sequence[Dict[str, Any]],
+        role: str,
+        tier: str = "now",
+    ) -> List[Dict[str, Any]]:
+        tokens = [str((c.get("anchor", {}) or {}).get("ref", "") or "") for c in token_cells]
+        token_ids = [str(c.get("id", "") or "") for c in token_cells]
+        out: List[Dict[str, Any]] = []
+        now_ts = time.time()
+        for idx, token in enumerate(tokens):
+            tok = str(token or "").strip().lower()
+            if not tok:
+                continue
+            role_info = self._word_tool_role(tok, idx, tokens)
+            tool_role = role_info["tool_role"]
+            digest = hashlib.blake2b(
+                f"word_role|{tok}|{tool_role}|{role_info['functional_role']}".encode("utf-8", errors="ignore"),
+                digest_size=8,
+            ).hexdigest()
+            token_id = token_ids[idx] if idx < len(token_ids) else ""
+            refs = [
+                {"kind": "token", "value": tok},
+                {"kind": "part_of_speech", "value": role_info["part_of_speech"]},
+                {"kind": "tool_role", "value": tool_role},
+                {"kind": "functional_role", "value": role_info["functional_role"]},
+                {"kind": "thought_use", "value": role_info["thought_use"]},
+            ]
+            out.append({
+                "id": f"wr{digest}",
+                "kind": "word_role",
+                "tier": tier,
+                "anchor": {
+                    "kind": f"language/word_role/{tool_role}",
+                    "ref": f"{tok}:{tool_role}",
+                    "norm": self._norm_text(f"{tok} {tool_role} {role_info['part_of_speech']}"),
+                },
+                "refs": refs,
+                "modalities": ["text"],
+                "links_explicit": [cell_id for cell_id in [parent_id, token_id] if cell_id],
+                "activation": 0.78,
+                "promotion": 0.03,
+                "decay": 1.0,
+                "trust": 0.68 if role == "user" else 0.54,
+                "meta": {
+                    "role": role,
+                    "parent_id": parent_id,
+                    "token": tok,
+                    "token_index": idx,
+                    **role_info,
+                },
+                "ts": now_ts,
+                "last_seen": now_ts,
+                "encounter_count": 1,
+                "revision": 0,
+            })
+        return out
+
+    def make_thought_template_cells(
+        self,
+        *,
+        text: str,
+        parent_id: str,
+        token_cells: Sequence[Dict[str, Any]],
+        word_role_cells: Sequence[Dict[str, Any]],
+        role: str,
+        tier: str = "now",
+    ) -> List[Dict[str, Any]]:
+        tokens = [str((c.get("anchor", {}) or {}).get("ref", "") or "").strip().lower() for c in token_cells]
+        token_ids = [str(c.get("id", "") or "") for c in token_cells]
+        word_role_ids = [str(c.get("id", "") or "") for c in word_role_cells]
+        out: List[Dict[str, Any]] = []
+        now_ts = time.time()
+        text_str = str(text or "").strip()
+        text_is_question = text_str.endswith("?") or (tokens[:1] and tokens[0] in QUESTION_WORDS | MODALS | {"do", "does", "did", "is", "are", "was", "were"})
+        seen: set[tuple[str, str]] = set()
+
+        def add_template(pattern_type: str, canonical: str, slots: Dict[str, Any], activation: float = 0.82, trust: Optional[float] = None) -> None:
+            canonical_clean = self._canonical_text([canonical])
+            if not canonical_clean:
+                return
+            key = (pattern_type, canonical_clean.lower())
+            if key in seen:
+                return
+            seen.add(key)
+            digest = hashlib.blake2b(
+                f"thought_template|{pattern_type}|{canonical_clean}".encode("utf-8", errors="ignore"),
+                digest_size=8,
+            ).hexdigest()
+            refs = [{"kind": "thought_template", "value": canonical_clean}]
+            for slot_name, slot_value in dict(slots or {}).items():
+                if slot_value in (None, "", []):
+                    continue
+                refs.append({"kind": "slot", "name": str(slot_name), "value": slot_value})
+            out.append({
+                "id": f"th{digest}",
+                "kind": "thought_template",
+                "tier": tier,
+                "anchor": {
+                    "kind": f"thought/template/{pattern_type}",
+                    "ref": canonical_clean,
+                    "norm": self._norm_text(canonical_clean),
+                },
+                "refs": refs,
+                "modalities": ["text"],
+                "links_explicit": self._merge_unique_list([parent_id], token_ids[:8] + word_role_ids[:8], limit=24),
+                "activation": activation,
+                "promotion": 0.10,
+                "decay": 1.0,
+                "trust": trust if trust is not None else (0.72 if role == "user" else 0.58),
+                "meta": {
+                    "role": role,
+                    "pattern_type": pattern_type,
+                    "canonical": canonical_clean,
+                    "surface": text_str[:180],
+                    "parent_id": parent_id,
+                    "slots": dict(slots or {}),
+                    "language_layer": "thought_template",
+                },
+                "ts": now_ts,
+                "last_seen": now_ts,
+                "encounter_count": 1,
+                "revision": 0,
+            })
+
+        if not tokens:
+            return out
+
+        # Questions become slot requests, not vague text echoes.
+        if text_is_question:
+            focus_tokens = [t for t in tokens if t not in QUESTION_WORDS and t not in MODALS and t not in DETERMINERS and t not in {"do", "does", "did", "is", "are", "was", "were", "to"}]
+            focus = self._canonical_text(focus_tokens[:4])
+            if focus:
+                add_template(
+                    "question_about",
+                    self._canonical_text(["question", focus]),
+                    {"question_word": tokens[0], "focus": focus, "is_question": True},
+                    activation=0.70,
+                    trust=0.66 if role == "user" else 0.52,
+                )
+
+        # Need/action: "I need to charge soon" / "do you need to charge?"
+        for idx, tok in enumerate(tokens):
+            if tok not in NEED_WORDS:
+                continue
+            subject = ""
+            for back in range(idx - 1, -1, -1):
+                if tokens[back] not in MODALS and tokens[back] not in {"do", "does", "did", "to"}:
+                    subject = tokens[back]
+                    break
+            action_idx, action = self._next_action_token(tokens, idx + 1)
+            urgency = self._first_token_after(tokens, TIME_MODIFIERS, (action_idx if action_idx >= 0 else idx) + 1)
+            need_type = self._need_type_for_action(action)
+            pattern_type = "query_need_action" if text_is_question else "need_action"
+            canonical = self._canonical_text([subject or "someone", "need", "to", action, urgency])
+            add_template(
+                pattern_type,
+                canonical,
+                {
+                    "subject": subject,
+                    "subject_ref": self._reference_scope(subject),
+                    "relation": "need",
+                    "action": action,
+                    "need_type": need_type,
+                    "urgency": urgency,
+                    "is_question": text_is_question,
+                },
+                activation=0.88 if action else 0.70,
+                trust=0.78 if role == "user" else 0.60,
+            )
+
+        # Action request: "can you patch it" / "please fix that".
+        if tokens[0] in MODALS | {"please"} or "please" in tokens or any(t in REQUEST_ACTION_WORDS for t in tokens):
+            action_idx, action = self._next_action_token(tokens, 0)
+            if action:
+                target = self._object_phrase_after(tokens, action_idx + 1)
+                add_template(
+                    "request_action",
+                    self._canonical_text(["request", action, target]),
+                    {
+                        "actor": "listener" if "you" in tokens else "assistant",
+                        "action": action,
+                        "target": target,
+                        "permission_shape": "can_you" if tokens[0] in MODALS else "please_or_imperative",
+                        "is_question": text_is_question,
+                    },
+                    activation=0.84,
+                    trust=0.78 if role == "user" else 0.58,
+                )
+
+        # Preference/intent action: "we like to visit old friends".
+        for idx, tok in enumerate(tokens):
+            if tok not in PREFERENCE_WORDS:
+                continue
+            subject = ""
+            for back in range(idx - 1, -1, -1):
+                if tokens[back] not in MODALS and tokens[back] not in {"to"}:
+                    subject = tokens[back]
+                    break
+            action_idx, action = self._next_action_token(tokens, idx + 1)
+            obj = self._object_phrase_after(tokens, (action_idx if action_idx >= 0 else idx) + 1)
+            if action:
+                add_template(
+                    "preference_action",
+                    self._canonical_text([subject or "someone", tok, action, obj]),
+                    {"subject": subject, "preference": tok, "action": action, "object": obj},
+                    activation=0.78,
+                )
+
+        # Generic action relation: subject action object. Avoid using
+        # discourse words such as "well" as the actor, and do not add a
+        # weaker duplicate when a stronger need/request/preference template
+        # already captured the thought.
+        specific_template_present = any(
+            pattern_type in {"need_action", "query_need_action", "request_action", "preference_action"}
+            for pattern_type, _canonical in seen
+        )
+        if len(tokens) >= 2 and not specific_template_present:
+            subject = ""
+            subject_idx = -1
+            for i, tok in enumerate(tokens):
+                if tok in DISCOURSE_MARKERS or tok in CONNECTORS or tok in DETERMINERS or tok in MODALS | QUESTION_WORDS:
+                    continue
+                subject = tok
+                subject_idx = i
+                break
+            action_idx, action = self._next_action_token(tokens, max(0, subject_idx + 1))
+            obj = self._object_phrase_after(tokens, action_idx + 1) if action_idx >= 0 else ""
+            if action and subject and subject != action and action not in NEED_WORDS | PREFERENCE_WORDS:
+                add_template(
+                    "action_relation",
+                    self._canonical_text([subject, action, obj]),
+                    {"subject": subject, "action": action, "object": obj},
+                    activation=0.66,
+                    trust=0.62 if role == "user" else 0.50,
+                )
+
+        return out
 
     def make_general_pattern_cells(
         self,
@@ -846,44 +1482,71 @@ class MemCellStore:
             text=text, topic=topic, role=role, transport_source=transport_source, source=source, meta=meta, tier=tier
         )
         utterance = self.upsert_cell(utterance, tier=tier, touch=True, flush=False)
-        token_cells = [self.upsert_cell(c, tier=tier, touch=True, flush=False) for c in self.make_token_cells(text=text, parent_id=str(utterance.get('id','')), role=role, tier=tier)]
-        pattern_cells = [self.upsert_cell(c, tier=tier, touch=True, flush=False) for c in self.make_pattern_cells(text=text, parent_id=str(utterance.get('id','')), token_cells=token_cells, role=role, tier=tier)]
+        parent_id = str(utterance.get('id', ''))
+
+        token_cells = [
+            self.upsert_cell(c, tier=tier, touch=True, flush=False)
+            for c in self.make_token_cells(text=text, parent_id=parent_id, role=role, tier=tier)
+        ]
+        pattern_cells = [
+            self.upsert_cell(c, tier=tier, touch=True, flush=False)
+            for c in self.make_pattern_cells(text=text, parent_id=parent_id, token_cells=token_cells, role=role, tier=tier)
+        ]
+        word_role_cells = [
+            self.upsert_cell(c, tier=tier, touch=True, flush=False)
+            for c in self.make_word_role_cells(text=text, parent_id=parent_id, token_cells=token_cells, role=role, tier=tier)
+        ]
+        thought_template_cells = [
+            self.upsert_cell(c, tier=tier, touch=True, flush=False)
+            for c in self.make_thought_template_cells(
+                text=text,
+                parent_id=parent_id,
+                token_cells=token_cells,
+                word_role_cells=word_role_cells,
+                role=role,
+                tier=tier,
+            )
+        ]
         general_pattern_cells = [
             self.upsert_cell(c, tier=tier, touch=True, flush=False)
             for c in self.make_general_pattern_cells(
                 text=text,
-                parent_id=str(utterance.get('id','')),
+                parent_id=parent_id,
                 token_cells=token_cells,
                 pattern_cells=pattern_cells,
                 role=role,
                 tier=tier,
             )
         ]
+        linker_source_cells = general_pattern_cells + thought_template_cells
         linker_cells = [
             self.upsert_cell(c, tier=tier, touch=True, flush=False)
             for c in self.make_linker_cells(
-                parent_id=str(utterance.get('id','')),
-                general_pattern_cells=general_pattern_cells,
+                parent_id=parent_id,
+                general_pattern_cells=linker_source_cells,
                 token_cells=token_cells,
                 role=role,
                 tier=tier,
             )
         ]
-        # back-link strongest immediate pieces into utterance
-        if token_cells or pattern_cells or general_pattern_cells or linker_cells:
+        # back-link strongest immediate pieces into utterance. Raw tokens remain
+        # evidence; word roles and thought templates are the reusable scaffold.
+        if token_cells or pattern_cells or word_role_cells or thought_template_cells or general_pattern_cells or linker_cells:
             utterance['links_explicit'] = self._merge_unique_list(
                 list(utterance.get('links_explicit', []) or []),
                 [
                     c.get('id')
                     for c in (
-                        token_cells[:4]
-                        + pattern_cells[:4]
+                        token_cells[:3]
+                        + pattern_cells[:3]
+                        + word_role_cells[:4]
+                        + thought_template_cells[:4]
                         + general_pattern_cells[:4]
                         + linker_cells[:4]
                     )
                     if c.get('id')
                 ],
-                limit=16,
+                limit=20,
             )
             utterance = self.upsert_cell(utterance, tier=tier, touch=False, flush=False)
         self.flush_tier(tier)
@@ -891,6 +1554,8 @@ class MemCellStore:
             'utterance': utterance,
             'tokens': token_cells,
             'patterns': pattern_cells,
+            'word_roles': word_role_cells,
+            'thought_templates': thought_template_cells,
             'general_patterns': general_pattern_cells,
             'linkers': linker_cells,
         }
@@ -956,7 +1621,7 @@ class MemCellStore:
                 if not isinstance(row, dict):
                     continue
                 kind = str(row.get("kind", "") or "")
-                if kind not in {"token_anchor", "pattern_anchor", "pattern_role", "utterance_anchor"}:
+                if kind not in {"token_anchor", "pattern_anchor", "pattern_role", "word_role", "thought_template", "pattern_linker", "utterance_anchor"}:
                     continue
                 activation = self._clamp01(row.get("activation", 0.0))
                 if activation <= 0.04 or activation >= 0.72:

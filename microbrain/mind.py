@@ -7,6 +7,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 from microbrain.utils.memdir import resolve_memdir_cli, ensure_child_dirs
 
@@ -18,11 +19,16 @@ from microbrain.memory.memory_store import MemoryStore
 from microbrain.memory.mem_cell_store import MemCellStore
 from microbrain.hrm.core import HRMCore
 from microbrain.pdna.core import PDNAStore
+from microbrain.pdna.access import profile_sections_for_kv
+from microbrain.hormone import derive_ddna_modulators
 from microbrain.utils.logging_setup import configure_logging
 from microbrain.orchestrator.orchestrator import Orchestrator
 from microbrain.orchestrator.neuron_loader import auto_register_neurons
 from microbrain.orchestrator.debug_utils import set_debug_enabled
 from microbrain.ipc.token import ensure_token_file
+from microbrain.utils.instance_lock import acquire_instance_lock
+
+_INSTANCE_LOCK = None
 WhisperAudioListener = None
 WhisperAudioConfig = None
 from microbrain.utils.mic_probe_runtime import list_input_devices, probe_rms
@@ -206,6 +212,23 @@ def _resolve_model_path(arg_model: str | None) -> str:
         return explicit
     return _pick_model(None)
 
+
+def publish_pdna_runtime_profile(orch: Orchestrator, pdna_profile: Any) -> None:
+    """Publish active PDNA/DDNA profile sections into runtime KV.
+
+    The active profile lives under the memdir (usually Z:/Memory/pdna_profile.json).
+    This helper turns dormant genome sections into readable organs:
+    pdna:affect_model, pdna:reinforcement_model, pdna:ddna_mutators,
+    pdna:wans, and drive:ddna_modulators.
+    """
+    orch.kv_store["pdna:last"] = pdna_profile.to_dict() if hasattr(pdna_profile, "to_dict") else pdna_profile
+    profile_sections = profile_sections_for_kv(pdna_profile)
+    orch.kv_store["pdna:sections"] = profile_sections
+    for section_name, section_value in profile_sections.items():
+        orch.kv_store[f"pdna:{section_name}"] = section_value
+    orch.kv_store["drive:ddna_modulators"] = derive_ddna_modulators(pdna_profile)
+
+
 async def main_async(cfg: AppConfig):
     # Configure logging (configure_logging returns None; logger is module-level).
     ui_mode = getattr(cfg, 'ui', 'repl')
@@ -292,6 +315,14 @@ async def main_async(cfg: AppConfig):
     orch.kv_store.setdefault("power:act_speech_thought_cost", 0.02)
     orch.kv_store.setdefault("power:task_start_cost", 0.15)
     orch.kv_store.setdefault("power:act_motor_cost", 0.50)
+    # Power/need speech gate: body pressure updates status freely, but does not
+    # seize the mouth unless critical or explicitly enabled by the operator.
+    orch.kv_store.setdefault("drive:power:speech_gate_enabled", True)
+    orch.kv_store.setdefault("drive:power:allow_unsolicited_speech", False)
+    orch.kv_store.setdefault("drive:power:critical_speech_threshold", 0.90)
+    orch.kv_store.setdefault("drive:power:status_cooldown_s", 120.0)
+    orch.kv_store.setdefault("drive:power:last_status_ts", 0.0)
+    orch.kv_store.setdefault("drive:power:last_status", {})
     orch.kv_store.setdefault("probe:enabled", True)
     orch.kv_store.setdefault("probe:every_s", 300.0)
     orch.kv_store.setdefault("probe:maintenance_every_s", 1800.0)
@@ -327,6 +358,67 @@ async def main_async(cfg: AppConfig):
     orch.kv_store.setdefault("vision:workspace:ttl_s", 25.0)
     orch.kv_store.setdefault("vision:workspace:min_repeat", 3)
     orch.kv_store.setdefault("vision:workspace:commit_stability", 0.58)
+
+    # Vision object-delta memory gate. Raw image/frame perception is parser input;
+    # durable visual memory should normally be compact object/spatial deltas.
+    orch.kv_store.setdefault("vision:raw_hrm_enabled", False)
+    orch.kv_store.setdefault("vision:delta:enabled", True)
+    orch.kv_store.setdefault("vision:delta:lidar_ttl_s", 1.5)
+    orch.kv_store.setdefault("vision:delta:move_threshold_m", 0.15)
+    orch.kv_store.setdefault("vision:delta:confidence_floor", 0.35)
+    orch.kv_store.setdefault("vision:delta:base_required_voters", 2)
+    orch.kv_store.setdefault("vision:delta:safe_space_required_voters", 3)
+    orch.kv_store.setdefault("vision:delta:safe_places", ["home", "workshop", "base", "lab"])
+
+    # Thought turn arbitration / drawer defaults. Thoughts are need expressions
+    # bound to a scene. If their required components are available, they become
+    # action candidates; if not, they wait in a demand-decaying drawer.
+    orch.kv_store.setdefault("thought:turn:enabled", True)
+    orch.kv_store.setdefault("thought:turn:base_recheck_s", 30.0)
+    orch.kv_store.setdefault("thought:turn:user_recent_s", 90.0)
+    orch.kv_store.setdefault("thought:turn:learning_rate", 0.05)
+    orch.kv_store.setdefault(
+        "thought:priority:base",
+        {
+            "power": 1.00,
+            "safety": 0.96,
+            "maintenance": 0.90,
+            "human_uplift": 0.74,
+            "task": 0.68,
+            "self_need": 0.60,
+            "social": 0.56,
+            "novelty": 0.44,
+            "expression": 0.34,
+            "idle_thought": 0.18,
+        },
+    )
+    orch.kv_store.setdefault("thought:priority:learned_modifiers", {})
+    orch.kv_store.setdefault(
+        "thought:turn:ttl_s",
+        {
+            "power": 900.0,
+            "safety": 600.0,
+            "maintenance": 1200.0,
+            "human_uplift": 900.0,
+            "task": 900.0,
+            "self_need": 600.0,
+            "social": 420.0,
+            "novelty": 240.0,
+            "expression": 180.0,
+            "idle_thought": 120.0,
+        },
+    )
+
+    # Capability circulation / metabolic glue defaults. This is a passive
+    # lymph-like readiness layer: it reports possible routes, missing parts,
+    # and redundant fallbacks, but it does not command action or speech.
+    orch.kv_store.setdefault("capability:circulation:enabled", True)
+    orch.kv_store.setdefault("capability:low_power_threshold_pct", 15.0)
+    orch.kv_store.setdefault("capability:components", {})
+    orch.kv_store.setdefault("capability:available_components", {})
+    orch.kv_store.setdefault("capability:alias_available", {})
+    orch.kv_store.setdefault("capability:state", {})
+    orch.kv_store.setdefault("capability:fallbacks", {})
 
     # Evidence recorder / hazard gating (split raw streams; OFF unless armed).
     orch.kv_store.setdefault("er:enabled", True)
@@ -367,6 +459,7 @@ async def main_async(cfg: AppConfig):
     pdna_store = PDNAStore(memdir=mem_root, profile_name="microbrain_default")
     orch.kv_store["pdna:store"] = pdna_store
     orch.kv_store["pdna:profile"] = pdna_store.profile
+    publish_pdna_runtime_profile(orch, pdna_store.profile)
 
     # Auto-load all neuron modules under microbrain.neurons.*
     # --- LLM enable flag (opt-in) ---
@@ -572,6 +665,41 @@ async def main_async(cfg: AppConfig):
     await orch.start()
 
     # ------------------------------------------------------------------
+    # Sidecars: background organs that must be explicitly started.
+    # ------------------------------------------------------------------
+    # Memory composer owns canonical mem-cell shard writes.  Other organs stage
+    # pending rows, then this desk-goblin drains and composes them into memory.
+    memory_composer_sidecar = None
+    try:
+        from microbrain.sidecars.memory_composer_sidecar import MemoryComposerSidecar
+
+        memory_composer_sidecar = MemoryComposerSidecar(orch, memdir=cfg.memdir)
+        await memory_composer_sidecar.start()
+        orch.kv_store["mem_cell:composer:started"] = True
+        logger.info("Memory composer sidecar started.")
+    except Exception as exc:
+        orch.kv_store["mem_cell:composer:started"] = False
+        orch.kv_store["mem_cell:composer:error"] = repr(exc)
+        logger.exception("Failed to start memory composer sidecar")
+
+    # /read and /slearn are handled by the read sidecar so document chewing and
+    # structured curriculum ingestion do not block the interaction/UI layer.
+    read_sidecar = None
+    try:
+        from microbrain.sidecars.read_sidecar import ReadSidecar
+
+        read_sidecar = ReadSidecar(orch, memdir=cfg.memdir)
+        await read_sidecar.start()
+        orch.kv_store["read:sidecar_started"] = True
+        orch.kv_store["slearn:sidecar_started"] = True
+        logger.info("Read/slearn sidecar started.")
+    except Exception as exc:
+        orch.kv_store["read:sidecar_started"] = False
+        orch.kv_store["slearn:sidecar_started"] = False
+        orch.kv_store["slearn:sidecar_error"] = repr(exc)
+        logger.exception("Failed to start read/slearn sidecar")
+
+    # ------------------------------------------------------------------
     # Heartbeat: drive "time passing" so neurons can act without external input
     # ------------------------------------------------------------------
     async def _clock_tick_loop():
@@ -625,6 +753,15 @@ def main():
 
     # Resolve memdir once so logging/memory/debug-tail all agree.
     args.memdir = _resolve_memdir(getattr(args, "memdir", None))
+
+    # Hard guard: only one full MB body may own a memdir at a time.
+    # Sidecars and organs share the current body; a second `python -m microbrain.mind`
+    # against the same Z:\memory can corrupt/lock canonical memory shards.
+    global _INSTANCE_LOCK
+    try:
+        _INSTANCE_LOCK = acquire_instance_lock(args.memdir)
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
     if getattr(args, "debug_tail", False):
         if not getattr(args, "debug", False):
             raise SystemExit("--debug-tail requires --debug")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import time
 from pathlib import Path
@@ -13,7 +14,7 @@ from microbrain.utils.memdir import resolve_memdir_ctx
 
 NEURON_NAME = Path(__file__).stem
 
-CONTROL_WORDS = {"IF", "USER", "THEN", "ELSE", "CLASSIFY", "REPLY", "NOT", "AND"}
+CONTROL_WORDS = {"IF", "USER", "THEN", "ELSE", "CLASSIFY", "REPLY", "NOT", "AND", "SUPPRESS"}
 DDNA_TARGETS = {
     "warmth",
     "friendly",
@@ -25,7 +26,15 @@ DDNA_TARGETS = {
     "terse",
 }
 
-IF_USER_SAYS_RE = re.compile(r"^IF\s+USER\s+says\s+(.+?)\s+THEN\s+(.+)$")
+IF_RULE_RE = re.compile(r"^IF\s+(.+?)\s+THEN\s+(.+)$")
+IF_USER_SAYS_CONDITION_RE = re.compile(r"^USER\s+says\s+(.+)$")
+CONDITION_OPERATOR_RE = re.compile(
+    r"^(.+?)\s+"
+    r"(differs\s+from|plus\s+time|is|exists|detected|changes|restored|resolved|unresolved|"
+    r"persists|increases|decreases|occurs|begins|completes|fails|succeeds|helps|harms)"
+    r"(?:\s+(.+))?$",
+    re.IGNORECASE,
+)
 AND_SPLIT_RE = re.compile(r"\s+AND\s+")
 ELSE_SPLIT_RE = re.compile(r"\s+ELSE\s+")
 TOKEN_RE = re.compile(r"[a-z0-9_']+")
@@ -110,9 +119,11 @@ class SyntaxLearningNeuron(BaseNeuron):
         try:
             saved = self._store_rule(store, parsed)
             await ctx.set_kv("syntax:last_rule", parsed)
+            if parsed.get("source_mode") == "slearn":
+                await self._record_slearn_apply(ctx, parsed, saved)
             return [
                 self._status(
-                    f"Learned rule: IF USER says {parsed['condition_text']} THEN "
+                    f"Learned {parsed.get('rule_kind', 'rule')}: IF {parsed.get('condition_raw', parsed['condition_text'])} THEN "
                     f"CLASSIFY {', '.join(parsed['classifiers']) or '(none)'}"
                     + (f" AND REPLY {parsed['reply_text']}" if parsed.get("reply_text") else "")
                     + (f" AND NOT REPLY {', '.join(parsed['avoid_replies'])}" if parsed.get("avoid_replies") else "")
@@ -123,6 +134,32 @@ class SyntaxLearningNeuron(BaseNeuron):
         except Exception as exc:
             await ctx.log_warn(f"[{self.name}] failed to store syntax rule", error=repr(exc))
             return [self._status(f"Teaching note parsed, but storing failed: {exc!r}", event)]
+
+    async def _record_slearn_apply(self, ctx, rule: Dict[str, Any], saved: int) -> None:
+        total = int(await ctx.get_kv("slearn:rules_applied_total", 0) or 0) + max(1, int(saved or 0))
+        await ctx.set_kv("slearn:rules_applied_total", total)
+        last = {
+            "ts": time.time(),
+            "saved": saved,
+            "rules_applied_total": total,
+            "rule_kind": str(rule.get("rule_kind", "") or ""),
+            "condition_text": str(rule.get("condition_text", "") or ""),
+            "source_name": str(rule.get("source_name", "") or ""),
+            "source_path": str(rule.get("source_path", "") or ""),
+            "source_line": rule.get("source_line"),
+        }
+        await ctx.set_kv("slearn:last_applied_rule", last)
+        try:
+            memdir = await resolve_memdir_ctx(ctx, fallback=r"Z:\memory")
+            path = Path(memdir) / "slearn" / "slearn_audit.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"event": "rule_applied", **last}, ensure_ascii=False, sort_keys=True) + "\n")
+            await ctx.set_kv("slearn:audit_path", str(path))
+        except Exception:
+            # Audit visibility is helpful, but learning should not fail if the
+            # audit file is locked or the memdir is temporarily unavailable.
+            pass
 
     async def _mem_cell_store(self, ctx) -> Optional[MemCellStore]:
         raw = await ctx.get_kv("memory:mem_cell_store", None)
@@ -143,18 +180,20 @@ class SyntaxLearningNeuron(BaseNeuron):
             if re.search(rf"\b{word.lower()}\b", note):
                 return {}
 
-        m = IF_USER_SAYS_RE.match(note.strip())
+        m = IF_RULE_RE.match(note.strip())
         if not m:
             return {}
 
-        condition_text = _strip_outer_quotes(m.group(1).strip())
+        condition_raw = m.group(1).strip()
         action_text = m.group(2).strip()
         then_text, *else_parts = ELSE_SPLIT_RE.split(action_text, maxsplit=1)
         else_text = else_parts[0].strip() if else_parts else ""
 
+        condition = self._parse_condition(condition_raw)
         classifiers: List[str] = []
         reply_text = ""
         avoid_replies: List[str] = []
+        suppress_targets: List[str] = []
 
         for action in AND_SPLIT_RE.split(then_text):
             action = action.strip()
@@ -168,24 +207,87 @@ class SyntaxLearningNeuron(BaseNeuron):
                     avoid_replies.append(avoid)
             elif action.startswith("REPLY "):
                 reply_text = _strip_outer_quotes(action[len("REPLY "):].strip())
+            elif action.startswith("SUPPRESS "):
+                suppress_targets.extend(_classifier_list(action[len("SUPPRESS "):]))
 
-        # de-dupe after multiple CLASSIFY clauses
+        # de-dupe after multiple CLASSIFY / SUPPRESS clauses
         classifiers = list(dict.fromkeys(classifiers))
+        suppress_targets = list(dict.fromkeys(suppress_targets))
         ddna_targets = [name for name in classifiers if name in DDNA_TARGETS]
         concept_classifiers = [name for name in classifiers if name not in DDNA_TARGETS]
+        rule_kind = self._rule_kind_for(condition)
 
         return {
-            "condition_actor": "USER",
-            "condition_operator": "says",
-            "condition_text": condition_text,
-            "condition_norm": _norm_text(condition_text),
+            **condition,
+            "rule_kind": rule_kind,
             "classifiers": classifiers,
             "concept_classifiers": concept_classifiers,
             "ddna_targets": ddna_targets,
             "reply_text": reply_text,
             "avoid_replies": avoid_replies,
+            "suppress_targets": suppress_targets,
             "else_text": else_text,
         }
+
+    def _parse_condition(self, condition_raw: str) -> Dict[str, Any]:
+        condition_raw = str(condition_raw or "").strip()
+
+        user_match = IF_USER_SAYS_CONDITION_RE.match(condition_raw)
+        if user_match:
+            condition_text = _strip_outer_quotes(user_match.group(1).strip())
+            return {
+                "condition_actor": "USER",
+                "condition_operator": "says",
+                "condition_domain": "user_speech",
+                "condition_text": condition_text,
+                "condition_norm": _norm_text(condition_text),
+                "condition_raw": condition_raw,
+            }
+
+        op_match = CONDITION_OPERATOR_RE.match(condition_raw)
+        if op_match:
+            subject = _strip_outer_quotes(op_match.group(1).strip())
+            operator = _norm_text(op_match.group(2).strip()).replace(" ", "_")
+            obj = _strip_outer_quotes((op_match.group(3) or "").strip())
+            condition_text = " ".join(part for part in (subject, operator.replace("_", " "), obj) if part).strip()
+            subject_norm = _norm_text(subject).replace(" ", "_")
+            return {
+                "condition_actor": subject_norm.upper() if subject_norm else "SYSTEM",
+                "condition_operator": operator,
+                "condition_domain": subject_norm or "system",
+                "condition_subject": subject,
+                "condition_object": obj,
+                "condition_text": condition_text,
+                "condition_norm": _norm_text(condition_text),
+                "condition_raw": condition_raw,
+            }
+
+        # Generic CAPS curriculum condition. This keeps the parser extensible for
+        # object/scene/reasoning sheets without pretending every domain already
+        # has a dedicated organ-level command.
+        domain = _norm_text(condition_raw).split(" ", 1)[0] if _norm_text(condition_raw) else "system"
+        return {
+            "condition_actor": domain.upper(),
+            "condition_operator": "state",
+            "condition_domain": domain,
+            "condition_subject": condition_raw,
+            "condition_object": "",
+            "condition_text": condition_raw,
+            "condition_norm": _norm_text(condition_raw),
+            "condition_raw": condition_raw,
+        }
+
+    def _rule_kind_for(self, condition: Dict[str, Any]) -> str:
+        if condition.get("condition_actor") == "USER" and condition.get("condition_operator") == "says":
+            return "syntax_rule"
+        domain = str(condition.get("condition_domain", "") or "").lower()
+        if domain in {"power", "maintenance", "boredom", "social", "safety", "curiosity", "need", "uplift", "rest"}:
+            return "drive_rule"
+        if domain in {"object", "entity", "state", "action", "relationship", "scene", "visual", "auditory", "touch", "feedback"}:
+            return "object_rule"
+        if domain in {"expectation", "supposition", "question", "gap", "memory", "thought", "reasoning", "abstraction"}:
+            return "reasoning_rule"
+        return "curriculum_rule"
 
     def _store_rule(self, store: MemCellStore, rule: Dict[str, Any]) -> int:
         condition = str(rule.get("condition_text", "") or "").strip()
@@ -229,6 +331,8 @@ class SyntaxLearningNeuron(BaseNeuron):
         now_ts = time.time()
         refs: List[Dict[str, Any]] = [
             {"kind": "condition", "value": condition},
+            {"kind": "condition_domain", "value": str(rule.get("condition_domain", "") or "")},
+            {"kind": "condition_operator", "value": str(rule.get("condition_operator", "") or "")},
         ]
         for c in list(rule.get("concept_classifiers", []) or []):
             refs.append({"kind": "classifier", "value": c, "target_type": "concept"})
@@ -238,30 +342,49 @@ class SyntaxLearningNeuron(BaseNeuron):
             refs.append({"kind": "reply", "value": reply_text})
         for avoid in list(rule.get("avoid_replies", []) or []):
             refs.append({"kind": "avoid_reply", "value": avoid})
+        for target in list(rule.get("suppress_targets", []) or []):
+            refs.append({"kind": "suppress", "value": target})
+
+        source_mode = str(rule.get("source_mode", "reinforcement") or "reinforcement")
+        rule_kind = str(rule.get("rule_kind", "syntax_rule") or "syntax_rule")
+        trust = 0.94 if weight >= 0 else 0.80
+        if source_mode == "slearn":
+            # Preseeded curriculum should start useful, but yield to lived
+            # experience over time. Reinforcement can still promote it later.
+            trust = 0.86 if weight >= 0 else 0.72
 
         cell = {
             "id": f"sr{digest}",
-            "kind": "syntax_rule",
+            "kind": rule_kind,
             "tier": "learned",
-            "anchor": {"kind": "syntax/condition", "ref": condition[:200], "norm": _norm_text(condition)[:200]},
+            "anchor": {"kind": f"slearn/{rule_kind}", "ref": condition[:200], "norm": _norm_text(condition)[:200]},
             "refs": refs,
             "modalities": ["text", "teaching"],
             "links_explicit": [],
             "activation": 1.0,
             "promotion": 0.52,
             "decay": 1.0,
-            "trust": 0.94 if weight >= 0 else 0.80,
+            "trust": trust,
             "meta": {
                 "role": "system",
-                "kind": "syntax_rule",
+                "kind": rule_kind,
                 "condition_text": condition,
+                "condition_raw": str(rule.get("condition_raw", "") or ""),
+                "condition_actor": str(rule.get("condition_actor", "") or ""),
+                "condition_operator": str(rule.get("condition_operator", "") or ""),
+                "condition_domain": str(rule.get("condition_domain", "") or ""),
+                "condition_subject": str(rule.get("condition_subject", "") or ""),
+                "condition_object": str(rule.get("condition_object", "") or ""),
                 "condition_norm": _norm_text(condition),
                 "syntax_classifiers": list(rule.get("classifiers", []) or []),
                 "concept_classifiers": list(rule.get("concept_classifiers", []) or []),
                 "ddna_targets": ddna_map,
                 "reply_text": reply_text,
                 "avoid_replies": list(rule.get("avoid_replies", []) or []),
+                "suppress_targets": list(rule.get("suppress_targets", []) or []),
                 "reinforce_weight": weight,
+                "source_decay_bias": 0.85 if source_mode == "slearn" else 1.0,
+                "lived_experience_can_override": True,
                 "target_text": str(rule.get("target_text", "") or ""),
                 "source_mode": str(rule.get("source_mode", "reinforcement") or "reinforcement"),
                 "source_name": str(rule.get("source_name", "") or ""),

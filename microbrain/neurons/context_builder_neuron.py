@@ -85,6 +85,8 @@ class ContextBuilderNeuron(BaseNeuron):
         scene_expectation_delta = await ctx.get_kv("scene:expectation:last_delta", {})
         scene_expectation = await ctx.get_kv("scene:expectation:last_exp", {})
         unresolved_questions = await ctx.get_kv("question:unresolved:recent", [])
+        conversation_scene = await ctx.get_kv("conversation:scene", {})
+        conversation_summary = await ctx.get_kv("conversation:summary", {})
         affect = await ctx.get_kv("affect:last", {})
         relation = await ctx.get_kv("relation:last", {})
         goals_crisis = bool(await ctx.get_kv("goals:crisis_mode", False))
@@ -136,6 +138,8 @@ class ContextBuilderNeuron(BaseNeuron):
                 "last_delta": scene_expectation_delta if isinstance(scene_expectation_delta, dict) else {},
                 "unresolved_questions": unresolved_questions[-8:] if isinstance(unresolved_questions, list) else [],
             },
+            "conversation_scene": conversation_scene if isinstance(conversation_scene, dict) else {},
+            "conversation_summary": conversation_summary if isinstance(conversation_summary, dict) else {},
             "affect": affect if isinstance(affect, dict) else {},
             "relation": relation if isinstance(relation, dict) else {},
             "constraints": {
@@ -163,6 +167,8 @@ class ContextBuilderNeuron(BaseNeuron):
             momentum_intent=(thought_momentum or {}).get("dominant_intent", "") if isinstance(thought_momentum, dict) else "",
             scene_delta=(scene_expectation_delta or {}).get("magnitude", 0.0) if isinstance(scene_expectation_delta, dict) else 0.0,
             unresolved_q=len(unresolved_questions) if isinstance(unresolved_questions, list) else 0,
+            conversation_topic=(conversation_summary or {}).get("topic", "") if isinstance(conversation_summary, dict) else "",
+            conversation_turns=((conversation_scene or {}).get("state", {}) or {}).get("turn_count", 0) if isinstance(conversation_scene, dict) else 0,
             crisis_mode=goals_crisis,
             cues=cues,
         )

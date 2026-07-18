@@ -5,6 +5,8 @@ from typing import Iterable
 
 from microbrain.orchestrator.neuron_base import BaseNeuron, NeuronConfig, Event
 from microbrain.orchestrator.orchestrator import Orchestrator
+from microbrain.hormone import derive_ddna_modulators
+from microbrain.pdna.access import publish_profile_sections
 
 NEURON_NAME = Path(__file__).stem
 
@@ -74,8 +76,10 @@ class PDNAStateNeuron(BaseNeuron):
         # Persist PDNA to disk (v1: simple, every interaction)
         pdna_store.save()
 
-        # Expose a snapshot for other neurons (e.g. reasoner_llm)
+        # Expose a snapshot and v2 profile organs for other neurons.
         await ctx.set_kv("pdna:last", pdna_profile.to_dict())
+        await publish_profile_sections(ctx, pdna_profile)
+        await ctx.set_kv("drive:ddna_modulators", derive_ddna_modulators(pdna_profile))
 
         self.debug(
             "pdna_updated",

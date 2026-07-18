@@ -53,6 +53,12 @@ class SensorySpineNeuron(BaseNeuron):
 
         await ctx.set_kv(f"spine:last:{modality}", entry)
         await ctx.set_kv("spine:last_percept", entry)
+
+        # Active-sense latch for curiosity/clarification gating.
+        # This lets curiosity ask about the sense that is actually live now
+        # instead of interrupting text with stale vision/audio gaps.
+        await ctx.set_kv("spine:active_sense", modality)
+        await ctx.set_kv("spine:active_sense:last", entry)
         return []
 
     def _summarize(self, topic: str, payload: Dict[str, Any]) -> str:

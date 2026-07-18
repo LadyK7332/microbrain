@@ -34,8 +34,59 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 
 
 def _looks_stock_reply(text: str) -> bool:
+    """Return True for low-value canned replies that should not be reused as memory."""
     norm = _norm(text)
-    return norm.startswith("i heard your question") or norm.startswith("i heard you")
+    if not norm:
+        return False
+    stock_exact = {
+        "hey there whats up",
+        "hey whats up",
+        "whats up",
+        "hello im here and listening",
+        "hello im here",
+        "im here and listening",
+        "need one variable",
+        "need a target",
+        "need one target",
+        "give me a concrete goal question or choice and ill respond directly",
+        "give me the concrete target or missing variable and ill answer directly",
+    }
+    return (
+        norm in stock_exact
+        or norm.startswith("hey there whats up")
+        or norm.startswith("i heard your question")
+        or norm.startswith("i heard you")
+        or norm.startswith("the question is about")
+        or norm.startswith("the open question is about")
+    )
+
+
+def _scene_turn_count(summary: Mapping[str, Any] | None) -> int:
+    if not isinstance(summary, Mapping):
+        return 0
+    try:
+        return int(summary.get("turn_count", 0) or 0)
+    except Exception:
+        return 0
+
+
+def _conversation_active(summary: Mapping[str, Any] | None) -> bool:
+    if not isinstance(summary, Mapping):
+        return False
+    return _scene_turn_count(summary) >= 2 or bool(summary.get("topic") or summary.get("active_threads"))
+
+
+def _sentence_list(value: Any, limit: int = 6) -> List[str]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    out: List[str] = []
+    for item in value:
+        text = str(item or "").strip()
+        if text:
+            out.append(text)
+        if len(out) >= limit:
+            break
+    return out
 
 
 def _accent_from_meta(raw_meta: Mapping[str, Any]) -> tuple[float, float, float, float, str]:
@@ -172,6 +223,201 @@ class NativeResponderNeuron(BaseNeuron):
                 best_text = text
                 best_score = score
         return best_text if best_score >= 0.35 else ""
+
+    def _context_breaks_scene(self, candidate: str, input_norm: str, conversation_summary: Mapping[str, Any]) -> bool:
+        """Block generic memory/fallback phrases once a verbal scene is active."""
+        if not _conversation_active(conversation_summary):
+            return False
+        cand_norm = _norm(candidate)
+        if not cand_norm:
+            return False
+        current_is_greeting = input_norm in {"hi", "hello", "hey", "yo", "howdy"}
+        if _looks_stock_reply(candidate) and not current_is_greeting:
+            return True
+        if cand_norm.startswith(("hey there", "hey whats", "hello im here")) and not current_is_greeting:
+            return True
+        return False
+
+    def _latest_gap_question(self, gap: Mapping[str, Any], *, avoid_norm: str = "") -> str:
+        if not isinstance(gap, Mapping):
+            return ""
+        status = str(gap.get("status", "") or "")
+        if status in {"resolved", "closed", "answered"}:
+            return ""
+        anchor_norm = _norm(str(gap.get("anchor", "") or ""))
+        if avoid_norm and anchor_norm == avoid_norm:
+            return ""
+        question = str(gap.get("question", "") or "").strip()
+        return question if question and not _looks_stock_reply(question) else ""
+
+    def _scene_recent(self, summary: Mapping[str, Any], key: str, limit: int = 6) -> List[str]:
+        return _sentence_list(summary.get(key, []), limit=limit) if isinstance(summary, Mapping) else []
+
+    def _last_scene_text(self, summary: Mapping[str, Any], key: str) -> str:
+        value = summary.get(key, "") if isinstance(summary, Mapping) else ""
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, (list, tuple)) and value:
+            for item in reversed(value):
+                text = str(item or "").strip()
+                if text:
+                    return text
+        return ""
+
+    def _infer_recent_referent(self, summary: Mapping[str, Any], *, prefer_questions: bool = False) -> str:
+        if not isinstance(summary, Mapping):
+            return ""
+        texts: List[str] = []
+        texts.extend(self._scene_recent(summary, "recent_assistant_points", limit=4))
+        texts.extend(self._scene_recent(summary, "recent_user_points", limit=4))
+        texts.extend(self._scene_recent(summary, "recent_claims", limit=4))
+        blob = " ".join(texts).lower()
+        if prefer_questions and re.search(r"\b(question|questions|inquiry|inquiries)\b", blob):
+            return "questions"
+        for word in ("questions", "question", "inquiry", "gap", "relationship", "scene", "memory", "pressure", "curiosity"):
+            if re.search(rf"\b{re.escape(word)}\b", blob):
+                return "questions" if word in {"question", "questions", "inquiry"} else word
+        active_objects = _sentence_list(summary.get("active_objects", []), limit=8)
+        for obj in active_objects:
+            if obj not in {"like", "any", "what", "have", "question"}:
+                return obj
+        return ""
+
+    async def _conversation_pragmatic_reply(
+        self,
+        ctx,
+        *,
+        text: str,
+        norm: str,
+        conversation_summary: Mapping[str, Any],
+        conversation_scene: Mapping[str, Any],
+        terse: float,
+        warm: float,
+    ) -> str:
+        """Canned pragmatic replies were removed after line-live testing.
+
+        Short follow-ups now remain inside the thought/context pipeline unless
+        memory, learned syntax, or a reasoning backend builds a response.
+        """
+        return ""
+
+    def _asks_internal_status(self, text: str, norm: str) -> bool:
+        if not norm:
+            return False
+        exact = {
+            "status",
+            "how are you",
+            "how are you doing",
+            "how do you feel",
+            "how are things",
+            "are you okay",
+            "are you ok",
+            "what are your internal scores",
+            "internal scores",
+            "internal status",
+            "system status",
+        }
+        if norm in exact:
+            return True
+        is_question = str(text or "").strip().endswith("?")
+        strong_phrases = (
+            "your internal state",
+            "your internal status",
+            "your internal scores",
+            "your scores",
+            "your status",
+            "your state",
+            "your needs",
+            "your drives",
+            "your power",
+            "your battery",
+            "do you need to charge",
+            "battery level",
+            "power level",
+            "maintenance status",
+        )
+        if any(phrase in norm for phrase in strong_phrases):
+            return True
+        if is_question and "need to charge" in norm:
+            return True
+        if is_question and any(token in norm.split() for token in {"status", "state", "scores", "needs", "drives", "battery", "charging", "maintenance"}):
+            return True
+        return False
+
+    def _status_band(self, value: float, *, low: float = 0.33, high: float = 0.66) -> str:
+        if value >= high:
+            return "high"
+        if value >= low:
+            return "moderate"
+        return "low"
+
+    async def _internal_status_reply(self, ctx, *, text: str, norm: str, terse: float) -> str:
+        if not self._asks_internal_status(text, norm):
+            return ""
+
+        power_state = await ctx.get_kv("power:state", {}) or {}
+        if not isinstance(power_state, Mapping):
+            power_state = {}
+        power_vector = await ctx.get_kv("drive:power_vector", {}) or {}
+        if not isinstance(power_vector, Mapping):
+            power_vector = {}
+        pressure = power_vector.get("pressure", {}) if isinstance(power_vector.get("pressure", {}), Mapping) else {}
+        needs = await ctx.get_kv("drive:needs_stack", {}) or {}
+        hormones = await ctx.get_kv("drive:hormones", {}) or {}
+        boredom = await ctx.get_kv("drive:boredom", {}) or {}
+        stress = await ctx.get_kv("drive:stress", {}) or {}
+        maint = await ctx.get_kv("memory:last_sleep_maintenance", {}) or {}
+        want_vector = await ctx.get_kv("drive:want_vector", {}) or {}
+
+        pct = _safe_float(power_state.get("pct", await ctx.get_kv("power:battery_pct", 100.0)), 100.0)
+        urgency = _safe_float(pressure.get("urgency", 0.0), 0.0)
+        charging = bool(power_state.get("charging", await ctx.get_kv("power:charging", False)))
+        sleeping = bool(power_state.get("sleep", await ctx.get_kv("power:sleep", False)))
+        mode = str(power_state.get("mode", await ctx.get_kv("power:mode", "active")) or "active")
+        stress_level = _safe_float(stress.get("level", 0.0), 0.0) if isinstance(stress, Mapping) else 0.0
+        boredom_level = _safe_float(boredom.get("level", 0.0), 0.0) if isinstance(boredom, Mapping) else 0.0
+        curiosity_boost = _safe_float(await ctx.get_kv("curiosity:boost", 0.0), 0.0)
+        inquiry = _safe_float(hormones.get("inquiry", 0.0), 0.0) if isinstance(hormones, Mapping) else 0.0
+        externalize = _safe_float(want_vector.get("externalize", 0.0), 0.0) if isinstance(want_vector, Mapping) else 0.0
+        maint_state = "stable"
+        if isinstance(maint, Mapping) and maint:
+            skipped = int(_safe_float(maint.get("skipped", 0), 0))
+            promoted = int(_safe_float(maint.get("promoted", 0), 0))
+            written = int(_safe_float(maint.get("written", 0), 0))
+            maint_state = f"stable; last sleep pass promoted {promoted}, wrote {written}, skipped {skipped}"
+
+        if charging:
+            power_phrase = f"power is {pct:.0f}% and charging"
+        elif sleeping:
+            power_phrase = f"power is {pct:.0f}% and sleep mode is active"
+        elif urgency >= 0.85:
+            power_phrase = f"power is {pct:.0f}% with critical charge pressure"
+        elif urgency >= 0.55:
+            power_phrase = f"power is {pct:.0f}% with elevated charge pressure"
+        else:
+            power_phrase = f"power is {pct:.0f}% and stable"
+
+        return (
+            "Internal status: "
+            f"{power_phrase}; power urgency {urgency:.2f}; "
+            f"stress {stress_level:.2f}; boredom {boredom_level:.2f}; "
+            f"curiosity {max(curiosity_boost, inquiry):.2f}; externalize {externalize:.2f}; "
+            f"mode {mode}; maintenance {maint_state}."
+        )
+
+    def _is_low_value_answer(self, answer: str, *, query_text: str, conversation_summary: Mapping[str, Any]) -> bool:
+        norm_answer = _norm(answer)
+        if not norm_answer:
+            return True
+        if _looks_stock_reply(answer):
+            return True
+        if _conversation_active(conversation_summary) and norm_answer.startswith("the question is about"):
+            return True
+        # Avoid answering short follow-ups with a lexical reflection of the helper word.
+        norm_q = _norm(query_text)
+        if norm_q in {"like what", "any questions", "do you have any", "what about it", "what about that"}:
+            return True
+        return False
 
     async def process(self, event: Event, ctx) -> Iterable[Event]:
         self.debug(
@@ -446,10 +692,15 @@ class NativeResponderNeuron(BaseNeuron):
         }
 
     async def _build_response(self, ctx, *, text: str, shape: Dict[str, Any], payload: Dict[str, Any]) -> str:
+        """Build only from learned/internal sources; no canned speech fallbacks.
+
+        Prebuilt test-pulse lines proved the routes were live. This responder now
+        speaks only when a learned syntax rule, internal status read, memory
+        composer, recalled phrase, or explicit reasoning output can supply text.
+        If none exists, it stays silent so the thought path can keep working.
+        """
         norm = _norm(text)
         atomized = await ctx.get_kv("language:last_atomized", {}) or {}
-        noun_candidates = atomized.get("nouns", []) if isinstance(atomized, Mapping) else []
-        noun_chunks = atomized.get("noun_chunks", []) if isinstance(atomized, Mapping) else []
         relations = atomized.get("relations", []) if isinstance(atomized, Mapping) else []
         mem_store = await ctx.get_kv("memory:mem_cell_store", None)
         if mem_store is None:
@@ -460,41 +711,42 @@ class NativeResponderNeuron(BaseNeuron):
                     await ctx.set_kv("memory:mem_cell_store", mem_store)
                 except Exception:
                     mem_store = None
+
         thought_path_last = await ctx.get_kv("thought_path:last", {}) or {}
         power_state = await ctx.get_kv("power:state", {}) or {}
         needs = await ctx.get_kv("drive:needs_stack", {}) or {}
         context = payload.get("context", {}) if isinstance(payload.get("context", {}), Mapping) else {}
         associations = list(context.get("associations", []) or []) if isinstance(context, Mapping) else []
         association_meta = dict(context.get("association_meta", {}) or {}) if isinstance(context, Mapping) else {}
+        conversation_summary = dict(context.get("conversation_summary", {}) or {}) if isinstance(context, Mapping) and isinstance(context.get("conversation_summary", {}), Mapping) else {}
 
-        terse = _safe_float(shape.get("terse", 0.0))
         warm = _safe_float(shape.get("warm", 0.0))
         mode = str(shape.get("mode", "direct") or "direct")
         syntax_guidance = self._syntax_guidance(mem_store, text)
         syntax_reply = self._preferred_rule_reply(syntax_guidance, warm=warm)
         avoid_norms = {_norm(t) for t in list(syntax_guidance.get("avoid_replies", []) or []) if _norm(str(t or ""))}
 
-        def choose(short: str, medium: str, warmish: str | None = None) -> str:
-            if warm >= 0.55 and warmish:
-                return warmish
-            if terse >= 0.56:
-                return short
-            return medium
+        internal_status_reply = await self._internal_status_reply(ctx, text=text, norm=norm, terse=_safe_float(shape.get("terse", 0.0)))
+        if internal_status_reply:
+            return internal_status_reply
 
         def best_recalled_phrase() -> str:
             best_text = ""
             best_score = 0.0
-
             top_assoc_score = _safe_float(association_meta.get("top_score", 0.0), 0.0)
             if top_assoc_score >= 0.42:
                 for assoc in associations[:4]:
                     if not isinstance(assoc, Mapping):
                         continue
                     candidate = str(assoc.get("text", "") or "").strip()
-                    if not candidate:
-                        continue
                     candidate_norm = _norm(candidate)
-                    if not candidate_norm or candidate_norm == norm or candidate_norm in avoid_norms or _looks_stock_reply(candidate):
+                    if (
+                        not candidate_norm
+                        or candidate_norm == norm
+                        or candidate_norm in avoid_norms
+                        or _looks_stock_reply(candidate)
+                        or self._context_breaks_scene(candidate, norm, conversation_summary)
+                    ):
                         continue
                     if candidate.startswith("/") or len(candidate.split()) > 18:
                         continue
@@ -515,19 +767,19 @@ class NativeResponderNeuron(BaseNeuron):
                     role = str(meta.get("role", "") or "")
                     if role and role not in ("assistant", "system"):
                         continue
-                    candidate = ""
                     refs = hit.get("refs", []) if isinstance(hit.get("refs", []), list) else []
-                    if refs:
-                        candidate = str(refs[0] or "").strip()
-                    if not candidate:
-                        candidate = str(hit.get("anchor_text", "") or "").strip()
+                    candidate = str(refs[0] if refs else hit.get("anchor_text", "") or "").strip()
                     candidate_norm = _norm(candidate)
-                    if not candidate_norm or candidate_norm == norm or candidate_norm in avoid_norms or _looks_stock_reply(candidate):
+                    if (
+                        not candidate_norm
+                        or candidate_norm == norm
+                        or candidate_norm in avoid_norms
+                        or _looks_stock_reply(candidate)
+                        or self._context_breaks_scene(candidate, norm, conversation_summary)
+                    ):
                         continue
                     if candidate.startswith("/") or len(candidate.split()) > 18:
                         continue
-                    if text.strip().endswith("?") and not candidate.strip().endswith(("?", ".")):
-                        candidate = candidate.rstrip() + "."
                     score = (
                         _safe_float(hit.get("score", 0.0), 0.0)
                         + (0.06 if role in ("assistant", "system") else 0.0)
@@ -536,90 +788,19 @@ class NativeResponderNeuron(BaseNeuron):
                     if score > best_score:
                         best_text = candidate
                         best_score = score
-
             return best_text if best_score >= 0.48 else ""
-
-        recalled_phrase = best_recalled_phrase()
 
         if syntax_reply:
             return syntax_reply
 
-        if norm in ("hi", "hello", "hey", "yo", "howdy"):
-            return choose(
-                "Hello.",
-                "Hello. I'm here and listening.",
-                "Hello. I'm here and listening.",
-            )
-
-        if "can you hear me" in norm:
-            return choose(
-                "Yes.",
-                "Yes. I hear you.",
-                "Yes. I hear you.",
-            )
-
-        if "please respond" in norm or norm == "respond" or norm == "reply" or "speak up" in norm:
-            return choose(
-                "I'm here.",
-                "I hear you. Give me a direct question, goal, or choice and I'll answer plainly.",
-                "I hear you. Give me a direct question, goal, or choice and I'll answer plainly.",
-            )
-
-        if norm in ("thanks", "thank you"):
-            return choose("You're welcome.", "You're welcome.", "You're welcome.")
-
-        if norm in ("bye", "goodbye", "see you"):
-            return choose(
-                "Alright.",
-                "Alright. I'll be here when you get back.",
-                "Alright. I'll be here when you get back.",
-            )
-
-        if "what can you do" in norm:
-            return choose(
-                "Listen, track context, and reply.",
-                "I can listen, track context, connect memory, and respond directly. Give me a concrete target and I'll work from there.",
-                "I can listen, track context, connect memory, and respond directly. Give me a concrete target and I'll work from there.",
-            )
-
-        if norm.startswith("say "):
-            say_text = text[4:].strip()
-            if say_text:
-                return say_text
-
-        if mode == "parse_reflect":
-            if noun_chunks:
-                return choose(
-                    f"Noun chunks: {', '.join(noun_chunks[:2])}.",
-                    f"I parsed noun chunks as: {', '.join(noun_chunks[:4])}.",
-                    f"I parsed noun chunks as: {', '.join(noun_chunks[:4])}.",
-                )
-            if noun_candidates:
-                lemmas = [str(n.get("lemma", "")) for n in noun_candidates[:4] if str(n.get("lemma", ""))]
-                if lemmas:
-                    return choose(
-                        f"Nouns: {', '.join(lemmas[:2])}.",
-                        f"I extracted noun candidates: {', '.join(lemmas)}.",
-                        f"I extracted noun candidates: {', '.join(lemmas)}.",
-                    )
-
-        if mode == "parse_empty":
-            return choose(
-                "Not much yet.",
-                "I did not get strong noun chunks from that line.",
-                "I did not get strong noun chunks from that line.",
-            )
-
         if mode == "relation_reflect" and relations:
             rel = relations[0]
             subj = str(rel.get("subject", "") or "something")
-            relation = str(rel.get("relation", "") or "related to")
+            relation = str(rel.get("relation", "") or "related_to")
             obj = str(rel.get("object", "") or "")
-            relation_text = f"{subj} {relation} {obj}".strip() if obj else f"{subj} {relation}".strip()
             await ctx.emit(Event(
                 topic="thought/internal",
                 payload={
-                    "text": f"parsed relation: {relation_text}",
                     "kind": "relation_parse",
                     "subject": subj,
                     "relation": relation,
@@ -636,22 +817,6 @@ class NativeResponderNeuron(BaseNeuron):
                 },
             ))
             return ""
-
-        if mode == "noun_reflect" and noun_candidates:
-            lemmas = [str(n.get("lemma", "")) for n in noun_candidates[:3] if str(n.get("lemma", ""))]
-            if lemmas:
-                return choose(
-                    f"I heard: {', '.join(lemmas[:2])}.",
-                    f"I heard you. The strongest noun candidates are: {', '.join(lemmas)}.",
-                    f"I heard you. The strongest noun candidates are: {', '.join(lemmas)}.",
-                )
-
-        if mode == "clarify":
-            return choose(
-                "Need one variable.",
-                "I can answer, but I need one missing variable first. Do you want explanation, action, or analysis?",
-                "I can answer, but I need one missing variable first. Do you want explanation, action, or analysis?",
-            )
 
         if text.strip().endswith("?"):
             bundle = gather_support(
@@ -686,27 +851,15 @@ class NativeResponderNeuron(BaseNeuron):
                         "ts": time.time(),
                     },
                 )
-                return answer
-            if recalled_phrase:
-                return recalled_phrase
-            return choose(
-                "Need a target.",
-                "Give me the concrete target or missing variable and I'll answer directly.",
-                "Give me the concrete target or missing variable and I'll answer directly.",
-            )
+                if not self._is_low_value_answer(answer, query_text=text, conversation_summary=conversation_summary):
+                    return answer
+            return best_recalled_phrase()
 
-        if mode == "ack":
-            if recalled_phrase:
-                return recalled_phrase
-            return choose("Noted.", "I heard you.", "I heard you.")
+        return best_recalled_phrase()
 
-        if recalled_phrase:
-            return recalled_phrase
-        return choose(
-            "Need one target.",
-            "Give me a concrete goal, question, or choice and I'll respond directly.",
-            "Give me a concrete goal, question, or choice and I'll respond directly.",
-        )
+    def _conversation_continuity_reply(self, summary: Mapping[str, Any], *, text: str, terse: float = 0.0) -> str:
+        """Canned continuity speech removed; continuity stays as scene state."""
+        return ""
 
 
 def build_neurons(orchestrator: Orchestrator):

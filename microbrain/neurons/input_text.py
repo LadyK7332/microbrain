@@ -1391,7 +1391,27 @@ class TextInputNeuron(BaseNeuron):
             directory = str(await ctx.get_kv("slearn:dir", "") or "")
             weight = int(await ctx.get_kv("slearn:default_weight", 3) or 3)
             last = await ctx.get_kv("slearn:last_result", None)
-            msg = f"Structured learning: {'on' if enabled else 'off'} | weight=+{weight} | dir={directory or '(default Z:\\memory\\slearn_dir)'}"
+            sidecar_started = bool(await ctx.get_kv("slearn:sidecar_started", False))
+            sidecar_error = str(await ctx.get_kv("slearn:sidecar_error", "") or "")
+            active_file = str(await ctx.get_kv("slearn:active_file", "") or "")
+            chunk_index = int(await ctx.get_kv("slearn:chunk_index", 0) or 0)
+            emitted_total = int(await ctx.get_kv("slearn:rules_emitted_total", 0) or 0)
+            applied_total = int(await ctx.get_kv("slearn:rules_applied_total", 0) or 0)
+            done_count = int(await ctx.get_kv("slearn:files_completed_count", 0) or 0)
+            audit_path = str(await ctx.get_kv("slearn:audit_path", "") or "")
+
+            msg = (
+                f"Structured learning: {'on' if enabled else 'off'} | "
+                f"sidecar={'running' if sidecar_started else 'not started'} | "
+                f"weight=+{weight} | dir={directory or '(default Z:\\memory\\slearn_dir)'}"
+            )
+            if sidecar_error:
+                msg += f"\nSidecar error: {sidecar_error}"
+            if active_file:
+                msg += f"\nActive: {active_file} @ chunk {chunk_index}"
+            msg += f"\nProgress: files_done={done_count} emitted_total={emitted_total} applied_total={applied_total}"
+            if audit_path:
+                msg += f"\nAudit: {audit_path}"
             if isinstance(last, dict):
                 msg += f"\nLast: {last.get('summary', last)}"
             msg += "\nUsage: /slearn on|off|status|next|dir <path>|weight <1-5>|template"
@@ -1454,7 +1474,10 @@ class TextInputNeuron(BaseNeuron):
                 "Structured learning sheet format: one rule per line. Lines beginning with # are ignored.\n"
                 "IF USER says moin THEN CLASSIFY social_greeting, warmth, friendly AND REPLY good morning\n"
                 "IF USER says thanks THEN CLASSIFY gratitude, warmth, friendly AND REPLY you're welcome\n"
-                "IF USER says stop THEN CLASSIFY boundary, user_serious AND NOT REPLY playful"
+                "IF USER says stop THEN CLASSIFY boundary, user_serious AND NOT REPLY playful\n"
+                "IF POWER is low THEN CLASSIFY need_power, energy_deficit, homeostasis\n"
+                "IF OBJECT detected THEN CLASSIFY base_object, noticed_thing\n"
+                "IF scene_delta detected THEN CLASSIFY surprise, investigation_candidate"
             )
             return [self._speech_control(template, channel=channel, correlation_id=correlation_id)]
 
@@ -1519,8 +1542,7 @@ class TextInputNeuron(BaseNeuron):
                     n = 5
             n = max(1, min(20, n))
 
-            hrm = await ctx.get_kv("hrm:core", None)
-            items = self._hrm_recent_items(hrm=hrm, want_role=want_role, n=n) if hrm else []
+            items = await self._recent_reinforcement_items(ctx=ctx, want_role=want_role, n=n)
 
             snap = {
                 "nonce": uuid.uuid4().hex[:8],
@@ -1550,7 +1572,8 @@ class TextInputNeuron(BaseNeuron):
                 preview = (it.get('text', '') or '').replace('\n', ' ').strip()
                 if len(preview) > 90:
                     preview = preview[:90] + "…"
-                lines.append(f"{i}) hrm_idx={it.get('hrm_idx')}  {preview}")
+                label = self._reinforcement_item_label(it)
+                lines.append(f"{i}) {label}  {preview}" if label else f"{i}) {preview}")
             lines.append("")
             lines.append("Score one item:")
             lines.append("  /r +3 2   or   /r -2 4")
@@ -1662,6 +1685,68 @@ class TextInputNeuron(BaseNeuron):
             ),
         ]
 
+    async def _recent_reinforcement_items(self, ctx, want_role: str, n: int) -> List[Dict[str, Any]]:
+        """Return recent visible conversation turns for /r snapshots.
+
+        /r is an operator UI affordance: the menu should show what the user
+        actually saw in the conversation pane, not whatever survived HRM's
+        long-term-memory filters.  HRM may intentionally skip system-ish or
+        low-trust utterances, so using HRM as the primary source can make
+        /r a/u point at stale items.  Conversation scene is the better live
+        source; HRM remains a fallback for older sessions where the scene has
+        not been built yet.
+        """
+        n = max(1, min(20, int(n or 5)))
+        scene_items = self._conversation_scene_recent_items(
+            scene=await ctx.get_kv("conversation:scene", None),
+            want_role=want_role,
+            n=n,
+        )
+        if scene_items:
+            return scene_items
+
+        hrm = await ctx.get_kv("hrm:core", None)
+        return self._hrm_recent_items(hrm=hrm, want_role=want_role, n=n) if hrm else []
+
+    def _conversation_scene_recent_items(self, scene: Any, want_role: str, n: int) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        if not isinstance(scene, dict):
+            return out
+        turns = scene.get("turns", [])
+        if not isinstance(turns, list):
+            return out
+
+        for pos, turn in enumerate(reversed(turns)):
+            if not isinstance(turn, dict):
+                continue
+            role = str(turn.get("role", "") or "")
+            if role != want_role:
+                continue
+            text = str(turn.get("text", "") or "").strip()
+            if not text or text.lstrip().startswith("/"):
+                continue
+            out.append(
+                {
+                    "source": "conversation_scene",
+                    "turn_idx": len(turns) - 1 - pos,
+                    "ts": float(turn.get("ts", 0.0) or 0.0),
+                    "text": text,
+                    "correlation_id": str(turn.get("correlation_id", "") or ""),
+                }
+            )
+            if len(out) >= n:
+                break
+        return out
+
+    def _reinforcement_item_label(self, item: Dict[str, Any]) -> str:
+        if not isinstance(item, dict):
+            return ""
+        if item.get("hrm_idx") is not None:
+            return f"hrm_idx={item.get('hrm_idx')}"
+        if item.get("turn_idx") is not None:
+            return f"turn_idx={item.get('turn_idx')}"
+        return str(item.get("source", "") or "").strip()
+
     def _hrm_recent_items(self, hrm, want_role: str, n: int) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         if hrm is None:
@@ -1679,6 +1764,7 @@ class TextInputNeuron(BaseNeuron):
                 continue
             out.append(
                 {
+                    "source": "hrm",
                     "hrm_idx": int(getattr(node, "idx", idx)),
                     "ts": float(getattr(node, "ts", 0.0)),
                     "text": text,

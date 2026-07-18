@@ -50,15 +50,43 @@ class PDNAProfile:
     # Optional endocrine / modulation overrides for math-based behavior tuning.
     hormone_overrides: Dict[str, float] = field(default_factory=dict)
 
+    # Forward-compatible profile organs. v2+ profiles may include DDNA,
+    # affect_model, reinforcement_model, drive_thresholds, WANS, etc. Older
+    # code can ignore these; newer organs can read them through pdna.access.
+    extra: Dict[str, Any] = field(default_factory=dict, repr=False)
+
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        data = asdict(self)
+        extra = data.pop("extra", {}) or {}
+        if isinstance(extra, dict):
+            # Known dataclass fields win if a future profile accidentally
+            # repeats them in extra. Unknown sections survive save cycles.
+            merged = dict(extra)
+            merged.update(data)
+            return merged
+        return data
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "PDNAProfile":
-        # Fill only known fields; ignore extras for forwards-compat
+        # Fill known fields and keep unknown sections for forwards-compat.
         known = {f.name for f in cls.__dataclass_fields__.values()}  # type: ignore[attr-defined]
-        filtered = {k: v for k, v in data.items() if k in known}
-        return cls(**filtered)
+        filtered = {k: v for k, v in data.items() if k in known and k != "extra"}
+        extra = {k: v for k, v in data.items() if k not in known}
+        profile = cls(**filtered)
+        profile.extra = extra
+        return profile
+
+    def get_section(self, name: str, default: Any | None = None) -> Any:
+        return self.extra.get(name, default) if isinstance(self.extra, dict) else default
+
+    @property
+    def extra_sections(self) -> Dict[str, Any]:
+        """Alias for v2 profile organs such as ddna_mutators and reinforcement_model.
+
+        Older code can continue using ``extra``; diagnostics and runtime organs
+        can call this clearer name when treating profile add-ons as sections.
+        """
+        return self.extra if isinstance(self.extra, dict) else {}
 
     def register_interaction(self, *, crisis: bool = False, affectionate: bool = False,
                              technical: bool = False) -> None:

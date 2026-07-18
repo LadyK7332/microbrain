@@ -91,7 +91,7 @@ class InitiativeThresholdNeuron(BaseNeuron):
           tier 0: stay quiet
           tier 1: mark an internal unresolved state
           tier 2: think internally
-          tier 3: ask one concise clarification outwardly
+          tier 3: create a clarification thought object
 
     This intentionally prefers constrained, objective behavior.
     It does NOT try to babble or generate open-ended chatter.
@@ -493,15 +493,18 @@ class InitiativeThresholdNeuron(BaseNeuron):
                 meta_kind = "initiative_probe" if question.strip() == "?" else "initiative_clarify"
                 out.append(
                     Event(
-                        topic="act/speech",
+                        topic="thought/object",
                         payload={
-                            "text": question,
-                            "channel": str(state.get("last_user_channel", "repl") or "repl"),
-                            "style": "assistant",
+                            "kind": meta_kind,
+                            "content": question,
+                            "scene_ref": "conversation",
+                            "need_ref": "clarify",
+                            "status": "drawer_waiting",
+                            "source_text": pending_text,
                         },
                         source=self.name,
                         correlation_id=event.correlation_id,
-                        meta={"kind": meta_kind, "tier": new_tier},
+                        meta={"channel": "thought", "kind": meta_kind, "tier": new_tier},
                     )
                 )
                 state["clarify_said"] = True
@@ -703,14 +706,14 @@ class InitiativeThresholdNeuron(BaseNeuron):
         if self._is_probe_fragment(compact, flags):
             return "?"
         if bool(flags.get("has_options", False)):
-            return "I can take either path here. Which option should I optimize for?"
+            return "clarify:choose_path"
         if bool(flags.get("has_error_language", False)):
-            return "I can dig in, but I need the target outcome first. What should success look like?"
+            return "clarify:target_outcome_needed"
         if bool(flags.get("has_response_request", False)):
-            return "I hear you. What do you want me to respond with: a quick acknowledgement, an explanation, or a concrete action?"
+            return "clarify:response_mode_needed"
         if bool(flags.get("has_question", False)):
-            return "I have one missing variable. Do you want an explanation, a plan, or a concrete patch?"
-        return f"I think the missing variable is the target outcome for: {compact} What should I optimize for?"
+            return "clarify:missing_variable"
+        return f"clarify:target_outcome:{compact}"
 
 
     def _is_probe_fragment(self, text: str, flags: Dict[str, Any]) -> bool:
@@ -772,7 +775,7 @@ def build_neurons(orchestrator: Orchestrator):
             "affect/state",
             "affect/salience",
         ],
-        output_topics=["reason/output", "act/speech"],
+        output_topics=["reason/output", "thought/object"],
         priority=-8,
     )
     yield InitiativeThresholdNeuron(cfg)

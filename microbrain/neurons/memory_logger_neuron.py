@@ -216,6 +216,8 @@ class MemoryLoggerNeuron(BaseNeuron):
                     "utterance_id": str((ingest_result.get("utterance", {}) or {}).get("id", "") or ""),
                     "token_ids": [str((c or {}).get("id", "") or "") for c in ingest_result.get("tokens", [])],
                     "pattern_ids": [str((c or {}).get("id", "") or "") for c in ingest_result.get("patterns", [])],
+                    "word_role_ids": [str((c or {}).get("id", "") or "") for c in ingest_result.get("word_roles", [])],
+                    "thought_template_ids": [str((c or {}).get("id", "") or "") for c in ingest_result.get("thought_templates", [])],
                     "general_patterns": [str((c or {}).get("id", "") or "") for c in ingest_result.get("general_patterns", [])],
                     "linker_ids": [str((c or {}).get("id", "") or "") for c in ingest_result.get("linkers", [])],
                 })

@@ -25,22 +25,15 @@ class TextRouterNeuron(BaseNeuron):
         - "percept/text"   (normalized text input)
 
     Emits:
-        - "act/speech"     for fast, low-latency responses
-        - "reason/request" for heavier LLM reasoning
+        - "context/request" for the contextual/thought pipeline
+        - "ui/status" / "ui/error" for command-plane diagnostics
 
-    Routing rules (v1, simple):
+    Routing rules:
 
-    1) Slash commands (text starting with "/"):
-       - /echo <msg>     → act/speech with <msg>
-       - /help           → ui/status with a help blurb
-       - unknown /cmd    → small error message
+    1) Slash commands (text starting with "/") stay on the command plane.
 
-    2) Short greetings:
-       - "hi", "hello", "hey", "yo" (case-insensitive)
-         → quick friendly reply via act/speech
-
-    3) Everything else:
-       → forward to LLMReasoner via "reason/request"
+    2) Natural language, including greetings, goes through context/thought.
+       The old fast canned greeting scaffold was removed once the line was live.
     """
 
     async def process(self, event: Event, ctx) -> Iterable[Event]:
@@ -675,62 +668,8 @@ class TextRouterNeuron(BaseNeuron):
                 meta={"kind": "recollection_request"},
             )]
         # ------------------------------
-        # 2) Greetings: warmup fast-path, then defer to learned behavior
+        # 2) Natural language, including greetings, goes through thought/context.
         # ------------------------------
-        greeting_match = await self._match_greeting(ctx, lowered)
-        if bool(greeting_match.get("matched", False)):
-            # Prefer the /user display name when available
-            user_name = await ctx.get_kv("profile:user_name", None)
-            user_label = str(user_name).strip() if user_name else "there"
-
-            # Learned greeting aliases should stay snappy even after warmup.
-            if bool(greeting_match.get("learned", False)):
-                await ctx.log_debug(
-                    f"[{self.name}] Handling learned greeting alias locally",
-                    text=text,
-                    channel=channel,
-                    concept=str(greeting_match.get("concept", "") or ""),
-                )
-                return [self._speech(
-                    f"Hey, {user_label}! What's up?",
-                    channel=channel,
-                    style="assistant",
-                    event=event,
-                )]
-
-            # Phase out canned greetings as semantic memory grows
-            mem_store = await ctx.get_kv("memory:store", None)
-            try:
-                semantic_n = len(getattr(mem_store, "semantic", [])) if mem_store else 0
-            except Exception:
-                semantic_n = 0
-
-            warmup_max = int(await ctx.get_kv("router:greet_warmup_semantic_max", 50) or 50)
-
-            if semantic_n < warmup_max:
-                await ctx.log_debug(
-                    f"[{self.name}] Handling greeting locally (warmup)",
-                    text=text,
-                    channel=channel,
-                    semantic_n=semantic_n,
-                    warmup_max=warmup_max,
-                )
-                return [self._speech(
-                    f"Hey, {user_label}! What's up?",
-                    channel=channel,
-                    style="assistant",
-                    event=event,
-                )]
-
-            # Past warmup: let the reasoner handle it (learned/personalized)
-            await ctx.log_debug(
-                f"[{self.name}] Greeting forwarded to LLM (post-warmup)",
-                text=text,
-                channel=channel,
-                semantic_n=semantic_n,
-                warmup_max=warmup_max,
-            )
-            # fall through to default forwarding
 
         # ------------------------------
         # 3) Default: forward to contextual builder
@@ -760,18 +699,6 @@ class TextRouterNeuron(BaseNeuron):
     # ------------------------------
     def _normalize_token(self, text: str) -> str:
         return " ".join(str(text or "").strip().lower().split())
-
-    async def _match_greeting(self, ctx, lowered: str) -> Dict[str, Any]:
-        norm = self._normalize_token(lowered)
-        builtins = {"hi", "hello", "hey", "yo", "good morning", "good afternoon", "good evening"}
-        if norm in builtins:
-            return {"matched": True, "learned": False, "normalized": norm}
-
-        aliases = await ctx.get_kv("router:greeting_aliases", {}) or {}
-        if isinstance(aliases, dict) and norm in aliases:
-            return {"matched": True, "learned": True, "normalized": norm, "concept": str(aliases.get(norm, "") or "")}
-
-        return {"matched": False, "learned": False, "normalized": norm}
 
     # Helper: detect "why did you say that?" style questions
     # ------------------------------
@@ -874,24 +801,12 @@ class TextRouterNeuron(BaseNeuron):
             meta=self._control_meta(kind="command_error"),
         )
 
-    def _speech(self, text: str, channel: str, style: str, event: Event) -> Event:
-        return Event(
-            topic="act/speech",
-            payload={
-                "text": text,
-                "channel": channel,
-                "style": style,
-            },
-            source=self.name,
-            correlation_id=event.correlation_id,
-            meta={"kind": "router_reply"},
-        )
-        
+
 def build_neurons(orchestrator: Orchestrator):
     cfg = NeuronConfig(
         name="text_router",
         subscribed_topics=["percept/text", "act/speech"],
-        output_topics=["reason/request", "act/speech", "ui/status", "ui/error"],
+        output_topics=["context/request", "ui/status", "ui/error"],
         priority=5,
     )
     yield TextRouterNeuron(cfg)

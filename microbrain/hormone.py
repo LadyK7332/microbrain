@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, Mapping
 
+from microbrain.pdna.access import ddna_trait_mutator, get_profile_section, profile_path
+
 HORMONE_KEYS = (
     "arousal",
     "inquiry",
@@ -45,6 +47,28 @@ DDNA_MOD_KEYS = (
     "expression_bias",
     "restraint_bias",
     "volatility",
+    # Extended DDNA/metabolism modifiers. Older organs can ignore these;
+    # newer reward/novelty/boredom/thought layers consume them.
+    "reward_gain",
+    "salience_gain",
+    "salience_decay_resistance",
+    "trainer_alignment_gain",
+    "boredom_growth_gain",
+    "boredom_relief_gain",
+    "curiosity_gain",
+    "expression_activation_gain",
+    "expression_threshold_gain",
+    "thought_momentum_gain",
+    "drawer_persistence_gain",
+    "decay_resistance",
+    "action_gate_strictness",
+    "novelty_risk_dampening",
+    "human_uplift_gain",
+    "thought_completion_bias",
+    "task_continuity_gain",
+    "social_reward_gain",
+    "support_expression_gain",
+    "expression_variance_gain",
 )
 
 ROSEHIP_KEYS = (
@@ -114,6 +138,26 @@ DEFAULT_DDNA_MODULATORS: Dict[str, float] = {
     "expression_bias": 1.00,
     "restraint_bias": 1.00,
     "volatility": 1.00,
+    "reward_gain": 1.00,
+    "salience_gain": 1.00,
+    "salience_decay_resistance": 1.00,
+    "trainer_alignment_gain": 1.00,
+    "boredom_growth_gain": 1.00,
+    "boredom_relief_gain": 1.00,
+    "curiosity_gain": 1.00,
+    "expression_activation_gain": 1.00,
+    "expression_threshold_gain": 1.00,
+    "thought_momentum_gain": 1.00,
+    "drawer_persistence_gain": 1.00,
+    "decay_resistance": 1.00,
+    "action_gate_strictness": 1.00,
+    "novelty_risk_dampening": 1.00,
+    "human_uplift_gain": 1.00,
+    "thought_completion_bias": 1.00,
+    "task_continuity_gain": 1.00,
+    "social_reward_gain": 1.00,
+    "support_expression_gain": 1.00,
+    "expression_variance_gain": 1.00,
 }
 
 
@@ -132,6 +176,8 @@ def derive_ddna_modulators(pdna: Any) -> Dict[str, float]:
     energy = clamp(safe_float(getattr(pdna, "energy", 0.5), 0.5))
     support = clamp(safe_float(getattr(pdna, "support_level", 0.7), 0.7))
 
+    # Legacy PDNA-derived baseline. This is still the fallback when the
+    # profile only has v1 traits.
     mods["arousal_gain"] = clamp(0.70 + (0.45 * energy) + (0.12 * playfulness), 0.35, 1.75)
     mods["inquiry_gain"] = clamp(0.70 + (0.38 * introspection) + (0.18 * focus) + (0.10 * playfulness), 0.35, 1.75)
     mods["affiliation_gain"] = clamp(0.70 + (0.35 * warmth) + (0.20 * support) + (0.05 * flirtation), 0.35, 1.75)
@@ -146,6 +192,44 @@ def derive_ddna_modulators(pdna: Any) -> Dict[str, float]:
     mods["restraint_bias"] = clamp(0.55 + (0.35 * safety) + (0.25 * formality) + (0.08 * introspection) - (0.12 * playfulness), 0.25, 1.90)
     mods["volatility"] = clamp(0.45 + (0.28 * energy) + (0.12 * playfulness) - (0.18 * safety), 0.20, 1.60)
 
+    # v2 profile mutators: DDNA presses into metabolism instead of writing
+    # responses. Missing keys simply behave as 1.0 multipliers.
+    mods["social_reward_gain"] = clamp(ddna_trait_mutator(pdna, "warmth", "social_reward_gain", 1.0), 0.40, 2.00)
+    mods["support_expression_gain"] = clamp(ddna_trait_mutator(pdna, "warmth", "support_expression_gain", 1.0), 0.40, 2.00)
+    mods["expression_variance_gain"] = clamp(ddna_trait_mutator(pdna, "playfulness", "expression_variance_gain", 1.0), 0.40, 2.00)
+    mods["boredom_growth_gain"] = clamp(ddna_trait_mutator(pdna, "playfulness", "boredom_growth_gain", 1.0), 0.40, 2.00)
+    mods["expression_threshold_gain"] = clamp(ddna_trait_mutator(pdna, "formality", "expression_threshold_gain", 1.0), 0.40, 2.00)
+    mods["thought_momentum_gain"] = clamp(ddna_trait_mutator(pdna, "introspection", "thought_momentum_gain", 1.0), 0.40, 2.00)
+    mods["drawer_persistence_gain"] = clamp(ddna_trait_mutator(pdna, "introspection", "drawer_persistence_gain", 1.0), 0.40, 2.00)
+    mods["action_gate_strictness"] = clamp(ddna_trait_mutator(pdna, "safety_orientation", "action_gate_strictness", 1.0), 0.40, 2.00)
+    mods["novelty_risk_dampening"] = clamp(ddna_trait_mutator(pdna, "safety_orientation", "novelty_risk_dampening", 1.0), 0.30, 1.40)
+    mods["task_continuity_gain"] = clamp(ddna_trait_mutator(pdna, "focus", "task_continuity_gain", 1.0), 0.40, 2.00)
+    mods["thought_completion_bias"] = clamp(ddna_trait_mutator(pdna, "focus", "thought_completion_bias", 1.0), 0.40, 2.00)
+    mods["expression_activation_gain"] = clamp(ddna_trait_mutator(pdna, "energy", "expression_activation_gain", 1.0), 0.40, 2.00)
+    mods["curiosity_gain"] = clamp(ddna_trait_mutator(pdna, "energy", "curiosity_activation_gain", 1.0), 0.40, 2.00)
+    mods["decay_resistance"] = clamp(ddna_trait_mutator(pdna, "energy", "decay_resistance", 1.0), 0.40, 2.00)
+    mods["human_uplift_gain"] = clamp(ddna_trait_mutator(pdna, "support_level", "human_uplift_gain", 1.0), 0.40, 2.00)
+    mods["trainer_alignment_gain"] = clamp(ddna_trait_mutator(pdna, "support_level", "trainer_alignment_gain", 1.0), 0.40, 2.00)
+
+    risk_salience_gain = clamp(ddna_trait_mutator(pdna, "safety_orientation", "risk_salience_gain", 1.0), 0.40, 2.20)
+    novelty_profile_gain = clamp(ddna_trait_mutator(pdna, "playfulness", "novelty_gain", 1.0), 0.40, 2.00)
+    relief_profile_gain = safe_float(profile_path(pdna, "drive_thresholds", "novelty.boredom_relief_gain", 0.35), 0.35)
+    mods["reward_gain"] = clamp(mods["social_reward_gain"] * mods["trainer_alignment_gain"] * (0.92 + 0.16 * playfulness), 0.35, 2.00)
+    mods["salience_gain"] = clamp((0.82 + 0.18 * focus) * risk_salience_gain, 0.35, 2.20)
+    mods["salience_decay_resistance"] = clamp(mods["decay_resistance"] * (0.90 + 0.20 * focus), 0.40, 2.00)
+    mods["boredom_relief_gain"] = clamp((0.85 + relief_profile_gain) * mods["curiosity_gain"], 0.35, 2.00)
+
+    # Press profile multipliers back into existing coarse DDNA channels.
+    mods["novelty_gain"] = clamp(mods["novelty_gain"] * novelty_profile_gain * mods["curiosity_gain"] * mods["novelty_risk_dampening"], 0.20, 2.00)
+    mods["expression_bias"] = clamp(mods["expression_bias"] * mods["support_expression_gain"] * mods["expression_activation_gain"] / max(0.40, mods["expression_threshold_gain"]), 0.20, 2.00)
+    mods["restraint_bias"] = clamp(mods["restraint_bias"] * mods["action_gate_strictness"], 0.20, 2.00)
+    mods["caution_gain"] = clamp(mods["caution_gain"] * mods["action_gate_strictness"], 0.20, 2.00)
+    mods["inquiry_gain"] = clamp(mods["inquiry_gain"] * mods["thought_momentum_gain"] * mods["curiosity_gain"], 0.20, 2.00)
+    mods["persistence_gain"] = clamp(mods["persistence_gain"] * mods["drawer_persistence_gain"] * mods["task_continuity_gain"], 0.20, 2.00)
+    mods["continuity_gain"] = clamp(mods["continuity_gain"] * mods["task_continuity_gain"], 0.20, 2.00)
+    mods["social_gain"] = clamp(mods["social_gain"] * mods["human_uplift_gain"], 0.20, 2.00)
+    mods["affiliation_gain"] = clamp(mods["affiliation_gain"] * mods["social_reward_gain"], 0.20, 2.00)
+
     overrides = getattr(pdna, "hormone_overrides", {})
     if isinstance(overrides, Mapping):
         for key, value in overrides.items():
@@ -153,7 +237,6 @@ def derive_ddna_modulators(pdna: Any) -> Dict[str, float]:
                 mods[key] = clamp(safe_float(value, mods[key]), 0.20, 2.00)
 
     return {k: round(v, 4) for k, v in mods.items()}
-
 
 def merge_need_maps(*maps: Mapping[str, Any] | None) -> Dict[str, float]:
     out = {k: 0.0 for k in NEED_KEYS}
