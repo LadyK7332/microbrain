@@ -7,6 +7,7 @@ from typing import Any, Dict, Iterable, List, Mapping
 from microbrain.hormone import derive_ddna_modulators
 from microbrain.orchestrator.neuron_base import BaseNeuron, Event, NeuronConfig
 from microbrain.orchestrator.orchestrator import Orchestrator
+from microbrain.utils.heartbeat_stream import PRIMARY_HEARTBEAT_TOPIC, is_heartbeat_event
 
 NEURON_NAME = Path(__file__).stem
 
@@ -27,6 +28,8 @@ def _norm_intent(text: str) -> str:
 
 
 def _is_control_event(event: Event) -> bool:
+    if is_heartbeat_event(event):
+        return False
     meta = event.meta if isinstance(event.meta, Mapping) else {}
     if event.topic.startswith(("ui/", "control/", "debug/")):
         return True
@@ -78,14 +81,17 @@ class ThoughtMomentumNeuron(BaseNeuron):
         persistence_gain = max(0.25, min(2.0, _safe_float((ddna_mods or {}).get("drawer_persistence_gain"), 1.0)))
 
         state = await self._load_state(ctx, now)
+        prior_summary = state.get("summary", {}) if isinstance(state.get("summary"), Mapping) else {}
+        prior_last_cognitive = str(prior_summary.get("last_cognitive_topic") or prior_summary.get("last_event_topic") or "")
         vectors = list(state.get("active_vectors", []) or [])
         vectors = self._decay_vectors(vectors, now, decay_resistance=persistence_gain)
 
         changed = False
         additions: List[Dict[str, Any]] = []
+        heartbeat = is_heartbeat_event(event)
 
-        if event.topic == "clock/tick":
-            changed = True
+        if heartbeat:
+            changed = bool(vectors)
 
         elif event.topic == "percept/text":
             additions.extend(self._vectors_from_text(event, now))
@@ -118,7 +124,10 @@ class ThoughtMomentumNeuron(BaseNeuron):
 
         vectors = self._rank_vectors(vectors)[: self.MAX_VECTORS]
         summary = self._summarize(vectors, now)
-        summary["last_event_topic"] = event.topic
+        summary["last_trigger_topic"] = PRIMARY_HEARTBEAT_TOPIC if heartbeat else event.topic
+        summary["last_event_topic"] = prior_last_cognitive if heartbeat else event.topic
+        summary["last_cognitive_topic"] = prior_last_cognitive if heartbeat else event.topic
+        summary["heartbeat_decay_only"] = bool(heartbeat)
         summary["updated_at"] = now
 
         if changed:
@@ -156,7 +165,10 @@ class ThoughtMomentumNeuron(BaseNeuron):
         active = await ctx.get_kv("thought:momentum:active_vectors", [])
         if not isinstance(active, list):
             active = []
-        return {"active_vectors": active, "loaded_at": now}
+        summary = await ctx.get_kv("thought:momentum", {})
+        if not isinstance(summary, Mapping):
+            summary = {}
+        return {"active_vectors": active, "summary": dict(summary), "loaded_at": now}
 
     def _decay_vectors(self, vectors: List[Dict[str, Any]], now: float, *, decay_resistance: float = 1.0) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
@@ -325,6 +337,7 @@ def build_neurons(orchestrator: Orchestrator):
             "reinforcement/feedback",
             "control/reinforce",
             "clock/tick",
+            PRIMARY_HEARTBEAT_TOPIC,
             "thought/internal",
         ],
         output_topics=["thought/momentum"],

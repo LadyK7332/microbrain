@@ -27,7 +27,7 @@ class AppConfig:
     tts_rate: int = 155
     tts_volume: float = 0.9
     log_level: str = "INFO"
-    ui: str = "textual"  # repl | textual
+    ui: str = "textual"  # repl | textual | dashboard
     mouth_backend: str = "auto"  # auto | ipc | local | none
     spoken_reply_bias_ttl_s: float = 45.0
 

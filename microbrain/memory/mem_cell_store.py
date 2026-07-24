@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import threading
@@ -9,12 +10,47 @@ import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from microbrain.memory.memory_store import JSONLStore
 
+# ---------------------------------------------------------------------------
+# Behavioral tuning
+# ---------------------------------------------------------------------------
+
+# These values affect pruning/promotion value only.  Reinforcement deltas live
+# with the hypothesis memory reinforcement neuron so both tuning groups remain
+# visible instead of being scattered through working logic.
+LIFECYCLE_ACTIVATION_WEIGHT = 0.28
+LIFECYCLE_PROMOTION_WEIGHT = 0.22
+LIFECYCLE_TRUST_WEIGHT = 0.14
+LIFECYCLE_ENCOUNTER_BONUS_CAP = 0.28
+LIFECYCLE_ENCOUNTER_BONUS_STEP = 0.035
+LIFECYCLE_RETRIEVAL_BONUS_CAP = 0.08
+LIFECYCLE_RETRIEVAL_BONUS_SCALE = 0.018
+LIFECYCLE_ASSOCIATION_BONUS_CAP = 0.04
+LIFECYCLE_ASSOCIATION_BONUS_SCALE = 0.010
+LIFECYCLE_USAGE_BONUS_CAP = 0.14
+LIFECYCLE_USAGE_BONUS_SCALE = 0.040
+LIFECYCLE_SUCCESS_BONUS_CAP = 0.16
+LIFECYCLE_SUCCESS_BONUS_SCALE = 0.055
+
+# Cross-process shard-write behavior.
+# Time values are seconds; attempts are integer retry counts.
+FILE_WRITE_LOCK_TIMEOUT_S = 12.0
+FILE_WRITE_LOCK_STALE_AFTER_S = 120.0
+FILE_WRITE_LOCK_POLL_S = 0.05
+ATOMIC_REPLACE_ATTEMPTS = 12
+ATOMIC_REPLACE_DELAY_S = 0.05
+
+# ---------------------------------------------------------------------------
+# Required static constants
+# ---------------------------------------------------------------------------
+
 TIERS = ("now", "short", "long", "learned")
 TOKEN_RE = re.compile(r"[a-z0-9']+")
+PENDING_REINFORCEMENT_SCHEMA = "mem_cell.pending_reinforce.v1"
+PENDING_REINFORCEMENT_OPERATION = "reinforce"
 
 _PROCESS_SHARD_LOCKS: Dict[str, threading.RLock] = {}
 _PROCESS_SHARD_LOCKS_GUARD = threading.Lock()
@@ -107,8 +143,8 @@ class MemCellStore:
         self,
         path: Path,
         *,
-        timeout_s: float = 12.0,
-        stale_after_s: float = 120.0,
+        timeout_s: float = FILE_WRITE_LOCK_TIMEOUT_S,
+        stale_after_s: float = FILE_WRITE_LOCK_STALE_AFTER_S,
     ) -> Iterator[None]:
         """Best-effort cross-process shard writer lock.
 
@@ -137,7 +173,7 @@ class MemCellStore:
                     pass
                 if time.monotonic() >= deadline:
                     raise TimeoutError(f"timed out waiting for mem-cell shard lock: {lock_path}")
-                time.sleep(0.05)
+                time.sleep(FILE_WRITE_LOCK_POLL_S)
 
         try:
             yield
@@ -157,8 +193,8 @@ class MemCellStore:
         tmp: Path,
         path: Path,
         *,
-        attempts: int = 12,
-        delay_s: float = 0.05,
+        attempts: int = ATOMIC_REPLACE_ATTEMPTS,
+        delay_s: float = ATOMIC_REPLACE_DELAY_S,
     ) -> None:
         last_exc: BaseException | None = None
         for attempt in range(max(1, int(attempts))):
@@ -235,6 +271,199 @@ class MemCellStore:
                 tmp.unlink(missing_ok=True)
             except OSError:
                 pass
+
+    def _stage_reinforcement_ops_for_composer(self, tier: str, updates: Sequence[Dict[str, Any]]) -> int:
+        """Stage additive reinforcement deltas for the single memory composer.
+
+        Reinforcement must be additive.  Staging a fully rewritten row would let
+        concurrent writers collapse two increments into one through max-based
+        merging, so these envelopes carry counters and deltas instead.
+        """
+        tier = self._coerce_tier(tier)
+        clean_updates = [dict(update) for update in (updates or []) if isinstance(update, dict)]
+        if not clean_updates:
+            return 0
+
+        pending_dir = self._pending_dir(tier)
+        pending_dir.mkdir(parents=True, exist_ok=True)
+        op_id = f"{os.getpid()}-{threading.get_ident()}-{time.time_ns()}-{uuid.uuid4().hex}"
+        tmp = pending_dir / f".{op_id}.jsonl.tmp"
+        final = pending_dir / f"{op_id}.jsonl"
+        try:
+            with tmp.open("w", encoding="utf-8") as f:
+                for update in clean_updates:
+                    update["tier"] = tier
+                    envelope = {
+                        "schema": PENDING_REINFORCEMENT_SCHEMA,
+                        "op": PENDING_REINFORCEMENT_OPERATION,
+                        "tier": tier,
+                        "writer_id": self.writer_id,
+                        "op_id": op_id,
+                        "queued_at": time.time(),
+                        "update": update,
+                    }
+                    f.write(json.dumps(envelope, ensure_ascii=False) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            tmp.replace(final)
+            return len(clean_updates)
+        finally:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def find_cell(self, cell_id: str, *, tier_hint: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Return a copy of a cell plus its resolved tier without mutating it."""
+        target = str(cell_id or "").strip()
+        if not target:
+            return None
+
+        ordered: List[str] = []
+        hint = str(tier_hint or "").strip().lower()
+        if hint in TIERS:
+            ordered.append(hint)
+        ordered.extend(tier for tier in TIERS if tier not in ordered)
+        for tier in ordered:
+            rows = self._load_tier_rows(tier)
+            idx = self._tier_index.get(tier, {}).get(target)
+            if idx is None or idx < 0 or idx >= len(rows):
+                continue
+            row = dict(rows[idx])
+            row["tier"] = tier
+            return row
+
+        for path in sorted(self.derived_dir.glob("derived_*.jsonl"), reverse=True):
+            try:
+                rows = JSONLStore(str(path)).read_all()
+            except Exception:
+                continue
+            for row in rows:
+                if isinstance(row, dict) and str(row.get("id", "") or "") == target:
+                    found = dict(row)
+                    found["tier"] = "derived"
+                    found["derived_path"] = str(path)
+                    return found
+        return None
+
+    def stage_reinforcements(self, updates: Sequence[Dict[str, Any]]) -> int:
+        """Resolve and stage additive cell reinforcement updates.
+
+        Canonical tiers go through the composer.  Derived rows still use their
+        own atomically rewritten shard because the current composer owns only the
+        four canonical tiers.
+        """
+        grouped: Dict[str, List[Dict[str, Any]]] = {tier: [] for tier in TIERS}
+        derived: List[Dict[str, Any]] = []
+        for raw in updates or []:
+            if not isinstance(raw, dict):
+                continue
+            update = dict(raw)
+            cell_id = str(update.get("cell_id", "") or "").strip()
+            if not cell_id:
+                continue
+            tier = str(update.get("tier", "") or "").strip().lower()
+            if tier not in TIERS and tier != "derived":
+                found = self.find_cell(cell_id)
+                if not found:
+                    continue
+                tier = str(found.get("tier", "") or "")
+            update["tier"] = tier
+            if tier == "derived":
+                derived.append(update)
+            elif tier in TIERS:
+                grouped[tier].append(update)
+
+        applied = 0
+        for tier, tier_updates in grouped.items():
+            if not tier_updates:
+                continue
+            if self.composer_enabled:
+                applied += self._stage_reinforcement_ops_for_composer(tier, tier_updates)
+            else:
+                for update in tier_updates:
+                    if self.apply_reinforcement(update, tier=tier, flush=False):
+                        applied += 1
+                self.flush_tier(tier)
+        for update in derived:
+            if self._apply_derived_reinforcement(update):
+                applied += 1
+        return applied
+
+    def apply_reinforcement(
+        self,
+        update: Dict[str, Any],
+        *,
+        tier: Optional[str] = None,
+        flush: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        """Apply one additive reinforcement operation to a canonical cell."""
+        op = dict(update or {})
+        target = str(op.get("cell_id", "") or "").strip()
+        if not target:
+            return None
+        resolved = str(tier or op.get("tier", "") or "").strip().lower()
+        if resolved not in TIERS:
+            found = self.find_cell(target, tier_hint=resolved)
+            if not found or str(found.get("tier", "")) not in TIERS:
+                return None
+            resolved = str(found.get("tier"))
+
+        with self._tier_lock(resolved):
+            rows = self._load_tier_rows(resolved)
+            idx = self._tier_index.get(resolved, {}).get(target)
+            if idx is None or idx < 0 or idx >= len(rows):
+                return None
+            row = dict(rows[idx])
+            row["retrieval_count"] = max(0, int(row.get("retrieval_count", 0) or 0) + int(op.get("retrieval_inc", 0) or 0))
+            row["association_touch_count"] = max(0, int(row.get("association_touch_count", 0) or 0) + int(op.get("association_inc", 0) or 0))
+            row["usage_count"] = max(0, int(row.get("usage_count", 0) or 0) + int(op.get("usage_inc", 0) or 0))
+            row["successful_recalls"] = max(0, int(row.get("successful_recalls", 0) or 0) + int(op.get("success_inc", 0) or 0))
+            row["failed_uses"] = max(0, int(row.get("failed_uses", 0) or 0) + int(op.get("failure_inc", 0) or 0))
+            row["activation"] = self._clamp01(float(row.get("activation", 0.0) or 0.0) + float(op.get("activation_delta", 0.0) or 0.0))
+            row["promotion"] = self._clamp01(float(row.get("promotion", 0.0) or 0.0) + float(op.get("promotion_delta", 0.0) or 0.0))
+            row["trust"] = self._clamp01(float(row.get("trust", 0.5) or 0.5) + float(op.get("trust_delta", 0.0) or 0.0))
+            row["last_retrieved_ts"] = max(float(row.get("last_retrieved_ts", 0.0) or 0.0), float(op.get("last_retrieved_ts", 0.0) or 0.0))
+            row["last_associated_ts"] = max(float(row.get("last_associated_ts", 0.0) or 0.0), float(op.get("last_associated_ts", 0.0) or 0.0))
+            row["last_used_ts"] = max(float(row.get("last_used_ts", 0.0) or 0.0), float(op.get("last_used_ts", 0.0) or 0.0))
+            meta = dict(row.get("meta", {}) or {})
+            reinforcement_meta = op.get("meta", {}) if isinstance(op.get("meta", {}), dict) else {}
+            if reinforcement_meta:
+                meta["last_reinforcement"] = dict(reinforcement_meta)
+            row["meta"] = meta
+            rows[idx] = row
+            if flush:
+                self._write_shard(resolved, rows)
+            return dict(row)
+
+    def _apply_derived_reinforcement(self, update: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        target = str(update.get("cell_id", "") or "").strip()
+        if not target:
+            return None
+        for path in sorted(self.derived_dir.glob("derived_*.jsonl"), reverse=True):
+            try:
+                rows = JSONLStore(str(path)).read_all()
+            except Exception:
+                continue
+            for idx, row in enumerate(rows):
+                if not isinstance(row, dict) or str(row.get("id", "") or "") != target:
+                    continue
+                changed = dict(row)
+                changed["retrieval_count"] = max(0, int(changed.get("retrieval_count", 0) or 0) + int(update.get("retrieval_inc", 0) or 0))
+                changed["association_touch_count"] = max(0, int(changed.get("association_touch_count", 0) or 0) + int(update.get("association_inc", 0) or 0))
+                changed["usage_count"] = max(0, int(changed.get("usage_count", 0) or 0) + int(update.get("usage_inc", 0) or 0))
+                changed["successful_recalls"] = max(0, int(changed.get("successful_recalls", 0) or 0) + int(update.get("success_inc", 0) or 0))
+                changed["failed_uses"] = max(0, int(changed.get("failed_uses", 0) or 0) + int(update.get("failure_inc", 0) or 0))
+                changed["activation"] = self._clamp01(float(changed.get("activation", 0.0) or 0.0) + float(update.get("activation_delta", 0.0) or 0.0))
+                changed["promotion"] = self._clamp01(float(changed.get("promotion", 0.0) or 0.0) + float(update.get("promotion_delta", 0.0) or 0.0))
+                changed["trust"] = self._clamp01(float(changed.get("trust", 0.5) or 0.5) + float(update.get("trust_delta", 0.0) or 0.0))
+                changed["last_retrieved_ts"] = max(float(changed.get("last_retrieved_ts", 0.0) or 0.0), float(update.get("last_retrieved_ts", 0.0) or 0.0))
+                changed["last_associated_ts"] = max(float(changed.get("last_associated_ts", 0.0) or 0.0), float(update.get("last_associated_ts", 0.0) or 0.0))
+                changed["last_used_ts"] = max(float(changed.get("last_used_ts", 0.0) or 0.0), float(update.get("last_used_ts", 0.0) or 0.0))
+                rows[idx] = changed
+                self._write_rows_to_path(path, rows)
+                return changed
+        return None
 
     def _stage_dirty_rows(self, tier: str) -> int:
         tier = self._coerce_tier(tier)
@@ -334,8 +563,13 @@ class MemCellStore:
         )
         merged["decay"] = min(float(old.get("decay", 1.0) or 1.0), float(new.get("decay", 1.0) or 1.0))
         merged["trust"] = min(1.0, max(float(old.get("trust", 0.5) or 0.5), float(new.get("trust", 0.5) or 0.5)))
+        merged["retrieval_count"] = max(int(old.get("retrieval_count", 0) or 0), int(new.get("retrieval_count", 0) or 0))
+        merged["association_touch_count"] = max(int(old.get("association_touch_count", 0) or 0), int(new.get("association_touch_count", 0) or 0))
         merged["usage_count"] = max(int(old.get("usage_count", 0) or 0), int(new.get("usage_count", 0) or 0))
         merged["successful_recalls"] = max(int(old.get("successful_recalls", 0) or 0), int(new.get("successful_recalls", 0) or 0))
+        merged["failed_uses"] = max(int(old.get("failed_uses", 0) or 0), int(new.get("failed_uses", 0) or 0))
+        merged["last_retrieved_ts"] = max(float(old.get("last_retrieved_ts", 0.0) or 0.0), float(new.get("last_retrieved_ts", 0.0) or 0.0))
+        merged["last_associated_ts"] = max(float(old.get("last_associated_ts", 0.0) or 0.0), float(new.get("last_associated_ts", 0.0) or 0.0))
         merged["last_used_ts"] = max(float(old.get("last_used_ts", 0.0) or 0.0), float(new.get("last_used_ts", 0.0) or 0.0))
 
         for key, limit in (("refs", 32), ("modalities", 8), ("links_explicit", 24)):
@@ -479,12 +713,27 @@ class MemCellStore:
         except Exception:
             return []
 
-    def _write_derived_rows(self, rows: List[Dict[str, Any]]) -> None:
-        path = self._derived_path()
+    def _write_rows_to_path(self, path: Path, rows: Sequence[Dict[str, Any]]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open('w', encoding='utf-8') as f:
-            for row in rows:
-                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        with self._process_shard_lock(path):
+            tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}.tmp")
+            try:
+                with self._file_write_lock(path):
+                    with tmp.open("w", encoding="utf-8") as f:
+                        for row in rows:
+                            if isinstance(row, dict):
+                                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                        f.flush()
+                        os.fsync(f.fileno())
+                    self._atomic_replace_with_retry(tmp, path)
+            finally:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    def _write_derived_rows(self, rows: List[Dict[str, Any]]) -> None:
+        self._write_rows_to_path(self._derived_path(), rows)
 
     def _iter_derived_rows(self) -> Iterable[Dict[str, Any]]:
         if not self.derived_dir.exists():
@@ -541,8 +790,13 @@ class MemCellStore:
             row.setdefault("promotion", 0.0)
             row.setdefault("decay", 1.0)
             row.setdefault("trust", 0.5)
+            row.setdefault("retrieval_count", 0)
+            row.setdefault("association_touch_count", 0)
             row.setdefault("usage_count", 0)
             row.setdefault("successful_recalls", 0)
+            row.setdefault("failed_uses", 0)
+            row.setdefault("last_retrieved_ts", 0.0)
+            row.setdefault("last_associated_ts", 0.0)
             row.setdefault("last_used_ts", 0.0)
 
             rows = self._load_tier_rows(tier)
@@ -1567,13 +1821,39 @@ class MemCellStore:
         except Exception:
             return 0.0
 
+    @staticmethod
+    def _last_activity_ts(row: Mapping[str, Any]) -> float:
+        return max(
+            float(row.get("last_seen", row.get("ts", 0.0)) or 0.0),
+            float(row.get("last_retrieved_ts", 0.0) or 0.0),
+            float(row.get("last_associated_ts", 0.0) or 0.0),
+            float(row.get("last_used_ts", 0.0) or 0.0),
+        )
+
     def _value_score(self, row: Dict[str, Any]) -> float:
         activation = self._clamp01(row.get("activation", 0.0))
         promotion = self._clamp01(row.get("promotion", 0.0))
         trust = self._clamp01(row.get("trust", 0.0))
         encounters = max(1.0, float(row.get("encounter_count", 1) or 1))
-        encounter_bonus = min(0.35, (encounters - 1.0) * 0.04)
-        return activation * 0.30 + promotion * 0.25 + trust * 0.15 + encounter_bonus
+        retrievals = max(0.0, float(row.get("retrieval_count", 0) or 0))
+        associations = max(0.0, float(row.get("association_touch_count", 0) or 0))
+        usage = max(0.0, float(row.get("usage_count", 0) or 0))
+        successes = max(0.0, float(row.get("successful_recalls", 0) or 0))
+        encounter_bonus = min(LIFECYCLE_ENCOUNTER_BONUS_CAP, (encounters - 1.0) * LIFECYCLE_ENCOUNTER_BONUS_STEP)
+        retrieval_bonus = min(LIFECYCLE_RETRIEVAL_BONUS_CAP, math.log1p(retrievals) * LIFECYCLE_RETRIEVAL_BONUS_SCALE)
+        association_bonus = min(LIFECYCLE_ASSOCIATION_BONUS_CAP, math.log1p(associations) * LIFECYCLE_ASSOCIATION_BONUS_SCALE)
+        usage_bonus = min(LIFECYCLE_USAGE_BONUS_CAP, math.log1p(usage) * LIFECYCLE_USAGE_BONUS_SCALE)
+        success_bonus = min(LIFECYCLE_SUCCESS_BONUS_CAP, math.log1p(successes) * LIFECYCLE_SUCCESS_BONUS_SCALE)
+        return (
+            activation * LIFECYCLE_ACTIVATION_WEIGHT
+            + promotion * LIFECYCLE_PROMOTION_WEIGHT
+            + trust * LIFECYCLE_TRUST_WEIGHT
+            + encounter_bonus
+            + retrieval_bonus
+            + association_bonus
+            + usage_bonus
+            + success_bonus
+        )
 
     def bump_cell(
         self,
@@ -1670,7 +1950,7 @@ class MemCellStore:
                 if not isinstance(row, dict):
                     continue
                 row = dict(row)
-                age_h = max(0.0, now_ts - float(row.get("last_seen", row.get("ts", now_ts)) or now_ts)) / 3600.0
+                age_h = max(0.0, now_ts - self._last_activity_ts(row)) / 3600.0
                 value = self._value_score(row)
                 encounters = max(1, int(row.get("encounter_count", 1) or 1))
                 target_tier = tier
@@ -1712,54 +1992,34 @@ class MemCellStore:
         activation_delta: float = 0.03,
         promotion_delta: float = 0.012,
     ) -> Optional[Dict[str, Any]]:
+        """Compatibility wrapper around additive composer reinforcement.
+
+        Older callers expected this method to rewrite the shard immediately.
+        It now stages an additive update so concurrent usage increments cannot
+        overwrite one another.  The returned row is the pre-compose snapshot.
+        """
         target = str(cell_id or "").strip()
         if not target:
             return None
-
+        found = self.find_cell(target)
+        if not found:
+            return None
         now_ts = time.time()
-        for tier in TIERS:
-            rows = self._read_shard(tier)
-            changed = False
-            updated: Optional[Dict[str, Any]] = None
-            for idx, row in enumerate(rows):
-                if not isinstance(row, dict) or str(row.get("id", "") or "") != target:
-                    continue
-                row = dict(row)
-                row["last_used_ts"] = now_ts
-                row["usage_count"] = int(row.get("usage_count", 0) or 0) + 1
-                if success:
-                    row["successful_recalls"] = int(row.get("successful_recalls", 0) or 0) + 1
-                row["activation"] = self._clamp01(float(row.get("activation", 0.0) or 0.0) + activation_delta)
-                row["promotion"] = self._clamp01(float(row.get("promotion", 0.0) or 0.0) + promotion_delta)
-                rows[idx] = row
-                changed = True
-                updated = row
-                break
-            if changed:
-                self._write_shard(tier, rows)
-                return updated
-
-        rows = self._read_derived_rows()
-        changed = False
-        updated = None
-        for idx, row in enumerate(rows):
-            if not isinstance(row, dict) or str(row.get("id", "") or "") != target:
-                continue
-            row = dict(row)
-            row["last_used_ts"] = now_ts
-            row["usage_count"] = int(row.get("usage_count", 0) or 0) + 1
-            if success:
-                row["successful_recalls"] = int(row.get("successful_recalls", 0) or 0) + 1
-            row["activation"] = self._clamp01(float(row.get("activation", 0.0) or 0.0) + activation_delta)
-            row["promotion"] = self._clamp01(float(row.get("promotion", 0.0) or 0.0) + promotion_delta)
-            rows[idx] = row
-            changed = True
-            updated = row
-            break
-        if changed:
-            self._write_derived_rows(rows)
-            return updated
-        return None
+        self.stage_reinforcements(
+            [
+                {
+                    "cell_id": target,
+                    "tier": str(found.get("tier", "") or ""),
+                    "usage_inc": 1,
+                    "success_inc": 1 if success else 0,
+                    "activation_delta": activation_delta,
+                    "promotion_delta": promotion_delta,
+                    "last_used_ts": now_ts,
+                    "meta": {"stage": "legacy_note_cell_usage", "success": bool(success)},
+                }
+            ]
+        )
+        return found
 
     def _derived_value_score(self, row: Dict[str, Any]) -> float:
         activation = self._clamp01(row.get("activation", 0.0))
@@ -1929,7 +2189,7 @@ class MemCellStore:
 
         for row in source_rows:
             row = dict(row)
-            age_h = max(0.0, now_ts - float(row.get("last_seen", row.get("ts", now_ts)) or now_ts)) / 3600.0
+            age_h = max(0.0, now_ts - self._last_activity_ts(row)) / 3600.0
             value = self._derived_value_score(row)
             row["score"] = round(float(value), 6)
             support = max(1, int(row.get("support_count", row.get("encounter_count", 1)) or 1))
@@ -2007,7 +2267,7 @@ class MemCellStore:
                 elif c_norm and c_norm in q_norm:
                     contain_bonus += 0.22
 
-                age_s = max(0.0, now_ts - float(row.get('last_seen', row.get('ts', 0.0)) or 0.0))
+                age_s = max(0.0, now_ts - self._last_activity_ts(row))
                 recency = max(0.0, 1.0 - min(age_s / 86400.0, 1.0))
                 activation = max(0.0, min(1.0, float(row.get('activation', 1.0) or 1.0)))
                 promotion = max(0.0, min(1.0, float(row.get('promotion', 0.0) or 0.0)))
@@ -2041,6 +2301,14 @@ class MemCellStore:
                     'promotion': promotion,
                     'trust': trust,
                     'encounter_count': int(row.get('encounter_count', 1) or 1),
+                    'retrieval_count': int(row.get('retrieval_count', 0) or 0),
+                    'association_touch_count': int(row.get('association_touch_count', 0) or 0),
+                    'usage_count': int(row.get('usage_count', 0) or 0),
+                    'successful_recalls': int(row.get('successful_recalls', 0) or 0),
+                    'failed_uses': int(row.get('failed_uses', 0) or 0),
+                    'last_retrieved_ts': float(row.get('last_retrieved_ts', 0.0) or 0.0),
+                    'last_associated_ts': float(row.get('last_associated_ts', 0.0) or 0.0),
+                    'last_used_ts': float(row.get('last_used_ts', 0.0) or 0.0),
                     'meta': dict(row.get('meta', {}) or {}),
                 })
 
@@ -2075,7 +2343,7 @@ class MemCellStore:
             elif c_norm and c_norm in q_norm:
                 contain_bonus += 0.22
 
-            age_s = max(0.0, now_ts - float(row.get('last_seen', row.get('ts', 0.0)) or 0.0))
+            age_s = max(0.0, now_ts - self._last_activity_ts(row))
             recency = max(0.0, 1.0 - min(age_s / 86400.0, 1.0))
             activation = max(0.0, min(1.0, float(row.get('activation', 1.0) or 1.0)))
             promotion = max(0.0, min(1.0, float(row.get('promotion', 0.0) or 0.0)))
@@ -2111,8 +2379,14 @@ class MemCellStore:
                 'promotion': promotion,
                 'trust': trust,
                 'encounter_count': int(row.get('encounter_count', 1) or 1),
+                'retrieval_count': int(row.get('retrieval_count', 0) or 0),
+                'association_touch_count': int(row.get('association_touch_count', 0) or 0),
                 'usage_count': int(row.get('usage_count', 0) or 0),
                 'successful_recalls': int(row.get('successful_recalls', 0) or 0),
+                'failed_uses': int(row.get('failed_uses', 0) or 0),
+                'last_retrieved_ts': float(row.get('last_retrieved_ts', 0.0) or 0.0),
+                'last_associated_ts': float(row.get('last_associated_ts', 0.0) or 0.0),
+                'last_used_ts': float(row.get('last_used_ts', 0.0) or 0.0),
                 'meta': dict(row.get('meta', {}) or {}),
             })
 

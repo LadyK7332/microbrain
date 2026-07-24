@@ -440,6 +440,8 @@ class NativeResponderNeuron(BaseNeuron):
         channel = str(payload.get("channel", "repl") or "repl")
         source = str(payload.get("source", "user") or "user")
         raw_meta = payload.get("raw_meta", {}) if isinstance(payload.get("raw_meta", {}), dict) else {}
+        hypothesis = payload.get("hypothesis", {}) if isinstance(payload.get("hypothesis", {}), Mapping) else {}
+        selected_action = str(payload.get("selected_action", "") or raw_meta.get("selected_action", "") or hypothesis.get("recommended_action", "") or "")
         transport_source = str(raw_meta.get("transport_source", source) or source)
 
         if not text:
@@ -449,7 +451,15 @@ class NativeResponderNeuron(BaseNeuron):
         if channel in ("internal", "thought"):
             return []
 
-        shape = await self._shape_reply(ctx, text=text, channel=channel, transport_source=transport_source, raw_meta=raw_meta)
+        shape = await self._shape_reply(
+            ctx,
+            text=text,
+            channel=channel,
+            transport_source=transport_source,
+            raw_meta=raw_meta,
+            hypothesis=hypothesis,
+            selected_action=selected_action,
+        )
         if shape.get("suppress", False):
             await ctx.log_debug(
                 f"[{self.name}] Suppressed outward native reply",
@@ -461,6 +471,24 @@ class NativeResponderNeuron(BaseNeuron):
         reply = await self._build_response(ctx, text=text, shape=shape, payload=payload)
         if not reply:
             return []
+
+        memory_cell_ids: List[str] = []
+        answer_bundle = await ctx.get_kv("composer:last_answer_bundle", {})
+        if isinstance(answer_bundle, Mapping):
+            bundle_query = str(answer_bundle.get("query_text", "") or "")
+            bundle_answer = str(answer_bundle.get("answer", "") or "")
+            bundle_ts = _safe_float(answer_bundle.get("ts", 0.0), 0.0)
+            if (
+                _norm(bundle_query) == _norm(text)
+                and _norm(bundle_answer) == _norm(reply)
+                and bundle_ts > 0.0
+                and (time.time() - bundle_ts) <= 15.0
+            ):
+                memory_cell_ids = [
+                    str(cell_id or "")
+                    for cell_id in list(answer_bundle.get("selected_cell_ids", []) or [])
+                    if str(cell_id or "")
+                ][:12]
 
         await ctx.set_kv(
             "native_responder:last",
@@ -481,6 +509,7 @@ class NativeResponderNeuron(BaseNeuron):
                     "text": reply,
                     "channel": channel,
                     "style": "assistant",
+                    "memory_cell_ids": memory_cell_ids,
                 },
                 source=self.name,
                 correlation_id=event.correlation_id,
@@ -488,11 +517,22 @@ class NativeResponderNeuron(BaseNeuron):
                     "kind": "native_responder_reply",
                     "transport_source": transport_source,
                     "shape": shape,
+                    "memory_cell_ids": memory_cell_ids,
                 },
             )
         ]
 
-    async def _shape_reply(self, ctx, *, text: str, channel: str, transport_source: str, raw_meta: Mapping[str, Any] | None = None) -> Dict[str, Any]:
+    async def _shape_reply(
+        self,
+        ctx,
+        *,
+        text: str,
+        channel: str,
+        transport_source: str,
+        raw_meta: Mapping[str, Any] | None = None,
+        hypothesis: Mapping[str, Any] | None = None,
+        selected_action: str = "",
+    ) -> Dict[str, Any]:
         hormones = await ctx.get_kv("drive:hormones", {}) or {}
         wants = await ctx.get_kv("drive:want_vector", {}) or {}
         ddna = await ctx.get_kv("drive:ddna_modulators", {}) or {}
@@ -503,6 +543,14 @@ class NativeResponderNeuron(BaseNeuron):
         social_experimentation = await ctx.get_kv("drive:social_experimentation", {}) or {}
         thought_momentum = await ctx.get_kv("thought:momentum", {}) or {}
         raw_meta = raw_meta if isinstance(raw_meta, Mapping) else {}
+        hypothesis = hypothesis if isinstance(hypothesis, Mapping) else {}
+        hypothesis_pattern = hypothesis.get("pattern_analysis", {}) if isinstance(hypothesis.get("pattern_analysis", {}), Mapping) else {}
+        hypothesis_response_demand = _safe_float(hypothesis.get("response_demand", 0.0), 0.0)
+        hypothesis_should_respond = bool(hypothesis.get("should_respond", False))
+        hypothesis_uncertainty = _safe_float(hypothesis_pattern.get("uncertainty", 0.0), 0.0)
+        hypothesis_continuity = _safe_float(hypothesis_pattern.get("continuity", 0.0), 0.0)
+        hypothesis_statement_kind = str(hypothesis_pattern.get("statement_kind", "statement") or "statement")
+        selected_action = str(selected_action or hypothesis.get("recommended_action", "") or "")
         accent_value, accent_magnitude, accent_positive, accent_negative_severity, tone_label = _accent_from_meta(raw_meta)
 
         text_norm = _norm(text)
@@ -554,6 +602,12 @@ class NativeResponderNeuron(BaseNeuron):
 
         if momentum_pressure >= 0.20:
             direct_bonus += min(0.08, momentum_pressure * 0.07)
+        if hypothesis_should_respond:
+            direct_bonus += min(0.24, hypothesis_response_demand * 0.24)
+        if selected_action in {"clarify", "ask_followup"}:
+            direct_bonus += min(0.08, hypothesis_uncertainty * 0.08)
+        elif selected_action in {"acknowledge", "acknowledge_revision", "continue_thread", "reflect"}:
+            direct_bonus += min(0.08, hypothesis_continuity * 0.08)
 
         outward_urge = _clamp((externalize * expression_bias) + (0.18 * connect) + (0.10 * continuity) + (0.08 * social_level) + direct_bonus)
         brake = _clamp((withhold * restraint_bias) + (0.10 * caution))
@@ -567,7 +621,7 @@ class NativeResponderNeuron(BaseNeuron):
                     "interruption_cost": 0.0,
                     "redundancy": 0.0,
                     "confidence": 0.65,
-                    "direct_address": 1.0 if (is_question or direct_response_request) else 0.0,
+                    "direct_address": 1.0 if (is_question or direct_response_request or hypothesis_should_respond) else 0.0,
                     "recent_user": 1.0,
                     "answered": 0.0,
                     "recent_reply": 0.0,
@@ -605,6 +659,9 @@ class NativeResponderNeuron(BaseNeuron):
         )
         if is_question or direct_response_request or parse_request or say_request or greeting:
             release_score = max(release_score, direct_reply_floor)
+        elif hypothesis_should_respond:
+            hypothesis_floor = min(0.38, 0.16 + (0.22 * hypothesis_response_demand))
+            release_score = max(release_score, hypothesis_floor)
 
         terse = _clamp(
             (0.55 * restraint_bias)
@@ -649,13 +706,17 @@ class NativeResponderNeuron(BaseNeuron):
         if sleep_quiet_brake >= 0.70:
             suppress = True
             reason = "rosehip_sleep_quiet"
-        elif not (is_question or direct_response_request or parse_request or say_request or greeting):
+        elif not (is_question or direct_response_request or parse_request or say_request or greeting or hypothesis_should_respond):
             if release_score < 0.18:
                 suppress = True
                 reason = "low_release_score"
 
         mode = "direct"
-        if clarify_first >= 0.52 and is_question and not parse_request and not say_request:
+        if selected_action in {"clarify", "ask_followup"}:
+            mode = "clarify"
+        elif selected_action in {"acknowledge", "acknowledge_revision"}:
+            mode = "ack"
+        elif clarify_first >= 0.52 and is_question and not parse_request and not say_request:
             mode = "clarify"
         elif release_score < 0.28 and not (is_question or direct_response_request):
             mode = "ack"
@@ -689,6 +750,12 @@ class NativeResponderNeuron(BaseNeuron):
             "accent_positive": round(accent_positive, 4),
             "accent_negative_severity": round(accent_negative_severity, 4),
             "tone_label": tone_label,
+            "hypothesis_should_respond": hypothesis_should_respond,
+            "hypothesis_response_demand": round(hypothesis_response_demand, 4),
+            "hypothesis_uncertainty": round(hypothesis_uncertainty, 4),
+            "hypothesis_continuity": round(hypothesis_continuity, 4),
+            "hypothesis_statement_kind": hypothesis_statement_kind,
+            "selected_action": selected_action,
         }
 
     async def _build_response(self, ctx, *, text: str, shape: Dict[str, Any], payload: Dict[str, Any]) -> str:
@@ -833,12 +900,6 @@ class NativeResponderNeuron(BaseNeuron):
                     for cell_id in list(answer_meta.get("selected_cell_ids", []) or [])
                     if str(cell_id or "")
                 ]
-                if selected_cell_ids and isinstance(mem_store, MemCellStore):
-                    for cell_id in selected_cell_ids[:6]:
-                        try:
-                            mem_store.note_cell_usage(cell_id, success=True)
-                        except Exception:
-                            pass
                 await ctx.set_kv(
                     "composer:last_answer_bundle",
                     {

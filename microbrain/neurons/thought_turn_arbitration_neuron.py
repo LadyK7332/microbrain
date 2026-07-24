@@ -8,6 +8,7 @@ from typing import Any, Iterable, Mapping
 from microbrain.hormone import derive_ddna_modulators
 from microbrain.orchestrator.neuron_base import BaseNeuron, Event, NeuronConfig
 from microbrain.orchestrator.orchestrator import Orchestrator
+from microbrain.utils.heartbeat_stream import PRIMARY_HEARTBEAT_TOPIC, heartbeat_reason, is_heartbeat_event
 
 NEURON_NAME = Path(__file__).stem
 
@@ -81,12 +82,12 @@ class ThoughtTurnArbitrationNeuron(BaseNeuron):
         drawer = await self._load_drawer(ctx, now)
         outputs: list[Event] = []
 
-        if event.topic == "clock/tick":
+        if is_heartbeat_event(event):
             due = self._due_drawer_thoughts(drawer, now)
             for thought in due:
                 self._recheck_thought(thought, await self._available_components(ctx), now)
             drawer = self._prune_and_rank(drawer, now)
-            state = self._turn_state(drawer, now, reason="clock/tick")
+            state = self._turn_state(drawer, now, reason=heartbeat_reason())
             await self._save_drawer(ctx, drawer, state)
             if due:
                 outputs.append(self._state_event(event, state))
@@ -663,6 +664,7 @@ def build_neurons(orchestrator: Orchestrator):
         name=NEURON_NAME,
         subscribed_topics=[
             "clock/tick",
+            PRIMARY_HEARTBEAT_TOPIC,
             "thought/internal",
             "drive/power_request",
             "drive:boredom",

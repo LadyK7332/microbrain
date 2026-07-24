@@ -6,6 +6,7 @@ from typing import Any, Iterable, Mapping
 
 from microbrain.orchestrator.neuron_base import BaseNeuron, Event, NeuronConfig
 from microbrain.orchestrator.orchestrator import Orchestrator
+from microbrain.utils.heartbeat_stream import PRIMARY_HEARTBEAT_TOPIC, is_heartbeat_event
 
 NEURON_NAME = Path(__file__).stem
 
@@ -136,7 +137,7 @@ class CapabilityCirculationNeuron(BaseNeuron):
                     await ctx.set_kv(f"capability:readiness:{readiness['thought_id']}", readiness)
                 outputs.append(self._readiness_event(event, readiness))
 
-        if changed or event.topic == "clock/tick":
+        if changed or is_heartbeat_event(event):
             await self._save_components(ctx, components, available, alias_available, state)
             outputs.append(self._state_event(event, state))
             if changed:
@@ -514,6 +515,7 @@ def build_neurons(orchestrator: Orchestrator):
         name=NEURON_NAME,
         subscribed_topics=[
             "clock/tick",
+            PRIMARY_HEARTBEAT_TOPIC,
             "power/state",
             "component/status",
             "equipment/status",

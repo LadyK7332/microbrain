@@ -175,14 +175,21 @@ class EventBus:
         """
         Return subscriber IDs that want this topic, sorted by priority.
 
-        For now we only support exact matches. Later we can extend this
-        method to support:
-        - wildcard topics (e.g. "percept/*")
-        - tag routing
-        - regex / pattern objects
-        without changing the dispatch logic.
+        Exact topic matching remains the neuron-routing default.  A subscriber
+        may additionally subscribe to the special ``"*"`` topic to observe the
+        complete bus.  This is intended for diagnostics/frontends and does not
+        change the topic contract used by neurons.
         """
-        return list(self._topic_index.get(topic, []))
+        exact = list(self._topic_index.get(topic, []))
+        observers = list(self._topic_index.get("*", []))
+        if not observers:
+            return exact
+
+        # De-duplicate a subscriber that intentionally registered both the exact
+        # topic and the all-event observer route, then preserve priority order.
+        merged = list(dict.fromkeys([*exact, *observers]))
+        merged.sort(key=lambda sid: self._subs_by_id[sid].priority, reverse=True)
+        return merged
 
     # ------------------------------------------------------------------
     # Dispatch

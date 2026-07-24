@@ -6,6 +6,7 @@ import logging
 import os
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -52,7 +53,7 @@ def build_arg_parser():
     p.add_argument(
         "--debug-tail",
         action="store_true",
-        help="(debug) If used with --ui textual, open a separate console tailing logs. If used alone, tail logs and exit.",
+        help="(debug) With Textual, open a separate log-tail console. Dashboard already includes internal logs.",
     )
     p.add_argument("--ollama-base", default="http://localhost:11434")
     p.add_argument("--model", default="mistral")
@@ -74,7 +75,7 @@ def build_arg_parser():
     p.add_argument("--voice", action="store_true")
     p.add_argument("--mic-device", type=int, default=None)
     p.add_argument("--sample-rate", type=int, default=16000)
-    p.add_argument("--ui", choices=["repl", "textual"], default="textual")
+    p.add_argument("--ui", choices=["repl", "textual", "dashboard"], default="textual")
     p.add_argument("--whisper-model", default="small.en")
     p.add_argument("--vad-aggressiveness", type=int, default=2)    
     
@@ -236,7 +237,7 @@ async def main_async(cfg: AppConfig):
     if getattr(cfg, 'memdir', None):
         log_file = str(Path(cfg.memdir) / 'logs' / 'microbrain.log')
     # In Textual mode, avoid printing logs to stdout (it can corrupt the TUI).
-    configure_logging(cfg.log_level, log_file=log_file, console=(ui_mode != 'textual'))
+    configure_logging(cfg.log_level, log_file=log_file, console=(ui_mode not in {'textual', 'dashboard'}))
 
     # Grab the running event loop so background threads (e.g. Vosk)
     # can safely schedule events into the orchestrator.
@@ -700,19 +701,46 @@ async def main_async(cfg: AppConfig):
         logger.exception("Failed to start read/slearn sidecar")
 
     # ------------------------------------------------------------------
-    # Heartbeat: drive "time passing" so neurons can act without external input
+    # Heartbeat: drive "time passing" as body infrastructure, not cognition.
     # ------------------------------------------------------------------
+    from microbrain.utils.heartbeat_stream import (
+        COMPAT_HEARTBEAT_TOPIC,
+        PRIMARY_HEARTBEAT_TOPIC,
+        heartbeat_meta,
+        heartbeat_payload,
+    )
+
     async def _clock_tick_loop():
-        # low rate by default; enough to drive boredom/babble without spam
+        # Low rate by default; enough to drive boredom/decay/cooldowns without
+        # promoting the raw pulse into cognition.  The compatibility alias is
+        # emitted first so older organs keep working while the primary stream
+        # becomes the authoritative body-side heartbeat.
         while True:
             await asyncio.sleep(0.5)
+            ts = time.time()
+            corr = uuid.uuid4().hex
             await orch.push_event(
-                "clock/tick",
-                {"ts": time.time()},
-                meta={"source": "system", "channel": "internal"},
+                COMPAT_HEARTBEAT_TOPIC,
+                heartbeat_payload(ts),
+                meta=heartbeat_meta(compat_alias=True),
+                source="mind.clock",
+                correlation_id=corr,
+            )
+            await orch.push_event(
+                PRIMARY_HEARTBEAT_TOPIC,
+                heartbeat_payload(ts),
+                meta=heartbeat_meta(),
+                source="mind.clock",
+                correlation_id=corr,
             )
 
     asyncio.create_task(_clock_tick_loop())
+
+    if getattr(cfg, "ui", "repl") == "dashboard":
+        logger.info("Starting native PySide6 dashboard …")
+        from microbrain.ui.dashboard.qt_runtime import run_dashboard_frontend
+        await run_dashboard_frontend(orch, memdir=cfg.memdir)
+        return
 
     if getattr(cfg, "ui", "repl") == "textual":
         logger.info("Starting Textual UI …")
@@ -768,11 +796,14 @@ def main():
         memdir = _resolve_memdir(getattr(args, "memdir", None))
         from microbrain.utils.debug_tail import tail_log, spawn_tail_window
 
-        # If we are launching the Textual UI, spawn a separate tail window and continue startup.
+        # Textual can use a separate tail window.  The native dashboard already
+        # contains raw event and organ/log panels, so --debug-tail is redundant.
         if getattr(args, "ui", "repl") == "textual":
             spawned, reason = spawn_tail_window(args.memdir)
             if not spawned:
                 logger.warning("debug-tail window spawn failed (%s); continuing without tail", reason)
+        elif getattr(args, "ui", "repl") == "dashboard":
+            logger.info("--debug-tail ignored: dashboard includes internal diagnostics")
         else:
             # REPL mode: act like a standalone tail command and exit.
             raise SystemExit(tail_log(args.memdir))
@@ -801,7 +832,12 @@ def main():
         spoken_reply_bias_ttl_s=float(getattr(args, "spoken_reply_bias_ttl", 45.0)),
     )
 
-    asyncio.run(main_async(cfg))
+    if getattr(cfg, "ui", "repl") == "dashboard":
+        from microbrain.ui.dashboard.qt_runtime import run_qt_async
+
+        run_qt_async(main_async(cfg))
+    else:
+        asyncio.run(main_async(cfg))
 
 if __name__ == "__main__":
     main()

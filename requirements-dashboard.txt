@@ -1,0 +1,5 @@
+# Optional native Windows/desktop dashboard dependencies.
+# Keep separate from the base/headless runtime so organs and servers do not
+# require a desktop GUI stack.
+PySide6>=6.8,<7
+qasync>=0.27,<1

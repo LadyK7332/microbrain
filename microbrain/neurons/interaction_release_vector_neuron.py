@@ -8,7 +8,94 @@ from typing import Any, Dict, Iterable
 from microbrain.orchestrator.neuron_base import BaseNeuron, Event, NeuronConfig
 from microbrain.orchestrator.orchestrator import Orchestrator
 
+# ---------------------------------------------------------------------------
+# Behavioral tuning
+# ---------------------------------------------------------------------------
+
+# How long a newly observed participant message can act as the immediate
+# interaction-pressure stimulus before InitiativeThresholdNeuron catches up.
+# Unit: seconds. Practical range: 2.0-60.0.
+INPUT_STIMULUS_WINDOW_S = 18.0
+
+# Minimum immediate pressure supplied by a fresh participant message.
+# Range: 0.0-1.0. Higher values make interaction pressure rise faster.
+INPUT_TALK_FLOOR = 0.58
+INPUT_THINK_FLOOR = 0.34
+INPUT_BASE_BOOST = 0.34
+
+# Base pressure contributions. Range: 0.0-1.0 each.
+PENDING_TEXT_BASE = 0.14
+QUESTION_BASE = 0.30
+RESPONSE_REQUEST_BASE = 0.28
+GREETING_BASE = 0.18
+DIRECT_ADDRESS_BASE = 0.14
+SHORT_FRAGMENT_BASE = 0.08
+QUESTION_COHERENCE_SCORE = 0.20
+STATEMENT_COHERENCE_SCORE = 0.08
+ERROR_LANGUAGE_BASE = 0.06
+CLARIFY_READY_BASE = 0.10
+
+# Pressure attenuation after an answer or clarification has already occurred.
+# Range: 0.0-1.0. Lower values vent more pressure.
+ANSWERED_PRESSURE_SCALE = 0.38
+CLARIFY_SAID_PRESSURE_SCALE = 0.72
+
+# Time for unresolved interaction pressure to reach full persistence.
+# Unit: seconds. Practical range: 15.0-600.0.
+PERSISTENCE_WINDOW_S = 120.0
+
+# Urgency fusion weights. These are intentionally visible because they define
+# how strongly each bodily signal contributes to interaction pressure.
+URGENCY_BASE_WEIGHT = 0.45
+URGENCY_TALK_WEIGHT = 0.28
+URGENCY_THINK_WEIGHT = 0.10
+URGENCY_PERSISTENCE_WEIGHT = 0.17
+URGENCY_SOCIAL_BID_BONUS = 0.08
+URGENCY_EXPLICIT_RESPONSE_BONUS = 0.08
+URGENCY_INTERRUPTION_PENALTY = 0.18
+
+# Outlet scoring defaults. These may still be overridden through KV controls.
+TEXTUAL_OUTLET_BIAS = 0.28
+AUDIO_OUTLET_BIAS = 0.10
+MOTION_OUTLET_BIAS = 0.03
+OUTLET_SUCCESS_WEIGHT = 0.40
+OUTLET_RELIEF_WEIGHT = 0.22
+OUTLET_LATENCY_WEIGHT = 0.16
+OUTLET_LATENCY_TARGET_S = 20.0
+
+# Style thresholds. Range: 0.0-1.0.
+GREETING_DIRECT_MAX_URGENCY = 0.65
+URGENT_QUESTION_MIN_URGENCY = 0.80
+STIMULUS_DIRECT_MIN_URGENCY = 0.50
+CLARIFY_DIRECT_MIN_URGENCY = 0.60
+
+# Emission gates. These may still be overridden through KV controls.
+SIGNAL_THRESHOLD = 0.50
+INPUT_SIGNAL_THRESHOLD = 0.36
+SIGNAL_COOLDOWN_S = 45.0
+QUIET_AFTER_RELIEF_S = 12.0
+CHARGING_RELEASE_MIN_URGENCY = 0.78
+
+# ---------------------------------------------------------------------------
+# Required static constants
+# ---------------------------------------------------------------------------
+
+# Fixed bus routes and identity markers. Changing these requires updating every
+# producer/subscriber that participates in the interaction-pressure protocol.
 NEURON_NAME = Path(__file__).stem
+
+# Unified response-ownership law. External participant turns are interpreted
+# and released by the hypothesis path. This neuron may measure and publish
+# pressure, but must not create a second outward reply for the same turn.
+# Do not change without redesigning the response arbitration protocol.
+HYPOTHESIS_OWNS_EXTERNAL_INTERACTION = True
+
+THOUGHT_TOPIC = "thought/internal"
+INTERACTION_REQUEST_TOPIC = "drive/interaction_request"
+SPEECH_REASON_TOPIC = "speech/reason"
+EXTERNAL_RESPONSE_OWNER = "hypothesis"
+INTERNAL_RESPONSE_OWNER = "interaction_release_vector"
+
 _GREETING_STARTS = (
     "hi",
     "hello",
@@ -29,6 +116,10 @@ _DIRECT_ADDRESS_MARKERS = (
     "mi-",
     " mi ",
 )
+
+_NON_PARTICIPANT_SOURCES = {"assistant", "system", "mb"}
+_RESPONSE_REQUEST_MARKERS = ("respond", "reply", "speak up", "can you hear me")
+_ERROR_LANGUAGE_MARKERS = ("error", "issue", "problem", "stuck", "not working")
 
 
 def _safe_float(x: Any, default: float) -> float:
@@ -86,7 +177,7 @@ class InteractionReleaseVectorNeuron(BaseNeuron):
         source = str(raw_meta.get("source", payload.get("source", "user")) or "user").lower()
         if not text:
             return "", channel, False
-        if source in {"assistant", "system", "mb"}:
+        if source in _NON_PARTICIPANT_SOURCES:
             return text, channel, False
         if bool(meta.get("control", False)) or bool(raw_meta.get("control", False)):
             return text, channel, False
@@ -151,21 +242,36 @@ class InteractionReleaseVectorNeuron(BaseNeuron):
             stim_text = self._clean_text(str(stimulus.get("text", "") or ""))
             stim_ts = _safe_float(stimulus.get("ts", 0.0), 0.0)
             stim_age = max(0.0, now - stim_ts) if stim_ts > 0.0 else 9999.0
-            stimulus_window = _safe_float(await ctx.get_kv("drive:interaction:input_stimulus_window_s", 18.0), 18.0)
+            stimulus_window = _safe_float(
+                await ctx.get_kv("drive:interaction:input_stimulus_window_s", INPUT_STIMULUS_WINDOW_S),
+                INPUT_STIMULUS_WINDOW_S,
+            )
             if stim_text and stim_age <= max(1.0, stimulus_window) and not pending_text:
                 pending_text = stim_text
                 pending_age = stim_age
                 pending_flags = {
                     "has_question": "?" in stim_text,
-                    "has_response_request": any(tok in stim_text.lower() for tok in ("respond", "reply", "speak up", "can you hear me")),
-                    "has_error_language": any(tok in stim_text.lower() for tok in ("error", "issue", "problem", "stuck", "not working")),
+                    "has_response_request": any(tok in stim_text.lower() for tok in _RESPONSE_REQUEST_MARKERS),
+                    "has_error_language": any(tok in stim_text.lower() for tok in _ERROR_LANGUAGE_MARKERS),
                     "short_fragment": len(stim_text.split()) <= 3,
                     "clarify_ready": False,
-                    "coherence_score": 0.20 if "?" in stim_text else 0.08,
+                    "coherence_score": QUESTION_COHERENCE_SCORE if "?" in stim_text else STATEMENT_COHERENCE_SCORE,
                     "from_input_stimulus": True,
                 }
-                talk_pressure = max(talk_pressure, _safe_float(await ctx.get_kv("drive:interaction:input_talk_floor", 0.58), 0.58))
-                think_pressure = max(think_pressure, _safe_float(await ctx.get_kv("drive:interaction:input_think_floor", 0.34), 0.34))
+                talk_pressure = max(
+                    talk_pressure,
+                    _safe_float(
+                        await ctx.get_kv("drive:interaction:input_talk_floor", INPUT_TALK_FLOOR),
+                        INPUT_TALK_FLOOR,
+                    ),
+                )
+                think_pressure = max(
+                    think_pressure,
+                    _safe_float(
+                        await ctx.get_kv("drive:interaction:input_think_floor", INPUT_THINK_FLOOR),
+                        INPUT_THINK_FLOOR,
+                    ),
+                )
         clarify_ready = bool(initiative.get("clarify_ready", pending_flags.get("clarify_ready", False)))
         interruption_cost = _clamp01(initiative.get("interruption_cost", 0.0))
         answered = _safe_bool(state.get("pending_answered", False), False)
@@ -181,40 +287,46 @@ class InteractionReleaseVectorNeuron(BaseNeuron):
 
         base = 0.0
         if pending_text:
-            base += 0.14
+            base += PENDING_TEXT_BASE
             if bool(pending_flags.get("from_input_stimulus", False)):
-                base += _safe_float(await ctx.get_kv("drive:interaction:input_base_boost", 0.34), 0.34)
+                base += _safe_float(
+                    await ctx.get_kv("drive:interaction:input_base_boost", INPUT_BASE_BOOST),
+                    INPUT_BASE_BOOST,
+                )
         if question:
-            base += 0.30
+            base += QUESTION_BASE
         if response_request:
-            base += 0.28
+            base += RESPONSE_REQUEST_BASE
         if greeting:
-            base += 0.18
+            base += GREETING_BASE
         if direct_address:
-            base += 0.14
+            base += DIRECT_ADDRESS_BASE
         if short_fragment:
-            base += 0.08
+            base += SHORT_FRAGMENT_BASE
         if error_language:
-            base += 0.06
+            base += ERROR_LANGUAGE_BASE
         if clarify_ready and pending_text:
-            base += 0.10
+            base += CLARIFY_READY_BASE
 
         if answered:
-            base *= 0.38
+            base *= ANSWERED_PRESSURE_SCALE
         if clarify_said:
-            base *= 0.72
+            base *= CLARIFY_SAID_PRESSURE_SCALE
 
-        persistence_window = _safe_float(await ctx.get_kv("drive:interaction:persistence_window_s", 120.0), 120.0)
+        persistence_window = _safe_float(
+            await ctx.get_kv("drive:interaction:persistence_window_s", PERSISTENCE_WINDOW_S),
+            PERSISTENCE_WINDOW_S,
+        )
         persistence = _clamp01(pending_age / max(1.0, persistence_window)) if pending_text else 0.0
 
         urgency = _clamp01(
-            (base * 0.45)
-            + (talk_pressure * 0.28)
-            + (think_pressure * 0.10)
-            + (persistence * 0.17)
-            + (0.08 if social_bid else 0.0)
-            + (0.08 if question or response_request else 0.0)
-            - (0.18 * interruption_cost)
+            (base * URGENCY_BASE_WEIGHT)
+            + (talk_pressure * URGENCY_TALK_WEIGHT)
+            + (think_pressure * URGENCY_THINK_WEIGHT)
+            + (persistence * URGENCY_PERSISTENCE_WEIGHT)
+            + (URGENCY_SOCIAL_BID_BONUS if social_bid else 0.0)
+            + (URGENCY_EXPLICIT_RESPONSE_BONUS if question or response_request else 0.0)
+            - (URGENCY_INTERRUPTION_PENALTY * interruption_cost)
         )
 
         return {
@@ -252,13 +364,31 @@ class InteractionReleaseVectorNeuron(BaseNeuron):
             success_rate = _clamp01(entry.get("success_rate", 0.0))
             avg_relief = max(0.0, _safe_float(entry.get("avg_relief", 0.0), 0.0))
             avg_latency = max(0.0, _safe_float(entry.get("avg_latency_s", 999.0), 999.0))
-            latency_score = 0.0 if avg_latency >= 999.0 else _clamp01(1.0 - (avg_latency / 20.0))
+            latency_score = (
+                0.0
+                if avg_latency >= 999.0
+                else _clamp01(1.0 - (avg_latency / OUTLET_LATENCY_TARGET_S))
+            )
             base_bias = {
-                "textual": _safe_float(await ctx.get_kv("drive:interaction:textual_bias", 0.28), 0.28),
-                "audio": _safe_float(await ctx.get_kv("drive:interaction:audio_bias", 0.10), 0.10),
-                "motion": _safe_float(await ctx.get_kv("drive:interaction:motion_bias", 0.03), 0.03),
+                "textual": _safe_float(
+                    await ctx.get_kv("drive:interaction:textual_bias", TEXTUAL_OUTLET_BIAS),
+                    TEXTUAL_OUTLET_BIAS,
+                ),
+                "audio": _safe_float(
+                    await ctx.get_kv("drive:interaction:audio_bias", AUDIO_OUTLET_BIAS),
+                    AUDIO_OUTLET_BIAS,
+                ),
+                "motion": _safe_float(
+                    await ctx.get_kv("drive:interaction:motion_bias", MOTION_OUTLET_BIAS),
+                    MOTION_OUTLET_BIAS,
+                ),
             }.get(outlet, 0.0)
-            score = base_bias + (success_rate * 0.40) + (min(avg_relief, 1.0) * 0.22) + (latency_score * 0.16)
+            score = (
+                base_bias
+                + (success_rate * OUTLET_SUCCESS_WEIGHT)
+                + (min(avg_relief, 1.0) * OUTLET_RELIEF_WEIGHT)
+                + (latency_score * OUTLET_LATENCY_WEIGHT)
+            )
             options.append({
                 "outlet": outlet,
                 "score": round(score, 4),
@@ -289,21 +419,21 @@ class InteractionReleaseVectorNeuron(BaseNeuron):
         clarify_ready = bool(pressure.get("clarify_ready", False))
 
         stimulus_input = bool(pressure.get("stimulus_input", False))
-        if greeting and urgency < 0.65:
+        if greeting and urgency < GREETING_DIRECT_MAX_URGENCY:
             style = "direct_simple"
             message = "greeting_pressure"
         elif question or response_request:
-            if urgency >= 0.80:
+            if urgency >= URGENT_QUESTION_MIN_URGENCY:
                 style = "urgent_direct"
                 message = "question_pressure_urgent"
             else:
                 style = "direct_simple"
                 message = "question_pressure"
         elif stimulus_input:
-            style = "direct_simple" if urgency >= 0.50 else "gentle_notice"
+            style = "direct_simple" if urgency >= STIMULUS_DIRECT_MIN_URGENCY else "gentle_notice"
             message = "stimulus_response_pressure"
         elif clarify_ready:
-            style = "gentle_notice" if urgency < 0.60 else "direct_simple"
+            style = "gentle_notice" if urgency < CLARIFY_DIRECT_MIN_URGENCY else "direct_simple"
             message = f"missing_variable:{pending_text}" if pending_text else "missing_variable"
         else:
             style = "gentle_notice"
@@ -318,10 +448,37 @@ class InteractionReleaseVectorNeuron(BaseNeuron):
         })
         return chosen
 
+    async def _response_ownership(self, ctx, pressure: Dict[str, Any]) -> Dict[str, Any]:
+        """Resolve who owns outward response selection for this pressure event.
+
+        The interaction drive may observe and publish pressure from participant
+        input, but the hypothesis path owns reply-or-silence selection for that
+        same external turn.  Internal interaction pressure remains eligible for
+        the legacy need-speech route.
+        """
+        pending_fp = str(pressure.get("pending_fingerprint", "") or "")
+        stimulus = await ctx.get_kv("drive:interaction:last_input_stimulus", {}) or {}
+        stimulus = stimulus if isinstance(stimulus, dict) else {}
+        stimulus_fp = str(stimulus.get("fingerprint", "") or "")
+        stimulus_corr = str(stimulus.get("correlation_id", "") or "")
+        external_match = bool(pending_fp and stimulus_fp and pending_fp == stimulus_fp)
+        hypothesis_owned = bool(HYPOTHESIS_OWNS_EXTERNAL_INTERACTION and external_match)
+        ownership = {
+            "owner": EXTERNAL_RESPONSE_OWNER if hypothesis_owned else INTERNAL_RESPONSE_OWNER,
+            "hypothesis_owned": hypothesis_owned,
+            "outward_speech_allowed": not hypothesis_owned,
+            "pending_fingerprint": pending_fp,
+            "stimulus_fingerprint": stimulus_fp,
+            "stimulus_correlation_id": stimulus_corr,
+        }
+        await ctx.set_kv("drive:interaction:last_response_ownership", ownership)
+        return ownership
+
     async def _emit_request(self, ctx, event: Event, pressure: Dict[str, Any], vector: Dict[str, Any], now: float) -> list[Event]:
         outlet = vector.get("outlet")
         style = str(vector.get("style", "direct_simple") or "direct_simple")
         message = str(vector.get("message", "interaction_pressure_open") or "interaction_pressure_open")
+        ownership = await self._response_ownership(ctx, pressure)
 
         pending = {
             "need": "interaction",
@@ -333,6 +490,8 @@ class InteractionReleaseVectorNeuron(BaseNeuron):
             "message": message,
             "pending_text": str(pressure.get("pending_text", "") or ""),
             "correlation_id": event.correlation_id,
+            "response_owner": ownership["owner"],
+            "outward_speech_allowed": ownership["outward_speech_allowed"],
         }
         await ctx.set_kv("drive:interaction_pending_request", pending)
         await ctx.set_kv("drive:interaction:last_signal_ts", now)
@@ -340,9 +499,9 @@ class InteractionReleaseVectorNeuron(BaseNeuron):
         await ctx.set_kv("drive:interaction:last_signal_fingerprint", str(pressure.get("pending_fingerprint", "") or ""))
 
         thought_text = "input_response_pressure"
-        return [
+        events = [
             Event(
-                topic="thought/internal",
+                topic=THOUGHT_TOPIC,
                 payload={
                     "text": thought_text,
                     "kind": "interaction_pressure",
@@ -363,28 +522,40 @@ class InteractionReleaseVectorNeuron(BaseNeuron):
                 },
             ),
             Event(
-                topic="drive/interaction_request",
+                topic=INTERACTION_REQUEST_TOPIC,
                 payload=pending,
-                source=self.name,
-                correlation_id=event.correlation_id,
-                meta={"need": "interaction", "outlet": outlet, "style": style},
-            ),
-            Event(
-                topic="speech/reason",
-                payload={
-                    **pending,
-                    "channel": "default",
-                },
                 source=self.name,
                 correlation_id=event.correlation_id,
                 meta={
                     "need": "interaction",
                     "outlet": outlet,
                     "style": style,
-                    "kind": "need_signal_reason",
+                    "response_owner": ownership["owner"],
+                    "outward_speech_allowed": ownership["outward_speech_allowed"],
                 },
             ),
         ]
+
+        if ownership["outward_speech_allowed"]:
+            events.append(
+                Event(
+                    topic=SPEECH_REASON_TOPIC,
+                    payload={
+                        **pending,
+                        "channel": "default",
+                    },
+                    source=self.name,
+                    correlation_id=event.correlation_id,
+                    meta={
+                        "need": "interaction",
+                        "outlet": outlet,
+                        "style": style,
+                        "kind": "need_signal_reason",
+                        "response_owner": ownership["owner"],
+                    },
+                )
+            )
+        return events
 
     async def process(self, event: Event, ctx) -> Iterable[Event]:
         now = time.time()
@@ -422,9 +593,18 @@ class InteractionReleaseVectorNeuron(BaseNeuron):
             return []
 
         urgency = _safe_float(pressure.get("urgency", 0.0), 0.0)
-        threshold = _safe_float(await ctx.get_kv("drive:interaction:signal_threshold", 0.50), 0.50)
+        threshold = _safe_float(
+            await ctx.get_kv("drive:interaction:signal_threshold", SIGNAL_THRESHOLD),
+            SIGNAL_THRESHOLD,
+        )
         if bool(pressure.get("stimulus_input", False)):
-            threshold = min(threshold, _safe_float(await ctx.get_kv("drive:interaction:input_signal_threshold", 0.36), 0.36))
+            threshold = min(
+                threshold,
+                _safe_float(
+                    await ctx.get_kv("drive:interaction:input_signal_threshold", INPUT_SIGNAL_THRESHOLD),
+                    INPUT_SIGNAL_THRESHOLD,
+                ),
+            )
         if urgency < threshold:
             return []
 
@@ -432,17 +612,23 @@ class InteractionReleaseVectorNeuron(BaseNeuron):
         last_signal_fp = str(await ctx.get_kv("drive:interaction:last_signal_fingerprint", "") or "")
         same_signal = bool(this_fp and last_signal_fp and this_fp == last_signal_fp)
         last_signal_ts = _safe_float(await ctx.get_kv("drive:interaction:last_signal_ts", 0.0), 0.0)
-        cooldown_s = _safe_float(await ctx.get_kv("drive:interaction:signal_cooldown_s", 45.0), 45.0)
+        cooldown_s = _safe_float(
+            await ctx.get_kv("drive:interaction:signal_cooldown_s", SIGNAL_COOLDOWN_S),
+            SIGNAL_COOLDOWN_S,
+        )
         if same_signal and last_signal_ts > 0.0 and (now - last_signal_ts) < cooldown_s:
             return []
 
         last_relief_ts = _safe_float(await ctx.get_kv("drive:interaction:last_relief_ts", 0.0), 0.0)
-        quiet_after_relief_s = _safe_float(await ctx.get_kv("drive:interaction:quiet_after_relief_s", 12.0), 12.0)
+        quiet_after_relief_s = _safe_float(
+            await ctx.get_kv("drive:interaction:quiet_after_relief_s", QUIET_AFTER_RELIEF_S),
+            QUIET_AFTER_RELIEF_S,
+        )
         if last_relief_ts > 0.0 and (now - last_relief_ts) < quiet_after_relief_s:
             return []
 
         # Keep it quieter while power is being actively handled.
-        if charging and urgency < 0.78:
+        if charging and urgency < CHARGING_RELEASE_MIN_URGENCY:
             return []
 
         return await self._emit_request(ctx, event, pressure, vector, now)
@@ -452,7 +638,7 @@ def build_neurons(orchestrator: Orchestrator):
     cfg = NeuronConfig(
         name=NEURON_NAME,
         subscribed_topics=["clock/tick", "percept/text", "act/speech", "event/relief/interaction"],
-        output_topics=["drive/interaction_request", "speech/reason"],
+        output_topics=[INTERACTION_REQUEST_TOPIC, SPEECH_REASON_TOPIC],
         priority=8,
         cooldown_sec=0.0,
     )

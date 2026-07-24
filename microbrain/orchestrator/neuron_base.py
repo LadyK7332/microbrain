@@ -20,6 +20,16 @@ from typing import (
 from abc import ABC, abstractmethod
 
 # ---------------------------------------------------------------------------
+# Required static constants
+# ---------------------------------------------------------------------------
+
+# Infrastructure pulses are scheduler/metabolism triggers, not semantic input.
+# They may wake explicitly subscribed organs, but they must never gain Hebbian
+# significance merely because they occur frequently.
+NON_SEMANTIC_INPUT_TOPICS = frozenset({"clock/tick"})
+NON_SEMANTIC_EVENT_CLASSES = frozenset({"infrastructure"})
+
+# ---------------------------------------------------------------------------
 # Core Event type
 # ---------------------------------------------------------------------------
 
@@ -217,13 +227,40 @@ class BaseNeuron(ABC):
     # Hebbian handling
     # ------------------------------------------------------------------
 
+    def _is_semantic_input(self, event: Event) -> bool:
+        """Return False for scheduler/telemetry events that are not cognition.
+
+        These events can still be delivered to neurons that explicitly subscribe
+        to them.  The distinction only prevents infrastructure frequency from
+        masquerading as semantic/associative evidence.
+        """
+        meta = event.meta if isinstance(event.meta, dict) else {}
+        if event.topic in NON_SEMANTIC_INPUT_TOPICS:
+            return False
+        if meta.get("semantic_input") is False:
+            return False
+        event_class = str(meta.get("event_class", "") or "").strip().lower()
+        if event_class in NON_SEMANTIC_EVENT_CLASSES:
+            return False
+        return True
+
+    def _event_reinforcement_eligible(self, event: Event) -> bool:
+        """Whether an input event may earn base Hebbian reinforcement."""
+        if not self._is_semantic_input(event):
+            return False
+        meta = event.meta if isinstance(event.meta, dict) else {}
+        return meta.get("reinforcement_eligible") is not False
+
     def _hebb_context_key(self, event: Event) -> str:
         """
-        Derive a simple context key from the event.
+        Derive a simple semantic context key from the event.
 
-        Subclasses can override this if they want more detailed
-        contexts (e.g. user id, semantic cluster, etc.).
+        Infrastructure triggers intentionally return an empty key so they remain
+        schedulers rather than learned associations.  Subclasses can override this
+        for richer semantic contexts, but should preserve this separation.
         """
+        if not self._is_semantic_input(event):
+            return ""
         return event.topic
 
     def get_hebbian_weight(self, key: str) -> float:
@@ -411,10 +448,12 @@ class BaseNeuron(ABC):
             await self.evaluate_goals(event, raw_outputs, ctx)
         )
 
-        # Only reinforce if we actually produced something
+        # Only semantic, explicitly eligible inputs may earn Hebbian weight.
+        # Scheduler/infrastructure pulses can still drive organ maintenance, but
+        # their frequency must never be mistaken for cognitive significance.
         context_key = self._hebb_context_key(event)
-        new_weight = self.get_hebbian_weight(context_key)
-        if gated_outputs:
+        new_weight = self.get_hebbian_weight(context_key) if context_key else 0.0
+        if gated_outputs and context_key and self._event_reinforcement_eligible(event):
             new_weight = self.reinforce_context(context_key)
             await ctx.log_debug(
                 f"[{self.name}] Reinforced context",

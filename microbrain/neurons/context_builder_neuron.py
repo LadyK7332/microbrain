@@ -119,6 +119,8 @@ class ContextBuilderNeuron(BaseNeuron):
                 "raw_meta": raw_meta,
                 "tokens": tokens,
                 "meaningful_tokens": meaningful_tokens,
+                "correlation_id": event.correlation_id,
+                "timestamp": float(event.timestamp or 0.0),
             },
             "recent": recent,
             "associations": associations,

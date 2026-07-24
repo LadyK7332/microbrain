@@ -118,6 +118,7 @@ class MemCellComposer:
             "tiers": {},
             "files_processed": 0,
             "rows_applied": 0,
+            "reinforcements_applied": 0,
             "bad_lines": 0,
         }
         with self._composer_lock():
@@ -127,6 +128,7 @@ class MemCellComposer:
                     status["tiers"][tier] = tier_status
                     status["files_processed"] += int(tier_status["files_processed"])
                     status["rows_applied"] += int(tier_status["rows_applied"])
+                    status["reinforcements_applied"] += int(tier_status.get("reinforcements_applied", 0))
                     status["bad_lines"] += int(tier_status["bad_lines"])
         status["finished_at"] = time.time()
         status["elapsed_s"] = round(status["finished_at"] - status["started_at"], 4)
@@ -135,14 +137,20 @@ class MemCellComposer:
     def _compose_tier(self, tier: str) -> Dict[str, Any]:
         tier = self._coerce_tier(tier)
         files = self.pending_files(tier)
-        status = {"files_processed": 0, "rows_applied": 0, "bad_lines": 0, "pending_remaining": 0}
+        status = {
+            "files_processed": 0,
+            "rows_applied": 0,
+            "reinforcements_applied": 0,
+            "bad_lines": 0,
+            "pending_remaining": 0,
+        }
         if not files:
             status["pending_remaining"] = 0
             return status
 
         # Direct mode store is the only canonical writer.
         store = MemCellStore(self.base_dir, composer_enabled=False, writer_id="memory_composer")
-        rows_to_apply: List[tuple[Dict[str, Any], bool]] = []
+        operations: List[Dict[str, Any]] = []
         processing_dir = self.processing_root / tier
         processing_dir.mkdir(parents=True, exist_ok=True)
         moved_files: List[Path] = []
@@ -163,19 +171,40 @@ class MemCellComposer:
                 if envelope is None:
                     status["bad_lines"] += 1
                     continue
+                op = str(envelope.get("op", "upsert") or "upsert") if isinstance(envelope, dict) else ""
+                if op == "reinforce":
+                    update = envelope.get("update") if isinstance(envelope, dict) else None
+                    if not isinstance(update, dict) or not str(update.get("cell_id", "") or "").strip():
+                        status["bad_lines"] += 1
+                        continue
+                    operations.append({"op": "reinforce", "update": dict(update)})
+                    continue
+
                 row = envelope.get("row") if isinstance(envelope, dict) else None
                 if not isinstance(row, dict):
                     status["bad_lines"] += 1
                     continue
-                rows_to_apply.append((row, bool(envelope.get("touch", True))))
+                operations.append({"op": "upsert", "row": dict(row), "touch": bool(envelope.get("touch", True))})
 
-        if rows_to_apply:
-            for row, touch in rows_to_apply:
-                store.upsert_cell(row, tier=str(row.get("tier", tier) or tier), touch=touch, flush=False)
+        if operations:
+            touched_tiers: set[str] = set()
+            for operation in operations:
+                if operation.get("op") == "reinforce":
+                    update = dict(operation.get("update", {}) or {})
+                    update_tier = self._coerce_tier(str(update.get("tier", tier) or tier))
+                    if store.apply_reinforcement(update, tier=update_tier, flush=False) is not None:
+                        status["reinforcements_applied"] += 1
+                        touched_tiers.add(update_tier)
+                    continue
+
+                row = dict(operation.get("row", {}) or {})
+                row_tier = self._coerce_tier(str(row.get("tier", tier) or tier))
+                store.upsert_cell(row, tier=row_tier, touch=bool(operation.get("touch", True)), flush=False)
                 status["rows_applied"] += 1
+                touched_tiers.add(row_tier)
+
             # One canonical write per touched tier, not one per writer.
-            touched_tiers = sorted({self._coerce_tier(str(row.get("tier", tier) or tier)) for row, _touch in rows_to_apply})
-            for touched_tier in touched_tiers:
+            for touched_tier in sorted(touched_tiers):
                 store.flush_tier(touched_tier)
 
         for processing in moved_files:

@@ -632,7 +632,6 @@ class SpeechReasonNeuron(BaseNeuron):
             return []
 
         await self._update_pending_request(ctx, event, chosen)
-        await self._note_usage(ctx, chosen)
         await ctx.set_kv(
             "speech_reason:last",
             {
@@ -655,6 +654,7 @@ class SpeechReasonNeuron(BaseNeuron):
             "utterance_style": str(payload.get("style", "direct_simple") or "direct_simple"),
             "utterance_source": chosen.get("source", "fallback"),
             "utterance_score": round(self._safe_float(chosen.get("score", 0.0), 0.0), 4),
+            "memory_cell_ids": [str(chosen.get("cell_id", "") or "")] if str(chosen.get("cell_id", "") or "") else [],
         })
 
         return [
@@ -664,6 +664,7 @@ class SpeechReasonNeuron(BaseNeuron):
                     "text": utterance,
                     "style": "assistant",
                     "channel": str(payload.get("channel", "default") or "default"),
+                    "memory_cell_ids": [str(chosen.get("cell_id", "") or "")] if str(chosen.get("cell_id", "") or "") else [],
                 },
                 source=self.name,
                 correlation_id=event.correlation_id,
