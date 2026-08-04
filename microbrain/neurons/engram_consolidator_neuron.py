@@ -9,7 +9,10 @@ from typing import Any, Dict, Iterable, List
 from microbrain.orchestrator.neuron_base import BaseNeuron, NeuronConfig, Event
 from microbrain.utils.memdir import resolve_memdir_ctx
 
+from microbrain.utils.heartbeat_stream import service_topic
+
 NEURON_NAME = Path(__file__).stem
+SERVICE_TOPIC = service_topic("memory")
 
 
 def _sha_id(*parts: str) -> str:
@@ -43,7 +46,7 @@ class EngramConsolidatorNeuron(BaseNeuron):
     """
 
     async def process(self, event: Event, ctx) -> Iterable[Event]:
-        if event.topic != "clock/tick":
+        if event.topic != SERVICE_TOPIC:
             return []
 
         now = time.time()
@@ -238,7 +241,7 @@ class EngramConsolidatorNeuron(BaseNeuron):
 def build_neurons(orchestrator):
     cfg = NeuronConfig(
         name=NEURON_NAME,
-        subscribed_topics=["clock/tick"],
+        subscribed_topics=[SERVICE_TOPIC],
         output_topics=["act/speech"],
         priority=7,
         cooldown_sec=0.0,

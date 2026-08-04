@@ -200,7 +200,7 @@ class MemoryLoggerNeuron(BaseNeuron):
             # Keep logging failures from killing the brain
             self.debug("mem_store_error", error=str(e))
 
-        # --- Write to mem_cell/now -----------------------------------------------
+        # --- Write to mem_cell/hot -----------------------------------------------
         try:
             if mem_cell_store is not None and role in ("user", "assistant"):
                 ingest_result = mem_cell_store.ingest_text(
@@ -210,7 +210,7 @@ class MemoryLoggerNeuron(BaseNeuron):
                     transport_source=transport_source,
                     source=str(event.source or role),
                     meta=dict(event.meta or {}),
-                    tier="now",
+                    tier="hot",
                 )
                 await ctx.set_kv("memory:last_memcell_ingest", {
                     "utterance_id": str((ingest_result.get("utterance", {}) or {}).get("id", "") or ""),
@@ -218,6 +218,7 @@ class MemoryLoggerNeuron(BaseNeuron):
                     "pattern_ids": [str((c or {}).get("id", "") or "") for c in ingest_result.get("patterns", [])],
                     "word_role_ids": [str((c or {}).get("id", "") or "") for c in ingest_result.get("word_roles", [])],
                     "thought_template_ids": [str((c or {}).get("id", "") or "") for c in ingest_result.get("thought_templates", [])],
+                    "clause_frame_ids": [str((c or {}).get("id", "") or "") for c in ingest_result.get("clause_frames", [])],
                     "general_patterns": [str((c or {}).get("id", "") or "") for c in ingest_result.get("general_patterns", [])],
                     "linker_ids": [str((c or {}).get("id", "") or "") for c in ingest_result.get("linkers", [])],
                 })

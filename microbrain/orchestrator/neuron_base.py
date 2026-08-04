@@ -19,6 +19,13 @@ from typing import (
 )
 from abc import ABC, abstractmethod
 
+from microbrain.utils.heartbeat_stream import (
+    PRIMARY_HEARTBEAT_TOPIC,
+    canonical_subscription_topic,
+    canonical_topic,
+    is_infrastructure_event,
+)
+
 # ---------------------------------------------------------------------------
 # Required static constants
 # ---------------------------------------------------------------------------
@@ -26,7 +33,7 @@ from abc import ABC, abstractmethod
 # Infrastructure pulses are scheduler/metabolism triggers, not semantic input.
 # They may wake explicitly subscribed organs, but they must never gain Hebbian
 # significance merely because they occur frequently.
-NON_SEMANTIC_INPUT_TOPICS = frozenset({"clock/tick"})
+NON_SEMANTIC_INPUT_TOPICS = frozenset({"clock/tick", PRIMARY_HEARTBEAT_TOPIC})
 NON_SEMANTIC_EVENT_CLASSES = frozenset({"infrastructure"})
 
 # ---------------------------------------------------------------------------
@@ -146,7 +153,9 @@ class BaseNeuron(ABC):
         self._name = name or self.__class__.__name__
 
         # subscription & output bookkeeping
-        self._subscribed_topics: set[str] = set(config.subscribed_topics or [])
+        self._subscribed_topics: set[str] = {
+            canonical_subscription_topic(topic) for topic in (config.subscribed_topics or [])
+        }
         self._output_topics: List[str] = list(config.output_topics or [])
 
         # Hebbian weights keyed by a simple context key (e.g. topic name)
@@ -191,7 +200,7 @@ class BaseNeuron(ABC):
         return tuple(self._subscribed_topics)
 
     def subscribe(self, *topics: str) -> None:
-        self._subscribed_topics.update(topics)
+        self._subscribed_topics.update(canonical_subscription_topic(topic) for topic in topics)
 
     @property
     def output_topics(self) -> Sequence[str]:
@@ -214,7 +223,7 @@ class BaseNeuron(ABC):
         - regex
         - tag-based routing
         """
-        return topic in self._subscribed_topics
+        return canonical_topic(topic) in self._subscribed_topics
 
     def _is_in_cooldown(self, now: Optional[float] = None) -> bool:
         if self.config.cooldown_sec <= 0:
@@ -235,6 +244,8 @@ class BaseNeuron(ABC):
         masquerading as semantic/associative evidence.
         """
         meta = event.meta if isinstance(event.meta, dict) else {}
+        if is_infrastructure_event(event):
+            return False
         if event.topic in NON_SEMANTIC_INPUT_TOPICS:
             return False
         if meta.get("semantic_input") is False:
@@ -427,15 +438,22 @@ class BaseNeuron(ABC):
         if not self.matches_topic(event.topic):
             return []
 
-        if self._is_in_cooldown(now):
+        infrastructure_input = is_infrastructure_event(event)
+
+        # Semantic cooldown and body cadence are independent clocks. A recent
+        # cognitive/perceptual firing must not suppress housekeeping, and a body
+        # service opportunity must never consume the semantic cooldown itself.
+        if not infrastructure_input and self._is_in_cooldown(now):
             await ctx.log_debug(
                 f"[{self.name}] Skipping event due to cooldown",
                 topic=event.topic,
             )
             return []
 
-        # Decay old weights
-        self._apply_hebbian_decay(now)
+        # Body/infrastructure pulses are scheduling only. They must not mutate
+        # associative/Hebbian state merely because they occur frequently.
+        if not infrastructure_input:
+            self._apply_hebbian_decay(now)
 
         start = time.perf_counter()
 
@@ -447,6 +465,20 @@ class BaseNeuron(ABC):
         gated_outputs = list(
             await self.evaluate_goals(event, raw_outputs, ctx)
         )
+
+        # A body service pulse may legitimately cause a meaningful state event
+        # (for example a cooldown expiring), but the heartbeat/service correlation
+        # itself must never become the cognitive trace identity. Detach any
+        # inherited correlation at this hard boundary.
+        if infrastructure_input:
+            for output in gated_outputs:
+                if not isinstance(output, Event) or is_infrastructure_event(output):
+                    continue
+                if output.correlation_id == event.correlation_id:
+                    output.correlation_id = uuid.uuid4().hex
+                    if not isinstance(output.meta, dict):
+                        output.meta = {}
+                    output.meta.setdefault("infrastructure_correlation_detached", True)
 
         # Only semantic, explicitly eligible inputs may earn Hebbian weight.
         # Scheduler/infrastructure pulses can still drive organ maintenance, but
@@ -464,17 +496,24 @@ class BaseNeuron(ABC):
         end = time.perf_counter()
         latency_ms = (end - start) * 1000.0
 
-        # Record trace for tooling / visualization
-        self._record_activation(
-            timestamp=now,
-            event=event,
-            outputs=gated_outputs,
-            latency_ms=latency_ms,
-            hebbian_context=context_key,
-            hebbian_weight_after=new_weight,
-        )
+        # Infrastructure cadence must not crowd semantic activation history.
+        # It can be explicitly traced during scheduler debugging with
+        # meta["trace_activation"] = True.
+        trace_infrastructure = bool((event.meta or {}).get("trace_activation", False))
+        if not infrastructure_input or trace_infrastructure:
+            self._record_activation(
+                timestamp=now,
+                event=event,
+                outputs=gated_outputs,
+                latency_ms=latency_ms,
+                hebbian_context=context_key,
+                hebbian_weight_after=new_weight,
+            )
 
-        self._last_fire_time = now
+        # Likewise, a service pulse must not consume a neuron's semantic cooldown
+        # and accidentally suppress a real percept arriving a few milliseconds later.
+        if not infrastructure_input:
+            self._last_fire_time = now
         return gated_outputs
 
     # ------------------------------------------------------------------

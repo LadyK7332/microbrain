@@ -422,6 +422,40 @@ class TextInputNeuron(BaseNeuron):
                 merged_meta.setdefault("noun_label", noun_label)
 
         # ----------------------------------------------
+        # 2.9) Short-lived visual attention/deictic anchor
+        # ----------------------------------------------
+        # A dashboard click is equivalent to pointing: it tells cognition which
+        # current visual object the next user turn is about, but does not assign
+        # an identity or turn the user's later claim into ground truth.
+        if source == "user" and not leading_slash_command:
+            anchor = await ctx.get_kv("vision:attention_anchor", None)
+            if isinstance(anchor, dict):
+                now = time.time()
+                expires_at = float(anchor.get("expires_at", 0.0) or 0.0)
+                remaining = int(anchor.get("remaining_turns", 0) or 0)
+                if expires_at > now and remaining > 0 and str(anchor.get("track_id") or ""):
+                    visual_ref = dict(anchor)
+                    # This metadata is context, not a semantic assertion.
+                    visual_ref["bound_to_input_ts"] = now
+                    visual_ref["semantics"] = "attention_only_not_identity_assertion"
+                    merged_meta["visual_attention_ref"] = visual_ref
+                    words = set(re.findall(r"[a-zA-Z']+", text_norm.lower()))
+                    if words & {"this", "that", "it", "these", "those", "thing", "object"}:
+                        merged_meta["deictic_binding_hint"] = str(anchor.get("track_id") or "")
+                    remaining -= 1
+                    if remaining <= 0:
+                        await ctx.set_kv("vision:attention_anchor", None)
+                        await ctx.set_kv("attention:visual_ref", None)
+                    else:
+                        anchor = dict(anchor)
+                        anchor["remaining_turns"] = remaining
+                        await ctx.set_kv("vision:attention_anchor", anchor)
+                        await ctx.set_kv("attention:visual_ref", anchor)
+                elif expires_at <= now or remaining <= 0:
+                    await ctx.set_kv("vision:attention_anchor", None)
+                    await ctx.set_kv("attention:visual_ref", None)
+
+        # ----------------------------------------------
         # 3) Construct normalized percept payload
         # ----------------------------------------------
         percept_payload: Dict[str, Any] = {
@@ -1396,7 +1430,10 @@ class TextInputNeuron(BaseNeuron):
             active_file = str(await ctx.get_kv("slearn:active_file", "") or "")
             chunk_index = int(await ctx.get_kv("slearn:chunk_index", 0) or 0)
             emitted_total = int(await ctx.get_kv("slearn:rules_emitted_total", 0) or 0)
+            staged_total = int(await ctx.get_kv("slearn:rules_staged_total", emitted_total) or emitted_total)
             applied_total = int(await ctx.get_kv("slearn:rules_applied_total", 0) or 0)
+            mode = str(await ctx.get_kv("slearn:mode", "") or "")
+            status = str(await ctx.get_kv("slearn:status", "") or "")
             done_count = int(await ctx.get_kv("slearn:files_completed_count", 0) or 0)
             audit_path = str(await ctx.get_kv("slearn:audit_path", "") or "")
 
@@ -1409,7 +1446,9 @@ class TextInputNeuron(BaseNeuron):
                 msg += f"\nSidecar error: {sidecar_error}"
             if active_file:
                 msg += f"\nActive: {active_file} @ chunk {chunk_index}"
-            msg += f"\nProgress: files_done={done_count} emitted_total={emitted_total} applied_total={applied_total}"
+            msg += f"\nProgress: files_done={done_count} staged_total={staged_total} applied_total={applied_total}"
+            if mode or status:
+                msg += f" | mode={mode or '—'} status={status or '—'}"
             if audit_path:
                 msg += f"\nAudit: {audit_path}"
             if isinstance(last, dict):
@@ -1474,6 +1513,7 @@ class TextInputNeuron(BaseNeuron):
                 "Structured learning sheet format: one rule per line. Lines beginning with # are ignored.\n"
                 "IF USER says moin THEN CLASSIFY social_greeting, warmth, friendly AND REPLY good morning\n"
                 "IF USER says thanks THEN CLASSIFY gratitude, warmth, friendly AND REPLY you're welcome\n"
+                "IF USER says \"say {payload}\" THEN CLASSIFY literal_repeat AND REPLY \"{payload}\"\n"
                 "IF USER says stop THEN CLASSIFY boundary, user_serious AND NOT REPLY playful\n"
                 "IF POWER is low THEN CLASSIFY need_power, energy_deficit, homeostasis\n"
                 "IF OBJECT detected THEN CLASSIFY base_object, noticed_thing\n"

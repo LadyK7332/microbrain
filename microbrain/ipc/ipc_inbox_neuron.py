@@ -9,7 +9,10 @@ from microbrain.orchestrator.neuron_base import BaseNeuron, NeuronConfig, Event
 from microbrain.orchestrator.orchestrator import Orchestrator
 from microbrain.utils.memdir import resolve_memdir_ctx
 
+from microbrain.utils.heartbeat_stream import service_topic
+
 NEURON_NAME = Path(__file__).stem
+SERVICE_TOPIC = service_topic("ipc")
 
 ALLOWED_PREFIXES = ("rt/", "percept/", "act/", "plan/", "input/")
 
@@ -42,7 +45,7 @@ class IpcInboxNeuron(BaseNeuron):
     """
 
     async def process(self, event: Event, ctx) -> Iterable[Event]:
-        if event.topic != "clock/tick":
+        if event.topic != SERVICE_TOPIC:
             return []
 
         memdir = Path(await resolve_memdir_ctx(ctx, fallback=r"Z:\memory"))
@@ -153,7 +156,7 @@ class IpcInboxNeuron(BaseNeuron):
 def build_neurons(orchestrator: Orchestrator):
     cfg = NeuronConfig(
         name=NEURON_NAME,
-        subscribed_topics=["clock/tick"],
+        subscribed_topics=[SERVICE_TOPIC],
         output_topics=[],
         priority=5,
         cooldown_sec=0.25,

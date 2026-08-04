@@ -6,7 +6,7 @@ import asyncio
 
 from microbrain.orchestrator.event_bus import Event
 from microbrain.orchestrator.orchestrator import Orchestrator
-from microbrain.utils.heartbeat_stream import is_heartbeat_event
+from microbrain.utils.heartbeat_stream import is_infrastructure_event
 
 from .textual_app import MicroBrainUI, UIMessage
 
@@ -21,7 +21,7 @@ async def run_textual_frontend(orch: Orchestrator, *, memdir: str | None = None)
 
     async def _ui_tap(ev: Event) -> list[Event]:
         # Drop noisy internal ticks by default; UI would spam.
-        if is_heartbeat_event(ev):
+        if is_infrastructure_event(ev):
             return []
         meta = dict(ev.meta or {})
         # The Textual face should not show internal reasoning/request plumbing

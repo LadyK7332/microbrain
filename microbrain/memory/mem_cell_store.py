@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from microbrain.memory.memory_store import JSONLStore
+from microbrain.language_scaffold import analyze_english_structure
 
 # ---------------------------------------------------------------------------
 # Behavioral tuning
@@ -47,7 +48,10 @@ ATOMIC_REPLACE_DELAY_S = 0.05
 # Required static constants
 # ---------------------------------------------------------------------------
 
-TIERS = ("now", "short", "long", "learned")
+TIERS = ("hot", "now", "short", "long", "learned")
+HOT_MEMORY_TTL_HOURS = 3.0
+HOT_MEMORY_MIN_ENCOUNTERS_FOR_NOW = 2
+HOT_MEMORY_NOW_HOLD_HOURS = 24.0
 TOKEN_RE = re.compile(r"[a-z0-9']+")
 PENDING_REINFORCEMENT_SCHEMA = "mem_cell.pending_reinforce.v1"
 PENDING_REINFORCEMENT_OPERATION = "reinforce"
@@ -115,6 +119,7 @@ class MemCellStore:
         self._tier_locks: Dict[str, threading.RLock] = {}
         self._dirty_tier_rows: Dict[str, Dict[str, Dict[str, Any]]] = {}
         self._dirty_seq: int = 0
+        self._last_staged_paths: Dict[str, List[str]] = {}
         for tier in TIERS:
             (self.mem_cell_dir / tier).mkdir(parents=True, exist_ok=True)
         self.derived_dir.mkdir(parents=True, exist_ok=True)
@@ -265,12 +270,44 @@ class MemCellStore:
                 f.flush()
                 os.fsync(f.fileno())
             tmp.replace(final)
+            staged_paths = self._last_staged_paths.setdefault(tier, [])
+            staged_paths.append(str(final))
+            self._last_staged_paths[tier] = staged_paths[-512:]
             return len(clean_rows)
         finally:
             try:
                 tmp.unlink(missing_ok=True)
             except OSError:
                 pass
+
+    def stage_cells(self, rows: Sequence[Dict[str, Any]], *, tier: str = "now", touch: bool = True) -> int:
+        """Stage a batch of already-built cells with one composer envelope file.
+
+        Bulk organs use this to avoid loading/re-writing the whole in-memory tier
+        merely to enqueue deterministic cells.  Direct-memory mode still applies
+        the same rows and performs one final tier flush.
+        """
+        tier = self._coerce_tier(tier)
+        clean_rows = [dict(row) for row in (rows or []) if isinstance(row, dict)]
+        if not clean_rows:
+            return 0
+        if self.composer_enabled and tier != "hot":
+            return self._stage_rows_for_composer(tier, clean_rows, touch=touch)
+        for row in clean_rows:
+            self.upsert_cell(row, tier=tier, touch=touch, flush=False)
+        self.flush_tier(tier)
+        return len(clean_rows)
+
+    def take_staged_paths(self, tier: str) -> List[str]:
+        """Return and clear composer receipt paths staged by this store instance."""
+        tier = self._coerce_tier(tier)
+        paths = list(self._last_staged_paths.get(tier, []) or [])
+        self._last_staged_paths[tier] = []
+        return paths
+
+    def dirty_count(self, tier: str) -> int:
+        tier = self._coerce_tier(tier)
+        return len(self._dirty_tier_rows.get(tier, {}) or {})
 
     def _stage_reinforcement_ops_for_composer(self, tier: str, updates: Sequence[Dict[str, Any]]) -> int:
         """Stage additive reinforcement deltas for the single memory composer.
@@ -695,7 +732,7 @@ class MemCellStore:
     def flush_tier(self, tier: str) -> None:
         tier = self._coerce_tier(tier)
         with self._tier_lock(tier):
-            if self.composer_enabled:
+            if self.composer_enabled and tier != "hot":
                 self._stage_dirty_rows(tier)
                 return
             self._write_shard(tier, self._load_tier_rows(tier))
@@ -1013,6 +1050,83 @@ class MemCellStore:
                 break
         return " ".join(out).strip()
 
+    @staticmethod
+    def _structure_role_override(
+        role_info: Dict[str, str],
+        structure: Mapping[str, Any] | None,
+        idx: int,
+    ) -> Dict[str, str]:
+        """Let sentence structure refine only otherwise-generic word roles.
+
+        Closed-class/special lexical roles remain authoritative. The structure
+        analyzer mainly helps unknown content words such as the invented verb in
+        "the glorp snorp the flib".
+        """
+        info = dict(role_info or {})
+        if not structure:
+            return info
+        candidates = list(structure.get("role_candidates", []) or [])
+        if idx < 0 or idx >= len(candidates) or not isinstance(candidates[idx], Mapping):
+            return info
+        candidate = candidates[idx]
+        best_role = str(candidate.get("best_role", "") or "").strip().lower()
+        confidence = float(candidate.get("confidence", 0.0) or 0.0)
+        current = str(info.get("tool_role", "") or "")
+        generic = current in {"entity_anchor", "entity_or_concept_anchor", "unknown_word_tool"}
+        if not generic or confidence < 0.40:
+            return info
+
+        if best_role == "verb":
+            info.update({
+                "part_of_speech": "verb",
+                "tool_role": "action_or_process",
+                "functional_role": "relation_or_action_binding",
+                "thought_use": "binds_change_or_task",
+            })
+        elif best_role == "adjective":
+            info.update({
+                "part_of_speech": "adjective",
+                "tool_role": "attribute_modifier",
+                "functional_role": "modifier_binding",
+                "thought_use": "modifies_entity_quality",
+            })
+        elif best_role == "adverb":
+            info.update({
+                "part_of_speech": "adverb",
+                "tool_role": "manner_modifier",
+                "functional_role": "modifier_binding",
+                "thought_use": "modifies_action_quality",
+            })
+        elif best_role == "auxiliary":
+            info.update({
+                "part_of_speech": "verb",
+                "tool_role": "state_or_auxiliary_relation",
+                "functional_role": "relation_or_action_binding",
+                "thought_use": "supports_tense_state_or_question_structure",
+            })
+        elif best_role == "preposition":
+            info.update({
+                "part_of_speech": "preposition",
+                "tool_role": "relationship_marker",
+                "functional_role": "relation_or_action_binding",
+                "thought_use": "marks_path_target_or_relation",
+            })
+        elif best_role == "conjunction":
+            info.update({
+                "part_of_speech": "conjunction",
+                "tool_role": "structure_connector",
+                "functional_role": "structure_binding",
+                "thought_use": "joins_structures",
+            })
+        elif best_role == "pronoun":
+            info.update({
+                "part_of_speech": "pronoun",
+                "tool_role": "entity_reference_pointer",
+                "functional_role": "entity_binding",
+                "thought_use": "binds_contextual_entity_reference",
+            })
+        return info
+
     def make_word_role_cells(
         self,
         *,
@@ -1021,6 +1135,7 @@ class MemCellStore:
         token_cells: Sequence[Dict[str, Any]],
         role: str,
         tier: str = "now",
+        structure: Optional[Mapping[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         tokens = [str((c.get("anchor", {}) or {}).get("ref", "") or "") for c in token_cells]
         token_ids = [str(c.get("id", "") or "") for c in token_cells]
@@ -1031,6 +1146,7 @@ class MemCellStore:
             if not tok:
                 continue
             role_info = self._word_tool_role(tok, idx, tokens)
+            role_info = self._structure_role_override(role_info, structure, idx)
             tool_role = role_info["tool_role"]
             digest = hashlib.blake2b(
                 f"word_role|{tok}|{tool_role}|{role_info['functional_role']}".encode("utf-8", errors="ignore"),
@@ -1083,6 +1199,7 @@ class MemCellStore:
         word_role_cells: Sequence[Dict[str, Any]],
         role: str,
         tier: str = "now",
+        structure: Optional[Mapping[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         tokens = [str((c.get("anchor", {}) or {}).get("ref", "") or "").strip().lower() for c in token_cells]
         token_ids = [str(c.get("id", "") or "") for c in token_cells]
@@ -1233,7 +1350,12 @@ class MemCellStore:
             pattern_type in {"need_action", "query_need_action", "request_action", "preference_action"}
             for pattern_type, _canonical in seen
         )
-        if len(tokens) >= 2 and not specific_template_present:
+        structure_best = dict((structure or {}).get("best_clause", {}) or {})
+        structure_has_action = bool(
+            str(structure_best.get("action", "") or "").strip()
+            and str(structure_best.get("clause_type", "") or "") in {"declarative", "passive", "imperative", "question"}
+        )
+        if len(tokens) >= 2 and not specific_template_present and not structure_has_action:
             subject = ""
             subject_idx = -1
             for i, tok in enumerate(tokens):
@@ -1253,6 +1375,217 @@ class MemCellStore:
                     trust=0.62 if role == "user" else 0.50,
                 )
 
+        # Structure-first pass. This is where English word order can teach the
+        # role of an unknown word rather than requiring a dictionary entry.
+        # Multiple reading sentences may each contribute one best clause.
+        sentence_structures = list((structure or {}).get("sentence_structures", []) or [])
+        if not sentence_structures and structure:
+            sentence_structures = [{"best_clause": dict(structure.get("best_clause", {}) or {})}]
+        for sentence_structure in sentence_structures[:8]:
+            if not isinstance(sentence_structure, Mapping):
+                continue
+            frame = dict(sentence_structure.get("best_clause", {}) or {})
+            if not frame:
+                continue
+            clause_type = str(frame.get("clause_type", "") or "")
+            action = str(frame.get("action", "") or "").strip().lower()
+            subject = str(frame.get("agent", "") or frame.get("subject", "") or "").strip().lower()
+            obj = str(frame.get("patient", "") or frame.get("object", "") or "").strip().lower()
+
+            if clause_type == "imperative" and role == "user" and action:
+                target = str(frame.get("object_text", "") or obj or "").strip().lower()
+                add_template(
+                    "request_action",
+                    self._canonical_text(["request", action, target]),
+                    {
+                        "actor": "listener",
+                        "action": action,
+                        "target": target,
+                        "permission_shape": "imperative",
+                        "is_question": False,
+                        "structure_confidence": frame.get("confidence", 0.0),
+                    },
+                    activation=0.84,
+                    trust=0.78,
+                )
+                continue
+
+            if clause_type in {"declarative", "passive"} and subject and action:
+                add_template(
+                    "action_relation",
+                    self._canonical_text([subject, action, obj]),
+                    {
+                        "subject": subject,
+                        "action": action,
+                        "object": obj,
+                        "voice": str(frame.get("voice", "active") or "active"),
+                        "structure_confidence": frame.get("confidence", 0.0),
+                    },
+                    activation=0.72,
+                    trust=0.66 if role == "user" else 0.54,
+                )
+                continue
+
+            if clause_type == "copular":
+                subject = str(frame.get("subject", "") or "").strip().lower()
+                attribute = str(frame.get("attribute", "") or "").strip().lower()
+                identity = str(frame.get("identity", "") or "").strip().lower()
+                if subject and attribute:
+                    add_template(
+                        "assert_attribute",
+                        self._canonical_text([subject, "is", attribute]),
+                        {
+                            "subject": subject,
+                            "attribute": attribute,
+                            "copula": "is",
+                            "structure_confidence": frame.get("confidence", 0.0),
+                        },
+                        activation=0.80,
+                        trust=0.70 if role == "user" else 0.56,
+                    )
+                elif subject and identity:
+                    add_template(
+                        "assert_identity",
+                        self._canonical_text([subject, "is", identity]),
+                        {
+                            "subject": subject,
+                            "identity": identity,
+                            "structure_confidence": frame.get("confidence", 0.0),
+                        },
+                        activation=0.76,
+                        trust=0.68 if role == "user" else 0.54,
+                    )
+
+        return out
+
+    def make_clause_frame_cells(
+        self,
+        *,
+        text: str,
+        parent_id: str,
+        structure: Optional[Mapping[str, Any]],
+        role: str,
+        tier: str = "now",
+    ) -> List[Dict[str, Any]]:
+        """Persist sentence structure without pretending one parse is absolute truth.
+
+        Each sentence gets one clause-frame cell. The best interpretation is the
+        searchable anchor; nearby alternatives remain explicitly marked as parse
+        candidates in metadata so cognition can revisit ambiguity later.
+        """
+        if not structure:
+            return []
+        sentence_structures = list(structure.get("sentence_structures", []) or [])
+        if not sentence_structures:
+            sentence_structures = [{
+                "sentence_index": 0,
+                "text": str(text or ""),
+                "best_clause": dict(structure.get("best_clause", {}) or {}),
+                "clause_candidates": list(structure.get("clause_candidates", []) or []),
+            }]
+
+        out: List[Dict[str, Any]] = []
+        now_ts = time.time()
+        for sentence_structure in sentence_structures[:8]:
+            if not isinstance(sentence_structure, Mapping):
+                continue
+            best = dict(sentence_structure.get("best_clause", {}) or {})
+            if not best:
+                continue
+            clause_type = str(best.get("clause_type", "fragment") or "fragment")
+            subject = str(best.get("agent", "") or best.get("subject", "") or "").strip().lower()
+            action = str(best.get("action", "") or "").strip().lower()
+            obj = str(best.get("patient", "") or best.get("object", "") or "").strip().lower()
+            complement = str(best.get("complement", "") or best.get("attribute", "") or best.get("identity", "") or "").strip().lower()
+            query_target = str(best.get("query_target", "") or "").strip().lower()
+            object_text = str(best.get("object_text", "") or "").strip().lower()
+
+            if clause_type == "imperative":
+                canonical = self._canonical_text(["you", action, object_text or obj])
+            elif clause_type == "question":
+                canonical = self._canonical_text(["question", query_target, subject, action, obj])
+            elif clause_type == "copular":
+                canonical = self._canonical_text([subject, "be", complement])
+            else:
+                canonical = self._canonical_text([subject, action, obj or complement])
+            if not canonical:
+                canonical = self._norm_text(str(sentence_structure.get("text", "") or text))
+            if not canonical:
+                continue
+
+            candidates = [dict(c) for c in list(sentence_structure.get("clause_candidates", []) or []) if isinstance(c, Mapping)]
+            alternatives = []
+            for candidate in candidates:
+                if candidate == best:
+                    continue
+                alternatives.append({
+                    "clause_type": str(candidate.get("clause_type", "") or ""),
+                    "subject": str(candidate.get("subject", "") or ""),
+                    "action": str(candidate.get("action", "") or ""),
+                    "object": str(candidate.get("object", "") or ""),
+                    "embedded_action": str(candidate.get("embedded_action", "") or ""),
+                    "ambiguity": str(candidate.get("ambiguity", "") or ""),
+                    "confidence": float(candidate.get("confidence", 0.0) or 0.0),
+                })
+                if len(alternatives) >= 3:
+                    break
+
+            sentence_index = int(sentence_structure.get("sentence_index", 0) or 0)
+            digest = hashlib.blake2b(
+                f"clause_frame|{clause_type}|{canonical}|{sentence_index}".encode("utf-8", errors="ignore"),
+                digest_size=8,
+            ).hexdigest()
+            slots: Dict[str, Any] = {
+                "subject": subject,
+                "action": action,
+                "object": obj,
+                "complement": complement,
+                "query_target": query_target,
+                "voice": str(best.get("voice", "active") or "active"),
+                "negated": bool(best.get("negated", False)),
+            }
+            refs: List[Dict[str, Any]] = [{"kind": "clause_frame", "value": canonical}]
+            for slot_name, slot_value in slots.items():
+                if slot_value in (None, "", False, []):
+                    continue
+                refs.append({"kind": "slot", "name": slot_name, "value": slot_value})
+
+            out.append({
+                "id": f"cf{digest}",
+                "kind": "clause_frame",
+                "tier": tier,
+                "anchor": {
+                    "kind": f"language/clause/{clause_type}",
+                    "ref": canonical,
+                    "norm": self._norm_text(canonical),
+                },
+                "refs": refs,
+                "modalities": ["text"],
+                "links_explicit": [parent_id],
+                "activation": 0.74,
+                "promotion": 0.08,
+                "decay": 1.0,
+                "trust": 0.68 if role == "user" else 0.54,
+                "meta": {
+                    "role": role,
+                    "pattern_type": f"clause_{clause_type}",
+                    "clause_type": clause_type,
+                    "canonical": canonical,
+                    "surface": str(sentence_structure.get("text", "") or text)[:240],
+                    "parent_id": parent_id,
+                    "sentence_index": sentence_index,
+                    "slots": slots,
+                    "best_clause": best,
+                    "alternatives": alternatives,
+                    "parse_confidence": float(best.get("confidence", 0.0) or 0.0),
+                    "epistemic_status": "parsed_structure_candidate",
+                    "language_layer": "clause_frame",
+                },
+                "ts": now_ts,
+                "last_seen": now_ts,
+                "encounter_count": 1,
+                "revision": 0,
+            })
         return out
 
     def make_general_pattern_cells(
@@ -1264,6 +1597,7 @@ class MemCellStore:
         pattern_cells: Sequence[Dict[str, Any]],
         role: str,
         tier: str = "now",
+        structure: Optional[Mapping[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         tokens = [str((c.get("anchor", {}) or {}).get("ref", "") or "") for c in token_cells]
         token_ids = [str(c.get("id", "") or "") for c in token_cells]
@@ -1272,6 +1606,8 @@ class MemCellStore:
         text_str = str(text or "").strip()
         text_lower = text_str.lower()
         text_is_question = text_str.endswith("?")
+        best_clause = dict((structure or {}).get("best_clause", {}) or {})
+        best_clause_type = str(best_clause.get("clause_type", "") or "")
 
         def add_general(
             *,
@@ -1372,7 +1708,7 @@ class MemCellStore:
             if tok in COPULA_TOKENS:
                 copula_idx = i
                 break
-        if 0 < copula_idx < (len(tokens) - 1) and tokens[0] != "there":
+        if (not best_clause or best_clause_type == "copular") and 0 < copula_idx < (len(tokens) - 1) and tokens[0] != "there":
             subj_tokens = tokens[:copula_idx]
             attr_tokens = tokens[copula_idx + 1 :]
             deixis, subj_core_tokens = self._split_leading_determiner(subj_tokens)
@@ -1388,6 +1724,43 @@ class MemCellStore:
                     stop_idx=len(tokens),
                     activation=0.82,
                     trust=0.70 if role == "user" else 0.56,
+                )
+
+        # Structure-derived action frame. This catches normal English word
+        # order even when the predicate is a word MB has never seen before.
+        if best_clause_type in {"declarative", "passive"}:
+            subject = str(best_clause.get("agent", "") or best_clause.get("subject", "") or "").strip().lower()
+            action = str(best_clause.get("action", "") or "").strip().lower()
+            obj = str(best_clause.get("patient", "") or best_clause.get("object", "") or "").strip().lower()
+            if subject and action:
+                add_general(
+                    pattern_type="action_relation",
+                    canonical=self._canonical_text([subject, action, obj]),
+                    slots={
+                        "subject": subject,
+                        "action": action,
+                        "object": obj,
+                        "voice": str(best_clause.get("voice", "active") or "active"),
+                        "structure_confidence": best_clause.get("confidence", 0.0),
+                    },
+                    start_idx=0,
+                    stop_idx=len(tokens),
+                    activation=0.72,
+                    trust=0.66 if role == "user" else 0.52,
+                )
+
+        if best_clause_type == "imperative" and role == "user":
+            action = str(best_clause.get("action", "") or "").strip().lower()
+            target = str(best_clause.get("object_text", "") or best_clause.get("object", "") or "").strip().lower()
+            if action:
+                add_general(
+                    pattern_type="request_action",
+                    canonical=self._canonical_text(["request", action, target]),
+                    slots={"actor": "listener", "action": action, "target": target, "structure_confidence": best_clause.get("confidence", 0.0)},
+                    start_idx=0,
+                    stop_idx=len(tokens),
+                    activation=0.78,
+                    trust=0.72,
                 )
 
         # User redirected MB to another source/person.
@@ -1645,6 +2018,7 @@ class MemCellStore:
         source: str = "trainer",
         meta: Optional[Dict[str, Any]] = None,
         tier: str = "learned",
+        flush: bool = True,
     ) -> Dict[str, Any]:
         desired_clean = str(desired_text or "").strip()
         context_clean = str(context_query or "").strip()
@@ -1669,6 +2043,7 @@ class MemCellStore:
             source=str(source or "trainer"),
             meta=trainer_meta,
             tier=tier,
+            flush=flush,
         )
 
         utterance = ingest_result.get("utterance", {}) if isinstance(ingest_result, dict) else {}
@@ -1713,7 +2088,7 @@ class MemCellStore:
             "encounter_count": 1,
             "revision": 0,
         }
-        alignment = self.upsert_cell(alignment, tier=tier)
+        alignment = self.upsert_cell(alignment, tier=tier, flush=flush)
         return {
             "utterance": utterance,
             "alignment": alignment,
@@ -1731,12 +2106,18 @@ class MemCellStore:
         source: str,
         meta: Optional[Dict[str, Any]] = None,
         tier: str = 'now',
+        flush: bool = True,
     ) -> Dict[str, Any]:
         utterance = self.make_text_cell(
             text=text, topic=topic, role=role, transport_source=transport_source, source=source, meta=meta, tier=tier
         )
         utterance = self.upsert_cell(utterance, tier=tier, touch=True, flush=False)
         parent_id = str(utterance.get('id', ''))
+
+        try:
+            language_structure = analyze_english_structure(text)
+        except Exception:
+            language_structure = {}
 
         token_cells = [
             self.upsert_cell(c, tier=tier, touch=True, flush=False)
@@ -1748,7 +2129,9 @@ class MemCellStore:
         ]
         word_role_cells = [
             self.upsert_cell(c, tier=tier, touch=True, flush=False)
-            for c in self.make_word_role_cells(text=text, parent_id=parent_id, token_cells=token_cells, role=role, tier=tier)
+            for c in self.make_word_role_cells(
+                text=text, parent_id=parent_id, token_cells=token_cells, role=role, tier=tier, structure=language_structure
+            )
         ]
         thought_template_cells = [
             self.upsert_cell(c, tier=tier, touch=True, flush=False)
@@ -1757,6 +2140,17 @@ class MemCellStore:
                 parent_id=parent_id,
                 token_cells=token_cells,
                 word_role_cells=word_role_cells,
+                role=role,
+                tier=tier,
+                structure=language_structure,
+            )
+        ]
+        clause_frame_cells = [
+            self.upsert_cell(c, tier=tier, touch=True, flush=False)
+            for c in self.make_clause_frame_cells(
+                text=text,
+                parent_id=parent_id,
+                structure=language_structure,
                 role=role,
                 tier=tier,
             )
@@ -1770,6 +2164,7 @@ class MemCellStore:
                 pattern_cells=pattern_cells,
                 role=role,
                 tier=tier,
+                structure=language_structure,
             )
         ]
         linker_source_cells = general_pattern_cells + thought_template_cells
@@ -1785,7 +2180,7 @@ class MemCellStore:
         ]
         # back-link strongest immediate pieces into utterance. Raw tokens remain
         # evidence; word roles and thought templates are the reusable scaffold.
-        if token_cells or pattern_cells or word_role_cells or thought_template_cells or general_pattern_cells or linker_cells:
+        if token_cells or pattern_cells or word_role_cells or thought_template_cells or clause_frame_cells or general_pattern_cells or linker_cells:
             utterance['links_explicit'] = self._merge_unique_list(
                 list(utterance.get('links_explicit', []) or []),
                 [
@@ -1795,6 +2190,7 @@ class MemCellStore:
                         + pattern_cells[:3]
                         + word_role_cells[:4]
                         + thought_template_cells[:4]
+                        + clause_frame_cells[:4]
                         + general_pattern_cells[:4]
                         + linker_cells[:4]
                     )
@@ -1803,15 +2199,18 @@ class MemCellStore:
                 limit=20,
             )
             utterance = self.upsert_cell(utterance, tier=tier, touch=False, flush=False)
-        self.flush_tier(tier)
+        if flush:
+            self.flush_tier(tier)
         return {
             'utterance': utterance,
             'tokens': token_cells,
             'patterns': pattern_cells,
             'word_roles': word_role_cells,
             'thought_templates': thought_template_cells,
+            'clause_frames': clause_frame_cells,
             'general_patterns': general_pattern_cells,
             'linkers': linker_cells,
+            'language_structure': language_structure,
         }
 
     @staticmethod
@@ -1901,7 +2300,7 @@ class MemCellStore:
                 if not isinstance(row, dict):
                     continue
                 kind = str(row.get("kind", "") or "")
-                if kind not in {"token_anchor", "pattern_anchor", "pattern_role", "word_role", "thought_template", "pattern_linker", "utterance_anchor"}:
+                if kind not in {"token_anchor", "pattern_anchor", "pattern_role", "word_role", "thought_template", "clause_frame", "pattern_linker", "utterance_anchor"}:
                     continue
                 activation = self._clamp01(row.get("activation", 0.0))
                 if activation <= 0.04 or activation >= 0.72:
@@ -1916,12 +2315,84 @@ class MemCellStore:
         scored.sort(key=lambda t: t[0], reverse=True)
         return [row for _score, row in scored[:max(1, int(limit))]]
 
+    def maintain_hot_lifecycle(
+        self,
+        *,
+        now_ts: Optional[float] = None,
+        hot_ttl_hours: float = HOT_MEMORY_TTL_HOURS,
+        min_encounters_for_now: int = HOT_MEMORY_MIN_ENCOUNTERS_FOR_NOW,
+        now_hold_hours: float = HOT_MEMORY_NOW_HOLD_HOURS,
+    ) -> Dict[str, int]:
+        """Maintain the rolling hot-memory shelf.
+
+        ``hot`` is the short-lived relevance layer that sits before ``now``.
+        A meaningful touch updates ``last_seen`` and therefore resets the
+        rolling TTL.  Passive retrieval timestamps do not keep a hot item alive.
+
+        A row earns promotion only when meaningful encounters span the full hot
+        window.  This prevents a single old-but-idle row from graduating merely
+        because wall-clock time passed.
+        """
+        now_value = float(time.time() if now_ts is None else now_ts)
+        ttl_s = max(1.0, float(hot_ttl_hours) * 3600.0)
+        hold_s = max(0.0, float(now_hold_hours) * 3600.0)
+        min_encounters = max(2, int(min_encounters_for_now))
+
+        kept_hot: List[Dict[str, Any]] = []
+        promote_now: List[Dict[str, Any]] = []
+        stats = {"probed": 0, "promoted": 0, "expired": 0, "kept": 0}
+
+        for row in self._iter_rows("hot"):
+            if not isinstance(row, dict):
+                continue
+            stats["probed"] += 1
+            row = dict(row)
+            created_ts = float(row.get("ts", row.get("last_seen", now_value)) or now_value)
+            last_seen = float(row.get("last_seen", created_ts) or created_ts)
+            encounters = max(1, int(row.get("encounter_count", 1) or 1))
+            idle_s = max(0.0, now_value - last_seen)
+            meaningful_span_s = max(0.0, last_seen - created_ts)
+
+            if idle_s >= ttl_s:
+                stats["expired"] += 1
+                continue
+
+            if encounters >= min_encounters and meaningful_span_s >= ttl_s:
+                row["tier"] = "now"
+                row["promotion"] = self._clamp01(float(row.get("promotion", 0.0) or 0.0) + 0.08)
+                meta = dict(row.get("meta", {}) or {})
+                meta["promoted_from_hot"] = True
+                meta["hot_promoted_ts"] = now_value
+                meta["now_hold_until_ts"] = now_value + hold_s
+                meta["hot_meaningful_span_s"] = meaningful_span_s
+                row["meta"] = meta
+                promote_now.append(row)
+                stats["promoted"] += 1
+                continue
+
+            kept_hot.append(row)
+            stats["kept"] += 1
+
+        # ``hot`` is deliberately direct-written even when the composer is on.
+        # It is a single-process ephemeral shelf whose lifecycle requires true
+        # removal/move semantics; queued upserts would otherwise resurrect rows
+        # after they expired or graduated.
+        self._write_shard("hot", kept_hot)
+
+        if promote_now:
+            for row in promote_now:
+                self.upsert_cell(row, tier="now", touch=False, flush=False)
+            self.flush_tier("now")
+
+        return stats
+
     def maintain_lifecycle(
         self,
         *,
         retention_hours: Optional[Dict[str, float]] = None,
     ) -> Dict[str, int]:
         retention = {
+            "hot": HOT_MEMORY_TTL_HOURS,
             "now": 36.0,
             "short": 72.0,
             "long": 96.0,
@@ -1936,6 +2407,7 @@ class MemCellStore:
                         pass
 
         prune_floor = {
+            "hot": 0.0,
             "now": 0.28,
             "short": 0.34,
             "long": 0.42,
@@ -1950,13 +2422,28 @@ class MemCellStore:
                 if not isinstance(row, dict):
                     continue
                 row = dict(row)
+                if tier == "hot":
+                    # Hot-memory expiry/promotion is handled by
+                    # maintain_hot_lifecycle(), where only meaningful touches
+                    # may refresh the rolling 3-hour window.
+                    rewritten[tier].append(row)
+                    stats["kept"] += 1
+                    continue
+
                 age_h = max(0.0, now_ts - self._last_activity_ts(row)) / 3600.0
                 value = self._value_score(row)
                 encounters = max(1, int(row.get("encounter_count", 1) or 1))
                 target_tier = tier
 
-                if tier == "now" and (encounters >= 3 or value >= 0.36):
-                    target_tier = "short"
+                if tier == "now":
+                    meta = row.get("meta", {}) if isinstance(row.get("meta", {}), dict) else {}
+                    hold_until = float(meta.get("now_hold_until_ts", 0.0) or 0.0)
+                    if hold_until > now_ts:
+                        rewritten[tier].append(row)
+                        stats["kept"] += 1
+                        continue
+                    if encounters >= 3 or value >= 0.36:
+                        target_tier = "short"
                 elif tier == "short" and (encounters >= 5 or value >= 0.54):
                     target_tier = "long"
                 elif tier == "long" and (encounters >= 8 or value >= 0.76):
@@ -2221,7 +2708,7 @@ class MemCellStore:
         query_text: str,
         *,
         limit: int = 8,
-        tiers: Sequence[str] = ("learned", "long", "now", "short"),
+        tiers: Sequence[str] = ("learned", "long", "hot", "now", "short"),
     ) -> List[Dict[str, Any]]:
         q = str(query_text or '').strip()
         if not q:
@@ -2231,7 +2718,7 @@ class MemCellStore:
         if not q_tokens:
             return []
 
-        tier_bias = {"derived": 1.16, "learned": 1.08, "long": 1.0, "now": 0.88, "short": 0.74}
+        tier_bias = {"derived": 1.16, "learned": 1.08, "long": 1.0, "hot": 0.96, "now": 0.88, "short": 0.74}
         hits: List[Dict[str, Any]] = []
         now_ts = time.time()
 

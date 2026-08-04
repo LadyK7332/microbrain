@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-import json
+import io
 import math
 import time
 from pathlib import Path
@@ -9,7 +9,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from microbrain.orchestrator.neuron_base import BaseNeuron, Event, NeuronConfig
 from microbrain.orchestrator.orchestrator import Orchestrator
-from microbrain.utils.memdir import resolve_memdir_ctx
+from microbrain.utils.mb_vision.ram_frames import get_ram_frame
 
 NEURON_NAME = Path(__file__).stem
 
@@ -17,6 +17,10 @@ NEURON_NAME = Path(__file__).stem
 class ProtoObjectTrackerNeuron(BaseNeuron):
     """
     Slow, curiosity-led proto-object tracker for vision.
+
+    Current tracks are ephemeral RAM/KV state. They are not rewritten to disk
+    frame-by-frame; durable vision storage is reserved for meaningful deltas
+    and learned labels.
 
     Purpose:
       - Avoid instant hard labels for unknown visual content.
@@ -52,7 +56,7 @@ class ProtoObjectTrackerNeuron(BaseNeuron):
         if not frame_ref:
             return []
 
-        image = self._load_image(frame_ref)
+        image = await self._load_image(ctx, frame_ref)
         if image is None:
             await ctx.log_debug(f'[{self.name}] could not open frame', frame_ref=frame_ref)
             return []
@@ -138,7 +142,6 @@ class ProtoObjectTrackerNeuron(BaseNeuron):
 
         snapshot = self._snapshot(track)
         await ctx.set_kv('vision:proto:last_focus', snapshot)
-        await self._write_state(ctx, tracks)
 
         should_emit = self._should_emit_snapshot(track=track, is_new=is_new, min_repeat=min_repeat, now=now)
         out: List[Event] = []
@@ -224,7 +227,6 @@ class ProtoObjectTrackerNeuron(BaseNeuron):
 
         await ctx.set_kv('vision:proto:tracks', tracks)
         await ctx.set_kv('vision:proto:last_focus', snapshot)
-        await self._write_state(ctx, tracks)
 
         return [
             Event(
@@ -268,7 +270,13 @@ class ProtoObjectTrackerNeuron(BaseNeuron):
                 dist = (int(track.get('signature', 0) or 0) ^ obs_sig).bit_count()
             except Exception:
                 dist = 64
-            if dist > match_max_bits:
+            spatial_iou = self._crop_iou(track.get('crop_box'), obs.get('crop_box'))
+            # Appearance hashes on a live face/hand can wobble enough to fail a
+            # strict Hamming gate even though the crop is plainly the same
+            # spatial object. Reuse a near-identical current box before creating
+            # another proto ID; recognition confidence can change in-place.
+            spatial_reuse = spatial_iou >= 0.72 and dist <= max(28, match_max_bits)
+            if dist > match_max_bits and not spatial_reuse:
                 continue
             tfocus = track.get('focus_xy', {}) or {}
             dx = float(tfocus.get('x', 0.5) or 0.5) - float(obs_focus.get('x', 0.5) or 0.5)
@@ -276,7 +284,8 @@ class ProtoObjectTrackerNeuron(BaseNeuron):
             proximity = math.sqrt(dx * dx + dy * dy)
             if proximity > focus_proximity:
                 continue
-            score = (1.0 - (dist / max(1, match_max_bits))) + (1.0 - (proximity / max(0.001, focus_proximity)))
+            appearance_score = max(0.0, 1.0 - (dist / max(1.0, float(max(28, match_max_bits)))))
+            score = appearance_score + (1.0 - (proximity / max(0.001, focus_proximity))) + spatial_iou
             if score > best_score:
                 best_score = score
                 best_track = track
@@ -316,6 +325,32 @@ class ProtoObjectTrackerNeuron(BaseNeuron):
         track['fallback_ref'] = self._render_fallback_ref(track)
         tracks.append(track)
         return track, True
+
+
+    @staticmethod
+    def _crop_iou(a: Any, b: Any) -> float:
+        def xywh(box: Any):
+            if not isinstance(box, dict):
+                return None
+            try:
+                if all(k in box for k in ("left", "top", "right", "bottom")):
+                    x = float(box["left"]); y = float(box["top"])
+                    return x, y, float(box["right"]) - x, float(box["bottom"]) - y
+                if all(k in box for k in ("left", "top", "width", "height")):
+                    return float(box["left"]), float(box["top"]), float(box["width"]), float(box["height"])
+            except Exception:
+                return None
+            return None
+
+        aa, bb = xywh(a), xywh(b)
+        if aa is None or bb is None:
+            return 0.0
+        ax, ay, aw, ah = aa; bx, by, bw, bh = bb
+        x0, y0 = max(ax, bx), max(ay, by)
+        x1, y1 = min(ax + aw, bx + bw), min(ay + ah, by + bh)
+        inter = max(0.0, x1 - x0) * max(0.0, y1 - y0)
+        union = max(1e-9, aw * ah + bw * bh - inter)
+        return inter / union
 
     @staticmethod
     def _clamp(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
@@ -421,28 +456,30 @@ class ProtoObjectTrackerNeuron(BaseNeuron):
         keep.sort(key=lambda row: (float(row.get('importance', 0.0) or 0.0), float(row.get('last_seen', 0.0) or 0.0)), reverse=True)
         return keep[:max_tracks]
 
-    async def _write_state(self, ctx, tracks: List[Dict[str, Any]]) -> None:
-        memdir = await resolve_memdir_ctx(ctx, fallback=None)
-        if not memdir:
-            return
-        out_dir = Path(memdir) / 'state'
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / 'vision_proto_tracks.json'
-        payload = {
-            'schema': 'vision_proto_tracks.v1',
-            'ts': time.time(),
-            'tracks': [self._snapshot(track) for track in tracks],
-        }
-        try:
-            out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
-        except Exception:
-            pass
+    # Current proto-object tracks intentionally remain in RAM/KV.
+    # Durable visual memory is written by meaningful delta/learning paths, not
+    # by rewriting a track snapshot on every camera frame.
 
-    def _load_image(self, frame_ref: str):
+    async def _load_image(self, ctx, frame_ref: str):
         try:
             from PIL import Image
         except Exception:
             return None
+
+        if str(frame_ref or "").startswith("ram:vision:"):
+            packet = await get_ram_frame(ctx, frame_ref)
+            if not isinstance(packet, dict):
+                return None
+            raw = packet.get("jpeg_bytes")
+            if not isinstance(raw, (bytes, bytearray)):
+                return None
+            try:
+                image = Image.open(io.BytesIO(bytes(raw)))
+                image.load()
+                return image.convert('RGB')
+            except Exception:
+                return None
+
         try:
             image = Image.open(frame_ref)
             image.load()

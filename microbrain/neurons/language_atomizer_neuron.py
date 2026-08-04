@@ -88,6 +88,7 @@ class LanguageAtomizerNeuron(BaseNeuron):
             relation_count=len(atomized["atom_candidates"]["relations"]),
             word_role_count=len(atomized["atom_candidates"]["word_roles"]),
             thought_template_count=len(atomized["atom_candidates"]["thought_templates"]),
+            clause_candidate_count=len(atomized["atom_candidates"].get("clause_frames", [])),
             text_preview=text[:100],
         )
 
@@ -161,10 +162,14 @@ class LanguageAtomizerNeuron(BaseNeuron):
             "noun_chunks": noun_chunks,
             "word_roles": word_roles,
             "thought_templates": thought_templates,
+            "role_candidates": [dict(item) for item in parsed.role_candidates],
+            "phrase_chunks": [dict(item) for item in parsed.phrase_chunks],
+            "clause_frames": [dict(item) for item in parsed.clause_candidates],
+            "best_clause": dict(parsed.best_clause),
         }
 
         return {
-            "schema": "language.parsed.v2",
+            "schema": "language.parsed.v3",
             "text": text,
             "channel": channel,
             "source": source,
@@ -173,6 +178,10 @@ class LanguageAtomizerNeuron(BaseNeuron):
             "noun_chunks": noun_chunks,
             "entities": entities,
             "tokens": tokens,
+            "phrase_chunks": [dict(item) for item in parsed.phrase_chunks],
+            "role_candidates": [dict(item) for item in parsed.role_candidates],
+            "clause_candidates": [dict(item) for item in parsed.clause_candidates],
+            "best_clause": dict(parsed.best_clause),
             "atom_candidates": atom_candidates,
         }
 

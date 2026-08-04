@@ -14,7 +14,7 @@ QUESTION_STOPWORDS = {
     'to', 'of', 'for', 'about', 'can', 'you', 'me', 'tell', 'give', 'explain',
     'why', 'how', 'when', 'where', 'who', 'whom', 'which'
 }
-STRUCTURAL_KINDS = {'general_pattern', 'compressed_general_pattern', 'thought_template', 'trainer_alignment'}
+STRUCTURAL_KINDS = {'general_pattern', 'compressed_general_pattern', 'thought_template', 'clause_frame', 'trainer_alignment'}
 
 
 def _norm(text: str) -> str:
@@ -92,6 +92,16 @@ def _render_pattern(hit: Dict[str, Any]) -> str:
         obj = str(slots.get('object', '') or '').strip()
         if subject and action:
             return ' '.join([subject, action, obj]).strip()
+    if str(hit.get('kind', '') or '') == 'clause_frame':
+        clause_type = str(meta.get('clause_type', '') or '')
+        subject = str(slots.get('subject', '') or '').strip()
+        action = str(slots.get('action', '') or '').strip()
+        obj = str(slots.get('object', '') or '').strip()
+        complement = str(slots.get('complement', '') or '').strip()
+        if clause_type == 'copular' and subject and complement:
+            return f'{subject} is {complement}'.strip()
+        if subject and action:
+            return ' '.join([subject, action, obj]).strip()
     return _extract_body(hit)
 
 
@@ -131,9 +141,9 @@ async def compose_answer_from_memory(ctx, query_text: str) -> Dict[str, Any]:
         return {'ok': False, 'reason': 'no_mem_cell_store', 'text': ''}
 
     search_query = ' '.join(focus) if focus else query_text
-    hits = store.search_text_cells(search_query, limit=12, tiers=('learned', 'long', 'now', 'short'))
+    hits = store.search_text_cells(search_query, limit=12, tiers=('learned', 'long', 'hot', 'now', 'short'))
     if not hits and search_query != query_text:
-        hits = store.search_text_cells(query_text, limit=12, tiers=('learned', 'long', 'now', 'short'))
+        hits = store.search_text_cells(query_text, limit=12, tiers=('learned', 'long', 'hot', 'now', 'short'))
     if not hits:
         return {'ok': False, 'reason': 'no_hits', 'text': ''}
 

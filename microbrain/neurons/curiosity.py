@@ -4,7 +4,10 @@ from typing import Iterable
 from microbrain.orchestrator.neuron_base import BaseNeuron, NeuronConfig, Event
 from microbrain.orchestrator.orchestrator import Orchestrator
 
+from microbrain.utils.heartbeat_stream import service_topic
+
 NEURON_NAME = Path(__file__).stem
+SERVICE_TOPIC = service_topic("curiosity")
 
 
 class CuriosityNeuron(BaseNeuron):
@@ -16,7 +19,7 @@ class CuriosityNeuron(BaseNeuron):
     """
 
     async def process(self, event: Event, ctx) -> Iterable[Event]:
-        if event.topic != "clock/tick":
+        if event.topic != SERVICE_TOPIC:
             return []
 
         # Legacy curiosity mode is now opt-in. The initiative threshold neuron
@@ -61,7 +64,7 @@ class CuriosityNeuron(BaseNeuron):
 def build_neurons(orchestrator: Orchestrator):
     cfg = NeuronConfig(
         name=NEURON_NAME,
-        subscribed_topics=["clock/tick"],
+        subscribed_topics=[SERVICE_TOPIC],
         output_topics=["reason/request"],
         priority=0,
     )

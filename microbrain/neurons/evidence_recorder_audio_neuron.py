@@ -10,7 +10,10 @@ from microbrain.orchestrator.neuron_base import BaseNeuron, Event, NeuronConfig
 from microbrain.orchestrator.orchestrator import Orchestrator
 from microbrain.utils.evidence import append_evidence_index, ensure_evidence_session, sha256_file, write_wav_mono_i16
 
+from microbrain.utils.heartbeat_stream import service_topic
+
 NEURON_NAME = Path(__file__).stem
+SERVICE_TOPIC = service_topic("evidence")
 
 
 class EvidenceRecorderAudioNeuron(BaseNeuron):
@@ -68,14 +71,14 @@ class EvidenceRecorderAudioNeuron(BaseNeuron):
         return sess_id, sess_dir
 
     async def process(self, event: Event, ctx) -> Iterable[Event]:
-        if event.topic not in ("percept/audio_pcm", "percept/audio_utterance", "clock/tick"):
+        if event.topic not in ("percept/audio_pcm", "percept/audio_utterance", SERVICE_TOPIC):
             return []
 
         enabled = bool(await ctx.get_kv("er:enabled", True))
         if not enabled:
             return []
 
-        if event.topic == "clock/tick":
+        if event.topic == SERVICE_TOPIC:
             armed = bool(await ctx.get_kv("er:armed", False))
             manual_hold = bool(await ctx.get_kv("er:manual_hold", False))
             if armed and not manual_hold:
@@ -137,7 +140,7 @@ class EvidenceRecorderAudioNeuron(BaseNeuron):
 def build_neurons(orchestrator: Orchestrator):
     cfg = NeuronConfig(
         name=NEURON_NAME,
-        subscribed_topics=["percept/audio_pcm", "percept/audio_utterance", "clock/tick"],
+        subscribed_topics=["percept/audio_pcm", "percept/audio_utterance", SERVICE_TOPIC],
         output_topics=[],
         priority=35,
         cooldown_sec=0.0,

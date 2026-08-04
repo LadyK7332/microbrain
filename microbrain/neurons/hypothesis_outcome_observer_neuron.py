@@ -19,6 +19,7 @@ from typing import Any, Dict, Iterable, Mapping, Sequence, Tuple
 from microbrain.orchestrator.neuron_base import BaseNeuron, Event, NeuronConfig
 from microbrain.orchestrator.orchestrator import Orchestrator
 from microbrain.patterns.pattern_toolkit import jaccard, normalize_text, tokenize
+from microbrain.utils.heartbeat_stream import service_topic
 
 # ---------------------------------------------------------------------------
 # Behavioral tuning
@@ -88,6 +89,7 @@ TRAINER_TARGET_SIMILARITY = 0.55
 # ---------------------------------------------------------------------------
 
 NEURON_NAME = Path(__file__).stem
+SERVICE_TOPIC = service_topic("outcome")
 OUTCOME_SCHEMA = "hypothesis.outcome.v1"
 ACTION_COMMITTED_TOPIC = "hypothesis/action_committed"
 SPEECH_TOPIC = "act/speech"
@@ -95,7 +97,6 @@ TEXT_TOPIC = "percept/text"
 REINFORCE_TOPIC = "control/reinforce"
 TRAINER_CORRECTION_TOPIC = "control/trainer_correction"
 INTERACTION_RELIEF_TOPIC = "event/relief/interaction"
-CLOCK_TOPIC = "clock/tick"
 OUTCOME_TOPIC = "hypothesis/outcome"
 
 _POSITIVE_MARKERS = (
@@ -247,7 +248,7 @@ class HypothesisOutcomeObserverNeuron(BaseNeuron):
                 evidence=[f"relief_delta:{relief:.4f}"],
             )
 
-        if event.topic == CLOCK_TOPIC:
+        if event.topic == SERVICE_TOPIC:
             pending = await self._pending(ctx)
             if not pending:
                 return []
@@ -659,7 +660,7 @@ def build_neurons(orchestrator: Orchestrator):
             REINFORCE_TOPIC,
             TRAINER_CORRECTION_TOPIC,
             INTERACTION_RELIEF_TOPIC,
-            CLOCK_TOPIC,
+            SERVICE_TOPIC,
         ],
         output_topics=[OUTCOME_TOPIC],
         priority=30,

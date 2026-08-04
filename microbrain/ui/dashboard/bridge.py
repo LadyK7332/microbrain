@@ -22,7 +22,7 @@ from microbrain.ui.frontend_common import (
     runtime_tuning_candidates,
     safe_json,
 )
-from microbrain.utils.heartbeat_stream import PRIMARY_HEARTBEAT_TOPIC, is_heartbeat_event
+from microbrain.utils.heartbeat_stream import PRIMARY_HEARTBEAT_TOPIC, is_infrastructure_event
 
 # ---------------------------------------------------------------------------
 # Behavioral tuning
@@ -35,9 +35,10 @@ DASHBOARD_DRAIN_DROP_BATCH = 32
 # UI telemetry cadence.  Units: seconds.
 PRESSURE_SAMPLE_INTERVAL_S = 0.25
 RUNTIME_SNAPSHOT_INTERVAL_S = 0.50
+VISION_SAMPLE_INTERVAL_S = 0.10
 
-# Raw clock ticks are intentionally omitted from the visible firehose because
-# they arrive twice per second forever.  Bus metrics still expose tick activity.
+# Raw body-heartbeat / compatibility clock pulses are intentionally omitted
+# from the visible firehose. Bus metrics still expose infrastructure activity.
 SHOW_CLOCK_TICK_EVENTS = False
 
 # Runtime tuning audit is capped in KV while the full history remains in the
@@ -52,6 +53,7 @@ DASHBOARD_TAP_NAME = "ui.dashboard.tap"
 DASHBOARD_PRESSURE_TOPIC = "ui/pressure_state"
 DASHBOARD_SNAPSHOT_TOPIC = "ui/dashboard_snapshot"
 DASHBOARD_TUNING_CHANGED_TOPIC = "control/runtime_tuning_changed"
+DASHBOARD_VISION_TOPIC = "ui/vision_current"
 DASHBOARD_TUNING_AUDIT_FILENAME = "dashboard_tuning_changes.jsonl"
 
 
@@ -68,6 +70,7 @@ class DashboardBridge:
         self._started = False
         self._last_noninfra_topic = ""
         self._last_noninfra_time = 0.0
+        self._last_visual_ts = 0.0
 
     @property
     def dropped_events(self) -> int:
@@ -86,6 +89,7 @@ class DashboardBridge:
         self._tasks = [
             asyncio.create_task(self._pressure_pump(), name="dashboard_pressure_sampler"),
             asyncio.create_task(self._snapshot_pump(), name="dashboard_runtime_sampler"),
+            asyncio.create_task(self._vision_pump(), name="dashboard_visual_sampler"),
         ]
         self.orch.kv_store["ui:dashboard:started"] = True
         self.orch.kv_store["outlet:textual_available"] = True
@@ -113,15 +117,32 @@ class DashboardBridge:
         self.orch.kv_store["ui:dashboard:started"] = False
 
     async def _tap_event(self, event: Event) -> list[Event]:
-        if is_heartbeat_event(event) and not SHOW_CLOCK_TICK_EVENTS:
+        if is_infrastructure_event(event) and not SHOW_CLOCK_TICK_EVENTS:
             return []
-        if not is_heartbeat_event(event):
+        if event.topic == "percept/vision/features":
+            return []
+        if not is_infrastructure_event(event):
             self._last_noninfra_topic = event.topic
             self._last_noninfra_time = float(event.timestamp or time.time())
+        payload = event.payload
+        if event.topic == "percept/vision" and isinstance(event.payload, Mapping):
+            payload = dict(event.payload)
+            ref = str(payload.get("data_ref") or payload.get("frame_ref") or "")
+            if ref.startswith("ram:vision:"):
+                packet = self.orch.kv_store.get("vision:frame:latest")
+                if not (isinstance(packet, Mapping) and str(packet.get("ref") or "") == ref):
+                    ring = self.orch.kv_store.get("vision:frame:ring", [])
+                    packet = next(
+                        (row for row in reversed(ring) if isinstance(row, Mapping) and str(row.get("ref") or "") == ref),
+                        None,
+                    ) if isinstance(ring, list) else None
+                if isinstance(packet, Mapping) and isinstance(packet.get("jpeg_bytes"), (bytes, bytearray)):
+                    payload["jpeg_bytes"] = bytes(packet.get("jpeg_bytes"))
+
         await self._enqueue(
             UIMessage(
                 topic=event.topic,
-                payload=event.payload,
+                payload=payload,
                 source=event.source,
                 meta=dict(event.meta or {}),
                 correlation_id=str(event.correlation_id or ""),
@@ -173,6 +194,57 @@ class DashboardBridge:
             )
             await asyncio.sleep(RUNTIME_SNAPSHOT_INTERVAL_S)
 
+    async def _vision_pump(self) -> None:
+        """Sample RAM-resident visual.current without publishing it through cognition."""
+
+        while True:
+            state = self.orch.kv_store.get("visual:current", {})
+            if isinstance(state, Mapping) and state:
+                try:
+                    ts = float(state.get("ts", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    ts = 0.0
+                if ts > self._last_visual_ts:
+                    self._last_visual_ts = ts
+                    await self._enqueue(
+                        UIMessage(
+                            topic=DASHBOARD_VISION_TOPIC,
+                            payload=safe_json(state),
+                            source="ui.dashboard.visual_sampler",
+                            meta={
+                                "ui_hidden": True,
+                                "ui_instrument": True,
+                                "store_in_memory": False,
+                                "cognitive_visible": False,
+                            },
+                            timestamp=time.time(),
+                        )
+                    )
+            await asyncio.sleep(VISION_SAMPLE_INTERVAL_S)
+
+    async def select_visual_object(self, track_id: str) -> None:
+        """Point MB's short-lived attention at one current visual object.
+
+        This is deliberately a control/context event, not a label or identity
+        assertion. The vision-attention organ decides whether the track is still
+        current and binds it to the next relevant user input.
+        """
+        track_id = str(track_id or "").strip()
+        if not track_id:
+            return
+        await self.orch.push_event(
+            "control/vision_attention",
+            {"action": "select", "track_id": track_id},
+            meta={
+                "source": "ui",
+                "channel": "dashboard",
+                "store_in_memory": False,
+                "cognitive_visible": False,
+                "user_pointing": True,
+            },
+            source="dashboard",
+        )
+
     async def send_text(self, text: str) -> None:
         prompt = (text or "").strip()
         if not prompt:
@@ -198,12 +270,14 @@ class DashboardBridge:
     def runtime_snapshot(self) -> dict[str, Any]:
         kv = self.orch.kv_store
         metrics = self.orch.bus.metrics
+        body_metrics = self.orch.body_bus.metrics
         ddna_profile = kv.get("pdna:ddna_mutators") or {}
         ddna_effective = kv.get("drive:ddna_modulators") or {}
         return {
             "schema": DASHBOARD_SNAPSHOT_SCHEMA,
             "ts": time.time(),
             "queue_depth": int(self.orch.event_queue.qsize()),
+            "body_queue_depth": int(self.orch.body_event_queue.qsize()),
             "dashboard_queue_depth": int(self.recv_q.qsize()),
             "dashboard_dropped_events": int(self._dropped_events),
             "neurons": len(self.orch.neurons),
@@ -219,6 +293,19 @@ class DashboardBridge:
                 "last_noninfra_event_time": self._last_noninfra_time,
                 "heartbeat_primary_topic": PRIMARY_HEARTBEAT_TOPIC,
             },
+            "body_bus": {
+                "total_published": int(body_metrics.total_published),
+                "total_dispatched": int(body_metrics.total_dispatched),
+                "handler_errors": int(body_metrics.total_handler_errors),
+                "last_error": body_metrics.last_error,
+                "last_error_subscriber": body_metrics.last_error_subscriber,
+                "last_event_topic": body_metrics.last_event_topic,
+                "last_event_time": body_metrics.last_event_time,
+            },
+            "heartbeat": safe_json(kv.get("body:heartbeat:stats", {})),
+            "adrenaline": safe_json(kv.get("body:adrenaline", {})),
+            "capability": safe_json(kv.get("capability:state", {})),
+            "vision": safe_json(kv.get("visual:current", {})),
             "organs": {
                 "memory_composer": bool(kv.get("mem_cell:composer:started", False)),
                 "read_sidecar": bool(kv.get("read:sidecar_started", False)),
@@ -226,6 +313,36 @@ class DashboardBridge:
                 "power_mode": kv.get("power:mode", "awake"),
                 "vision_enabled": bool(kv.get("vision:enabled", False)),
                 "tts_enabled": bool(kv.get("tts:enabled", False)),
+            },
+            # SLEARN keeps its detailed work on the engineering side of the UI.
+            # Future bucket/preflight/workspace fields are carried when present,
+            # while older sidecars still populate the stable counters below.
+            "slearn": {
+                "enabled": bool(kv.get("slearn:enabled", False)),
+                "sidecar_started": bool(kv.get("slearn:sidecar_started", False)),
+                "active_file": str(kv.get("slearn:active_file", "") or ""),
+                "chunk_index": int(kv.get("slearn:chunk_index", 0) or 0),
+                "last_activity_ts": float(kv.get("slearn:last_activity_ts", 0.0) or 0.0),
+                "files_completed_count": int(kv.get("slearn:files_completed_count", 0) or 0),
+                "rules_emitted_total": int(kv.get("slearn:rules_emitted_total", 0) or 0),
+                "rules_staged_total": int(kv.get("slearn:rules_staged_total", kv.get("slearn:rules_emitted_total", 0)) or 0),
+                "rules_applied_total": int(kv.get("slearn:rules_applied_total", 0) or 0),
+                "saved_cells_total": int(kv.get("slearn:saved_cells_total", 0) or 0),
+                "mode": str(kv.get("slearn:mode", kv.get("slearn:ingest_mode", "")) or ""),
+                "status": str(kv.get("slearn:status", "") or ""),
+                "phase": str(kv.get("slearn:phase", "") or ""),
+                "eof": bool(kv.get("slearn:eof", False)),
+                "outstanding_batches": int(kv.get("slearn:outstanding_batches", 0) or 0),
+                "composer_flush_batches": int(kv.get("slearn:composer_flush_batches", 0) or 0),
+                "composer_busy": bool(kv.get("mem_cell:composer:busy", False)),
+                "composer_learned_deferred": bool(kv.get("mem_cell:composer:learned_deferred", False)),
+                "composer_pending": safe_json(kv.get("mem_cell:composer:pending_count", {})),
+                "composer_health": safe_json(kv.get("mem_cell:composer:health", {})),
+                "composer_last_status": safe_json(kv.get("mem_cell:composer:last_status", {})),
+                "composer_last_error": str(kv.get("mem_cell:composer:last_error", "") or ""),
+                "preflight": safe_json(kv.get("slearn:preflight", {})),
+                "workspace": safe_json(kv.get("slearn:workspace", {})),
+                "last_result": safe_json(kv.get("slearn:last_result", {})),
             },
             "runtime_tunables": runtime_tuning_candidates(kv),
             "ddna": safe_json(ddna_profile),

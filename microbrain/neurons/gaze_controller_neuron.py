@@ -7,7 +7,10 @@ from typing import Any, Dict, Iterable, List, Tuple
 from microbrain.orchestrator.neuron_base import BaseNeuron, Event, NeuronConfig
 from microbrain.orchestrator.orchestrator import Orchestrator
 
+from microbrain.utils.heartbeat_stream import service_topic
+
 NEURON_NAME = Path(__file__).stem
+SERVICE_TOPIC = service_topic("gaze")
 
 
 class GazeControllerNeuron(BaseNeuron):
@@ -51,7 +54,11 @@ class GazeControllerNeuron(BaseNeuron):
             return await self._manual_focus(event, ctx)
         if event.topic == 'vision/proto_object':
             return await self._on_proto_object(event, ctx)
-        if event.topic != 'clock/tick':
+        if event.topic == 'vision/motion_attention':
+            return await self._on_motion_attention(event, ctx)
+        if event.topic == 'vision/attention_anchor':
+            return await self._on_visual_anchor(event, ctx)
+        if event.topic != SERVICE_TOPIC:
             return []
         return await self._tick(event, ctx)
 
@@ -64,6 +71,9 @@ class GazeControllerNeuron(BaseNeuron):
                 'radius': 0.12,
                 'mode': 'roam',
                 'target_proto_id': '',
+                'target_motion_id': '',
+                'search_center_x': 0.5,
+                'search_center_y': 0.5,
                 'dwell_until': 0.0,
                 'settle_until': 0.0,
                 'move_budget': 1.0,
@@ -167,6 +177,85 @@ class GazeControllerNeuron(BaseNeuron):
         await self._save_state(ctx, state)
         return []
 
+    async def _on_motion_attention(self, event: Event, ctx) -> List[Event]:
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        track_id = str(payload.get('track_id', '') or '').strip()
+        if not track_id:
+            return []
+        kind = str(payload.get('kind', '') or '').strip().lower()
+        position = payload.get('position', {}) if isinstance(payload.get('position'), dict) else {}
+        try:
+            fx = self._clamp(float(position.get('x', 0.5) or 0.5), 0.0, 1.0)
+            fy = self._clamp(float(position.get('y', 0.5) or 0.5), 0.0, 1.0)
+        except Exception:
+            fx, fy = 0.5, 0.5
+        state = await self._load_state(ctx)
+        now = time.time()
+
+        # Do not let every passing motion track steal attention once MB has
+        # already chosen a target. Reacquisition of the current target always
+        # wins; a fresh onset can claim attention only when no motion target is
+        # held or the prior one is already in search/release.
+        current_target = str(state.get('target_motion_id', '') or '')
+        if kind == 'motion_onset' and current_target and current_target != track_id and str(state.get('mode') or '') not in {'search', 'release', 'roam'}:
+            return []
+
+        if kind in {'motion_onset', 'reacquired', 'follow'}:
+            state['x'] = fx
+            state['y'] = fy
+            state['search_center_x'] = fx
+            state['search_center_y'] = fy
+            state['target_motion_id'] = track_id
+            state['mode'] = 'lock'
+            state['radius'] = self._clamp(min(float(state.get('radius', 0.12) or 0.12), 0.09), 0.03, 0.35)
+            state['dwell_until'] = now + (0.28 if kind == 'follow' else 0.7)
+            state['settle_until'] = now + 0.08
+            state['why'] = f'motion:{kind}:{track_id}'
+        elif kind == 'lost' and (not current_target or current_target == track_id):
+            state['x'] = fx
+            state['y'] = fy
+            state['search_center_x'] = fx
+            state['search_center_y'] = fy
+            state['target_motion_id'] = track_id
+            state['mode'] = 'search'
+            state['inspect_step_idx'] = 0
+            state['radius'] = self._clamp(max(float(state.get('radius', 0.10) or 0.10), 0.12), 0.03, 0.35)
+            state['dwell_until'] = now + 0.18
+            state['settle_until'] = now + 0.08
+            state['why'] = f'motion:lost:{track_id}'
+        await self._save_state(ctx, state)
+        return []
+
+    async def _on_visual_anchor(self, event: Event, ctx) -> List[Event]:
+        """A dashboard click is treated like a human pointing gesture."""
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        track_id = str(payload.get('track_id', '') or '').strip()
+        bbox = payload.get('bbox')
+        if not track_id or not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+            return []
+        latest = await ctx.get_kv('vision:frame:latest', {})
+        try:
+            width = float((latest or {}).get('width', 0) or 0)
+            height = float((latest or {}).get('height', 0) or 0)
+            x, y, w, h = (float(v) for v in bbox[:4])
+            if width <= 0 or height <= 0:
+                return []
+            fx = self._clamp((x + w / 2.0) / width, 0.0, 1.0)
+            fy = self._clamp((y + h / 2.0) / height, 0.0, 1.0)
+        except Exception:
+            return []
+        state = await self._load_state(ctx)
+        now = time.time()
+        state['x'] = fx
+        state['y'] = fy
+        state['mode'] = 'hold'
+        state['radius'] = self._clamp(min(float(state.get('radius', 0.12) or 0.12), 0.10), 0.03, 0.35)
+        state['dwell_until'] = now + 1.2
+        state['settle_until'] = now + 0.08
+        state['why'] = f'user_pointing:{track_id}'
+        await self._save_state(ctx, state)
+        return []
+
     async def _tick(self, event: Event, ctx) -> List[Event]:
         if not bool(await ctx.get_kv('vision:enabled', False)):
             return []
@@ -190,14 +279,21 @@ class GazeControllerNeuron(BaseNeuron):
 
         mode = str(state.get('mode', 'roam') or 'roam')
         outputs: List[Event] = []
-        if mode in {'inspect', 'lock'} and float(state.get('move_budget', 0.0) or 0.0) >= 0.18:
+        if mode == 'search' and float(state.get('move_budget', 0.0) or 0.0) >= 0.16:
+            self._search_nudge(state)
+            state['move_budget'] = self._clamp(float(state.get('move_budget', 0.0) or 0.0) - 0.16, 0.0, 1.5)
+            state['settle_until'] = now + float(await ctx.get_kv('vision:gaze:settle_s', 0.22) or 0.22)
+            state['dwell_until'] = now + 0.35
+            state['last_move_ts'] = now
+            state['why'] = f"search:near:{state.get('target_motion_id', '')}"
+        elif mode in {'inspect', 'lock'} and float(state.get('move_budget', 0.0) or 0.0) >= 0.18:
             self._micro_nudge(state)
             state['move_budget'] = self._clamp(float(state.get('move_budget', 0.0) or 0.0) - 0.18, 0.0, 1.5)
             state['settle_until'] = now + float(await ctx.get_kv('vision:gaze:settle_s', 0.22) or 0.22)
             state['dwell_until'] = now + float(await ctx.get_kv('vision:gaze:inspect_dwell_s', 1.0) or 1.0)
             state['last_move_ts'] = now
             state['why'] = f'{mode}:micro'
-        elif float(state.get('move_budget', 0.0) or 0.0) >= 0.24 and mode not in {'manual'}:
+        elif float(state.get('move_budget', 0.0) or 0.0) >= 0.24 and mode not in {'manual', 'search'}:
             self._roam_step(state)
             state['move_budget'] = self._clamp(float(state.get('move_budget', 0.0) or 0.0) - 0.24, 0.0, 1.5)
             state['settle_until'] = now + float(await ctx.get_kv('vision:gaze:settle_s', 0.22) or 0.22)
@@ -245,6 +341,26 @@ class GazeControllerNeuron(BaseNeuron):
         state['x'] = self._clamp(base_x + dx, 0.0, 1.0)
         state['y'] = self._clamp(base_y + dy, 0.0, 1.0)
 
+    def _search_nudge(self, state: Dict[str, Any]) -> None:
+        # Bounded local reacquisition scan around the predicted/last-seen
+        # position. This deliberately searches nearby regions before allowing
+        # the ordinary roam policy to take over.
+        idx = int(state.get('inspect_step_idx', 0) or 0)
+        offsets = (
+            (0.00, 0.00),
+            (0.035, 0.00), (-0.035, 0.00),
+            (0.00, 0.035), (0.00, -0.035),
+            (0.050, 0.035), (-0.050, 0.035),
+            (0.050, -0.035), (-0.050, -0.035),
+            (0.080, 0.00), (-0.080, 0.00),
+        )
+        dx, dy = offsets[idx % len(offsets)]
+        state['inspect_step_idx'] = idx + 1
+        cx = float(state.get('search_center_x', state.get('x', 0.5)) or 0.5)
+        cy = float(state.get('search_center_y', state.get('y', 0.5)) or 0.5)
+        state['x'] = self._clamp(cx + dx, 0.0, 1.0)
+        state['y'] = self._clamp(cy + dy, 0.0, 1.0)
+
     def _next_radius(self, state: Dict[str, Any]) -> float:
         mode = str(state.get('mode', 'roam') or 'roam')
         current = float(state.get('radius', 0.12) or 0.12)
@@ -258,6 +374,8 @@ class GazeControllerNeuron(BaseNeuron):
             return self._clamp(current * 0.92, 0.03, 0.35)
         if mode == 'lock':
             return self._clamp(current * 0.88, 0.03, 0.35)
+        if mode == 'search':
+            return self._clamp(current * 0.96 + 0.14 * 0.04, 0.06, 0.24)
         return self._clamp(current, 0.03, 0.35)
 
     @staticmethod
@@ -268,7 +386,7 @@ class GazeControllerNeuron(BaseNeuron):
 def build_neurons(orchestrator: Orchestrator):
     cfg = NeuronConfig(
         name=NEURON_NAME,
-        subscribed_topics=['clock/tick', 'vision/proto_object', 'control/focus'],
+        subscribed_topics=[SERVICE_TOPIC, 'vision/proto_object', 'vision/motion_attention', 'vision/attention_anchor', 'control/focus'],
         output_topics=['reason/output'],
         priority=6,
     )

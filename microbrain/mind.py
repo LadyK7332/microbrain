@@ -6,7 +6,6 @@ import logging
 import os
 import sys
 import time
-import uuid
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +27,7 @@ from microbrain.orchestrator.neuron_loader import auto_register_neurons
 from microbrain.orchestrator.debug_utils import set_debug_enabled
 from microbrain.ipc.token import ensure_token_file
 from microbrain.utils.instance_lock import acquire_instance_lock
+from microbrain.utils.heartbeat_stream import HEARTBEAT_HZ, HEARTBEAT_INTERVAL_S
 
 _INSTANCE_LOCK = None
 WhisperAudioListener = None
@@ -421,6 +421,21 @@ async def main_async(cfg: AppConfig):
     orch.kv_store.setdefault("capability:state", {})
     orch.kv_store.setdefault("capability:fallbacks", {})
 
+    # Body heartbeat / sympathetic scheduler.  The pacemaker itself is a fixed
+    # infrastructure law; these KV values expose current runtime state and allow
+    # cadence-profile tuning without turning the heartbeat into DDNA/personality.
+    orch.kv_store.setdefault("body:heartbeat:hz", HEARTBEAT_HZ)
+    orch.kv_store.setdefault("body:heartbeat:interval_s", HEARTBEAT_INTERVAL_S)
+    orch.kv_store.setdefault("body:heartbeat:stats", {})
+    orch.kv_store.setdefault("body:heartbeat:last", {})
+    orch.kv_store.setdefault("body:heartbeat:missed_total", 0)
+    orch.kv_store.setdefault("body:arousal_mode", "normal")
+    orch.kv_store.setdefault("body:adrenaline", {})
+    orch.kv_store.setdefault("body:organ_cadence", {})
+    orch.kv_store.setdefault("body:cadence_profile:normal", {})
+    orch.kv_store.setdefault("body:cadence_profile:alert", {})
+    orch.kv_store.setdefault("body:cadence_profile:emergency", {})
+
     # Evidence recorder / hazard gating (split raw streams; OFF unless armed).
     orch.kv_store.setdefault("er:enabled", True)
     orch.kv_store.setdefault("er:armed", False)
@@ -672,6 +687,7 @@ async def main_async(cfg: AppConfig):
     # pending rows, then this desk-goblin drains and composes them into memory.
     memory_composer_sidecar = None
     try:
+        logger.info("Starting memory composer sidecar …")
         from microbrain.sidecars.memory_composer_sidecar import MemoryComposerSidecar
 
         memory_composer_sidecar = MemoryComposerSidecar(orch, memdir=cfg.memdir)
@@ -687,6 +703,7 @@ async def main_async(cfg: AppConfig):
     # structured curriculum ingestion do not block the interaction/UI layer.
     read_sidecar = None
     try:
+        logger.info("Starting read/SLEARN sidecar …")
         from microbrain.sidecars.read_sidecar import ReadSidecar
 
         read_sidecar = ReadSidecar(orch, memdir=cfg.memdir)
@@ -701,40 +718,16 @@ async def main_async(cfg: AppConfig):
         logger.exception("Failed to start read/slearn sidecar")
 
     # ------------------------------------------------------------------
-    # Heartbeat: drive "time passing" as body infrastructure, not cognition.
+    # Body pacemaker: one canonical 20-TPS infrastructure heartbeat.
     # ------------------------------------------------------------------
-    from microbrain.utils.heartbeat_stream import (
-        COMPAT_HEARTBEAT_TOPIC,
-        PRIMARY_HEARTBEAT_TOPIC,
-        heartbeat_meta,
-        heartbeat_payload,
-    )
+    # The pacemaker is its own body service. ``mind`` only starts it; raw body
+    # cadence lives on the isolated infrastructure bus and never enters the
+    # cognitive event stream.
+    from microbrain.body.heartbeat import BodyHeartbeatPacemaker
 
-    async def _clock_tick_loop():
-        # Low rate by default; enough to drive boredom/decay/cooldowns without
-        # promoting the raw pulse into cognition.  The compatibility alias is
-        # emitted first so older organs keep working while the primary stream
-        # becomes the authoritative body-side heartbeat.
-        while True:
-            await asyncio.sleep(0.5)
-            ts = time.time()
-            corr = uuid.uuid4().hex
-            await orch.push_event(
-                COMPAT_HEARTBEAT_TOPIC,
-                heartbeat_payload(ts),
-                meta=heartbeat_meta(compat_alias=True),
-                source="mind.clock",
-                correlation_id=corr,
-            )
-            await orch.push_event(
-                PRIMARY_HEARTBEAT_TOPIC,
-                heartbeat_payload(ts),
-                meta=heartbeat_meta(),
-                source="mind.clock",
-                correlation_id=corr,
-            )
-
-    asyncio.create_task(_clock_tick_loop())
+    body_pacemaker = BodyHeartbeatPacemaker(orch)
+    body_pacemaker.start()
+    orch.kv_store["body:heartbeat:pacemaker"] = body_pacemaker
 
     if getattr(cfg, "ui", "repl") == "dashboard":
         logger.info("Starting native PySide6 dashboard …")
@@ -756,7 +749,7 @@ async def main_async(cfg: AppConfig):
     else:
         logger.info("Starting text REPL …")
         while True:
-            # IMPORTANT: don't block the asyncio loop (lets clock/tick + background outputs run)
+            # IMPORTANT: don't block the asyncio loop (lets body cadence + background outputs run)
             raw = await asyncio.to_thread(input, "you> ")
             prompt = (raw or "").strip()
             if not prompt:

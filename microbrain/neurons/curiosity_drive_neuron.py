@@ -7,7 +7,10 @@ from typing import Iterable
 from microbrain.orchestrator.neuron_base import BaseNeuron, NeuronConfig, Event
 from microbrain.orchestrator.orchestrator import Orchestrator
 
+from microbrain.utils.heartbeat_stream import service_topic
+
 NEURON_NAME = Path(__file__).stem
+SERVICE_TOPIC = service_topic("curiosity")
 
 
 class CuriosityDriveNeuron(BaseNeuron):
@@ -23,7 +26,7 @@ class CuriosityDriveNeuron(BaseNeuron):
         (It checks sensor flags but treats missing keys as False.)
 
     This neuron does NOT listen for user prompts. It keeps time primarily
-    via clock/tick, and will only emit internal thoughts when attention gates allow it.
+    via body service/curiosity, and will only emit internal thoughts when attention gates allow it.
     """
 
     async def process(self, event: Event, ctx) -> Iterable[Event]:
@@ -37,7 +40,7 @@ class CuriosityDriveNeuron(BaseNeuron):
         )
 
         # Only treat certain topics as "time ticks" for curiosity
-        if event.topic not in ("clock/tick", "percept/text", "percept/vision", "act/speech"):
+        if event.topic not in (SERVICE_TOPIC, "percept/text", "percept/vision", "act/speech"):
             return []
 
         # Legacy curiosity mode is now opt-in. The initiative threshold neuron
@@ -244,7 +247,7 @@ class CuriosityDriveNeuron(BaseNeuron):
         curiosity_text = None
 
         # Feedback-driven micro-probe: after a user correction, ask a smaller question.
-        micro_probe = (boost > 0.0) and (event.topic in ("clock/tick", "percept/text"))
+        micro_probe = (boost > 0.0) and (event.topic in (SERVICE_TOPIC, "percept/text"))
         if micro_probe:
             node_text = ""
             if hrm is not None and isinstance(hrm_last_idx, int):
@@ -495,7 +498,7 @@ def build_neurons(orchestrator: Orchestrator):
     cfg = NeuronConfig(
         name=NEURON_NAME,
         subscribed_topics=[
-            "clock/tick",
+            SERVICE_TOPIC,
             "percept/text",
             "percept/vision",
             "act/speech",

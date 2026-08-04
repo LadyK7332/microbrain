@@ -2,6 +2,7 @@ import asyncio
 
 from microbrain.neurons.thought_turn_arbitration_neuron import ThoughtTurnArbitrationNeuron
 from microbrain.orchestrator.neuron_base import Event, NeuronConfig
+from microbrain.utils.heartbeat_stream import service_topic
 
 
 class FakeCtx:
@@ -31,7 +32,7 @@ def make_neuron():
     return ThoughtTurnArbitrationNeuron(
         NeuronConfig(
             name="thought_turn_arbitration_neuron",
-            subscribed_topics=["drive/power_request", "clock/tick", "event/relief/power"],
+            subscribed_topics=["drive/power_request", service_topic("cognition"), "event/relief/power"],
             output_topics=["thought/object", "thought/action_candidate", "thought/turn_state"],
         )
     )

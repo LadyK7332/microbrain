@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import time
 from pathlib import Path
 from typing import Any, Mapping
 
-from PySide6.QtCore import Qt, QTimer, QUrl
-from PySide6.QtGui import QDesktopServices, QPainter, QPen, QPixmap
+from PySide6.QtCore import QPointF, QSettings, Qt, QTimer, QUrl
+from PySide6.QtGui import QBrush, QColor, QDesktopServices, QPainter, QPen, QPixmap, QPolygonF
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QDockWidget,
+    QFrame,
     QFormLayout,
     QHBoxLayout,
     QLabel,
@@ -20,11 +23,14 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QPushButton,
     QPlainTextEdit,
+    QProgressBar,
+    QSizePolicy,
     QSplitter,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QTreeWidget,
+    QToolButton,
     QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
@@ -41,6 +47,12 @@ from microbrain.ui.frontend_common import (
     should_show_in_conversation,
 )
 from microbrain.ui.dashboard.config_catalog import scan_repo
+from microbrain.vision_state import bbox_xywh
+from microbrain.ui.dashboard.status_signals import (
+    capability_counts,
+    capability_short_label,
+    capability_signal_map,
+)
 
 # ---------------------------------------------------------------------------
 # Behavioral tuning
@@ -52,13 +64,38 @@ MAX_RAW_LINES = 1500
 MAX_TRACE_GROUPS = 120
 MAX_EVIDENCE_ROWS = 400
 VISION_OVERLAY_LINE_WIDTH = 2
+VISION_OVERLAY_SELECTED_LINE_WIDTH = 4
+VISION_SELECTION_FLASH_MS = 850
+VISION_CONFIDENT_THRESHOLD = 0.75
+VISION_COLOR_IDENTIFIED = "#35c759"
+VISION_COLOR_UNCERTAIN = "#ffd60a"
+VISION_COLOR_UNKNOWN = "#0a84ff"
+VISION_COLOR_HAZARD = "#ff453a"
+VISION_COLOR_LOST = "#8e8e93"
+VISION_COLOR_SELECTED = "#ffffff"
 LOG_TAIL_POLL_MS = 500
 LOG_TAIL_INITIAL_BYTES = 65536
 DEFAULT_SCREEN_MARGIN_PX = 20
+COMPACT_PANEL_HEIGHT_PX = 34
+COMPACT_PANEL_WIDTH_PX = 190
+COMPACT_DOCK_HEIGHT_PX = 36
+COMPACT_DOCK_WIDTH_PX = 210
+MAX_SLEARN_LOG_LINES = 400
+CAPABILITY_GOOD_COLOR = "#35c759"
+CAPABILITY_BAD_COLOR = "#ff453a"
+CAPABILITY_UNKNOWN_COLOR = "#8e8e93"
+HEARTBEAT_GOOD_COLOR = "#35c759"
+HEARTBEAT_ALERT_COLOR = "#ffd60a"
+HEARTBEAT_BAD_COLOR = "#ff453a"
+HEARTBEAT_UNKNOWN_COLOR = "#8e8e93"
 
 # ---------------------------------------------------------------------------
 # Required static constants
 # ---------------------------------------------------------------------------
+
+WORKSPACE_SETTINGS_ORG = "ExisMechanica"
+WORKSPACE_SETTINGS_APP = "MicroBrainDashboard"
+WORKSPACE_SETTINGS_VERSION = 2
 
 TRACE_STAGE_PREFIXES = (
     ("input/", "Input"),
@@ -98,7 +135,679 @@ def _stage(topic: str) -> str:
     return "Bus"
 
 
+def _settings_bool(value: object, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _settings_sizes(value: object) -> list[int]:
+    if isinstance(value, (list, tuple)):
+        out: list[int] = []
+        for item in value:
+            try:
+                out.append(int(item))
+            except Exception:
+                pass
+        return out
+    if value is None:
+        return []
+    text = str(value).strip()
+    if not text:
+        return []
+    out = []
+    for item in text.split(","):
+        try:
+            out.append(int(item.strip()))
+        except Exception:
+            pass
+    return out
+
+
+def _sizes_text(splitter: QSplitter) -> str:
+    return ",".join(str(int(v)) for v in splitter.sizes())
+
+
+def _is_slearn_diagnostic(msg: UIMessage) -> bool:
+    kind = str((msg.meta or {}).get("kind") or "").lower()
+    return msg.topic.startswith("slearn/") or kind.startswith("slearn_")
+
+
+def _is_status_instrument_event(msg: UIMessage) -> bool:
+    """Telemetry rendered as an instrument, not as a scrolling trace line."""
+
+    return msg.topic in {"capability/state", "ui/vision_current"}
+
+
+def _is_ephemeral_visual_sample(msg: UIMessage) -> bool:
+    """High-rate vision samples that must not become dashboard disk/history sludge."""
+
+    return msg.topic in {"percept/vision", "percept/vision/features", "ui/vision_current"}
+
+
+class CapabilityStatusStrip(QWidget):
+    """Compact red/green capability lamps for Presence and Engineering."""
+
+    def __init__(self, title: str = "CAP") -> None:
+        super().__init__()
+        self._title = title
+        self._payload: dict[str, Any] = {}
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(4, 1, 4, 1)
+        layout.setSpacing(4)
+        self.label = QLabel(f"{html.escape(title)} — waiting")
+        self.label.setTextFormat(Qt.RichText)
+        self.label.setMinimumWidth(0)
+        self.label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.label.setToolTip("Capability / available-signal status. Green = available, red = unavailable.")
+        layout.addWidget(self.label, 1)
+
+    def update_payload(self, payload: Mapping[str, Any] | None) -> None:
+        self._payload = dict(payload) if isinstance(payload, Mapping) else {}
+        signals = capability_signal_map(self._payload)
+        if not signals:
+            self.label.setText(f'{html.escape(self._title)} <span style="color:{CAPABILITY_UNKNOWN_COLOR}">●</span> waiting')
+            return
+        up, total = capability_counts(self._payload)
+        bits = [f"<b>{html.escape(self._title)}</b> {up}/{total}"]
+        for name, available in signals.items():
+            color = CAPABILITY_GOOD_COLOR if available else CAPABILITY_BAD_COLOR
+            label = html.escape(capability_short_label(name))
+            bits.append(f'<span style="color:{color}">●</span>&nbsp;{label}')
+        self.label.setText("&nbsp;&nbsp;".join(bits))
+
+    def compact_text(self) -> str:
+        up, total = capability_counts(self._payload)
+        return f"cap {up}/{total}" if total else "cap waiting"
+
+
+class HeartbeatStatusStrip(QWidget):
+    """Compact body-clock health / arousal instrument for Engineering."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._heartbeat: dict[str, Any] = {}
+        self._adrenaline: dict[str, Any] = {}
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(4, 1, 4, 1)
+        layout.setSpacing(4)
+        self.label = QLabel('HEART <span style="color:#8e8e93">●</span> waiting')
+        self.label.setTextFormat(Qt.RichText)
+        self.label.setToolTip(
+            "Canonical body heartbeat. 20 TPS is scheduling; monotonic timestamps are elapsed-time truth."
+        )
+        layout.addWidget(self.label, 1)
+
+    def update_payloads(
+        self,
+        heartbeat: Mapping[str, Any] | None,
+        adrenaline: Mapping[str, Any] | None,
+    ) -> None:
+        self._heartbeat = dict(heartbeat) if isinstance(heartbeat, Mapping) else {}
+        self._adrenaline = dict(adrenaline) if isinstance(adrenaline, Mapping) else {}
+
+        last_ts = float(self._heartbeat.get("last_epoch_s", 0.0) or 0.0)
+        age = max(0.0, time.time() - last_ts) if last_ts else 9999.0
+        hz = float(self._heartbeat.get("actual_hz_ema", 0.0) or 0.0)
+        jitter = float(self._heartbeat.get("jitter_ms_ema", 0.0) or 0.0)
+        missed = int(self._heartbeat.get("missed_total", 0) or 0)
+        mode = str(self._adrenaline.get("mode", "normal") or "normal").upper()
+
+        if not last_ts:
+            lamp = HEARTBEAT_UNKNOWN_COLOR
+            status = "waiting"
+        elif age > 0.50:
+            lamp = HEARTBEAT_BAD_COLOR
+            status = f"stale {age:.1f}s"
+        elif mode == "EMERGENCY":
+            lamp = HEARTBEAT_BAD_COLOR
+            status = "EMERGENCY"
+        elif mode == "ALERT":
+            lamp = HEARTBEAT_ALERT_COLOR
+            status = "ALERT"
+        else:
+            lamp = HEARTBEAT_GOOD_COLOR
+            status = "NORMAL"
+
+        hz_text = f"{hz:.1f} TPS" if hz > 0.0 else "-- TPS"
+        self.label.setText(
+            f'<b>HEART</b> <span style="color:{lamp}">●</span>&nbsp;{hz_text}'
+            f'&nbsp;&nbsp; jitter {jitter:.1f} ms'
+            f'&nbsp;&nbsp; missed {missed}'
+            f'&nbsp;&nbsp; {html.escape(status)}'
+        )
+
+
+class CompactablePanel(QFrame):
+    """A splitter-friendly panel that can collapse without changing its slot.
+
+    In a horizontal splitter it becomes a narrow instrument strip. In a vertical
+    splitter it becomes a short header strip. Expanding restores the previous
+    splitter allocation when possible.
+    """
+
+    def __init__(self, title: str, content: QWidget) -> None:
+        super().__init__()
+        self.title = title
+        self.content = content
+        self._compact = False
+        self._saved_splitter_sizes: list[int] = []
+        self.setFrameShape(QFrame.StyledPanel)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(2)
+        header = QHBoxLayout()
+        header.setContentsMargins(4, 0, 2, 0)
+        self.title_label = QLabel(title)
+        self.title_label.setStyleSheet("font-weight: 600;")
+        self.status_label = QLabel("")
+        self.status_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.compact_button = QToolButton()
+        self.compact_button.setText("−")
+        self.compact_button.setToolTip("Compact this panel in place")
+        self.compact_button.clicked.connect(self.toggle_compact)
+        header.addWidget(self.title_label)
+        header.addWidget(self.status_label, 1)
+        header.addWidget(self.compact_button)
+        layout.addLayout(header)
+        layout.addWidget(content, 1)
+
+    @property
+    def is_compact(self) -> bool:
+        return self._compact
+
+    def set_status(self, text: str) -> None:
+        self.status_label.setText(str(text or ""))
+
+    def toggle_compact(self) -> None:
+        self.set_compact(not self._compact)
+
+    def set_compact(self, compact: bool) -> None:
+        compact = bool(compact)
+        if compact == self._compact:
+            return
+        splitter = self.parentWidget() if isinstance(self.parentWidget(), QSplitter) else None
+        index = splitter.indexOf(self) if splitter is not None else -1
+        if compact:
+            if splitter is not None:
+                self._saved_splitter_sizes = list(splitter.sizes())
+            self.content.setVisible(False)
+            self.compact_button.setText("+")
+            self.compact_button.setToolTip("Expand this panel")
+            self._compact = True
+            self._apply_compact_constraints(splitter)
+            if splitter is not None and index >= 0:
+                sizes = list(self._saved_splitter_sizes)
+                if len(sizes) == splitter.count():
+                    compact_size = (
+                        COMPACT_PANEL_WIDTH_PX
+                        if splitter.orientation() == Qt.Horizontal
+                        else COMPACT_PANEL_HEIGHT_PX
+                    )
+                    freed = max(0, sizes[index] - compact_size)
+                    sizes[index] = compact_size
+                    others = [i for i in range(len(sizes)) if i != index]
+                    if others and freed:
+                        target = max(others, key=lambda i: sizes[i])
+                        sizes[target] += freed
+                    splitter.setSizes(sizes)
+            return
+
+        self._compact = False
+        self.compact_button.setText("−")
+        self.compact_button.setToolTip("Compact this panel in place")
+        self.setMinimumSize(0, 0)
+        self.setMaximumSize(16777215, 16777215)
+        self.content.setVisible(True)
+        if splitter is not None and len(self._saved_splitter_sizes) == splitter.count():
+            splitter.setSizes(self._saved_splitter_sizes)
+
+    def _apply_compact_constraints(self, splitter: QSplitter | None) -> None:
+        self.setMinimumSize(0, 0)
+        self.setMaximumSize(16777215, 16777215)
+        if splitter is not None and splitter.orientation() == Qt.Horizontal:
+            self.setMinimumWidth(COMPACT_PANEL_WIDTH_PX)
+            self.setMaximumWidth(COMPACT_PANEL_WIDTH_PX)
+        else:
+            self.setMinimumHeight(COMPACT_PANEL_HEIGHT_PX)
+            self.setMaximumHeight(COMPACT_PANEL_HEIGHT_PX)
+
+
+class CompactDockWidget(QDockWidget):
+    """QDockWidget with a compact-in-place control while retaining Qt docking."""
+
+    def __init__(self, title: str, widget: QWidget, parent: QMainWindow) -> None:
+        super().__init__(title, parent)
+        self.base_title = title
+        self._compact_status = ""
+        self._compact = False
+        self._saved_min = (self.minimumWidth(), self.minimumHeight())
+        self._saved_max = (self.maximumWidth(), self.maximumHeight())
+        self.setWidget(widget)
+        self.setFeatures(QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable | QDockWidget.DockWidgetClosable)
+        self.compact_button = QToolButton(self)
+        self.compact_button.setText("−")
+        self.compact_button.setFixedSize(18, 18)
+        self.compact_button.setToolTip("Compact this dock in place")
+        self.compact_button.clicked.connect(self.toggle_compact)
+        self.dockLocationChanged.connect(lambda _area: self._reapply_compact_constraints())
+        self.topLevelChanged.connect(lambda _floating: self._reapply_compact_constraints())
+
+    @property
+    def is_compact(self) -> bool:
+        return self._compact
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        # Leave room for Qt's native float/close buttons on the far right.
+        self.compact_button.move(max(4, self.width() - 76), 3)
+        self.compact_button.raise_()
+
+    def set_compact_status(self, text: str) -> None:
+        self._compact_status = " ".join(str(text or "").split())
+        self._refresh_title()
+
+    def toggle_compact(self) -> None:
+        self.set_compact(not self._compact)
+
+    def set_compact(self, compact: bool) -> None:
+        compact = bool(compact)
+        if compact == self._compact:
+            return
+        self._compact = compact
+        content = self.widget()
+        if content is not None:
+            content.setVisible(not compact)
+        self.compact_button.setText("+" if compact else "−")
+        self.compact_button.setToolTip("Expand this dock" if compact else "Compact this dock in place")
+        if compact:
+            self._reapply_compact_constraints()
+        else:
+            self.setMinimumSize(*self._saved_min)
+            self.setMaximumSize(*self._saved_max)
+        self._refresh_title()
+
+    def _refresh_title(self) -> None:
+        if self._compact and self._compact_status:
+            self.setWindowTitle(f"{self.base_title} — {self._compact_status}")
+        else:
+            self.setWindowTitle(self.base_title)
+
+    def _reapply_compact_constraints(self) -> None:
+        if not self._compact:
+            return
+        self.setMinimumSize(0, 0)
+        self.setMaximumSize(16777215, 16777215)
+        parent = self.parentWidget()
+        area = parent.dockWidgetArea(self) if isinstance(parent, QMainWindow) else Qt.NoDockWidgetArea
+        if self.isFloating() or area in {Qt.TopDockWidgetArea, Qt.BottomDockWidgetArea, Qt.NoDockWidgetArea}:
+            self.setMinimumHeight(COMPACT_DOCK_HEIGHT_PX)
+            self.setMaximumHeight(COMPACT_DOCK_HEIGHT_PX)
+        else:
+            self.setMinimumWidth(COMPACT_DOCK_WIDTH_PX)
+            self.setMaximumWidth(COMPACT_DOCK_WIDTH_PX)
+
+
+class SlearnJobWidget(QWidget):
+    """Engineering-only SLEARN workbench/status panel.
+
+    It accepts today's chunk-status payloads and the richer preflight/bucket/
+    workspace/completion payloads planned for the ingestion rewrite.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._status_callback = None
+        self._last_file = ""
+        self._last_mode = ""
+        self._last_status = "idle"
+        self._last_history_signature = ""
+        self._last_composer_health: dict[str, Any] = {}
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.state_value = QLabel("idle")
+        self.file_value = QLabel("—")
+        self.mode_value = QLabel("—")
+        self.counts_value = QLabel("files 0 | staged 0 | applied 0")
+        self.workspace_value = QLabel("—")
+        self.composer_value = QLabel("idle")
+        self.composer_worker_value = QLabel("—")
+        self.composer_queue_value = QLabel("—")
+        self.composer_cycle_value = QLabel("—")
+        self.composer_fault_value = QLabel("none")
+        form.addRow("State", self.state_value)
+        form.addRow("File", self.file_value)
+        form.addRow("Mode", self.mode_value)
+        form.addRow("Counts", self.counts_value)
+        form.addRow("Workspace", self.workspace_value)
+        form.addRow("Composer", self.composer_value)
+        form.addRow("Worker", self.composer_worker_value)
+        form.addRow("Queue", self.composer_queue_value)
+        form.addRow("Cycle", self.composer_cycle_value)
+        form.addRow("Fault", self.composer_fault_value)
+        layout.addLayout(form)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setFormat("idle")
+        layout.addWidget(self.progress)
+        self.history = QPlainTextEdit()
+        self.history.setReadOnly(True)
+        self.history.setMaximumBlockCount(MAX_SLEARN_LOG_LINES)
+        self.history.setPlaceholderText("SLEARN preflight / ingest / cleanup / completion feedback")
+        layout.addWidget(self.history, 1)
+
+    def set_status_callback(self, callback) -> None:
+        self._status_callback = callback
+        self._emit_compact_status()
+
+    def update_snapshot(self, payload: Mapping[str, Any]) -> None:
+        merged: dict[str, Any] = dict(payload)
+        last_result = payload.get("last_result")
+        if isinstance(last_result, Mapping):
+            for key, value in last_result.items():
+                merged.setdefault(key, value)
+        self._apply_payload(merged, topic="snapshot", append_history=False)
+
+    def update_event(self, msg: UIMessage) -> None:
+        payload = dict(msg.payload) if isinstance(msg.payload, Mapping) else {"summary": _summary(msg.payload)}
+        self._apply_payload(payload, topic=msg.topic, append_history=True)
+
+    def _apply_payload(self, payload: Mapping[str, Any], *, topic: str, append_history: bool) -> None:
+        file_value = (
+            payload.get("active_file")
+            or payload.get("file")
+            or payload.get("completed_file")
+            or payload.get("source_name")
+            or ""
+        )
+        if file_value:
+            try:
+                self._last_file = Path(str(file_value)).name
+            except Exception:
+                self._last_file = str(file_value)
+
+        mode = payload.get("mode") or payload.get("ingest_mode") or payload.get("selected_mode") or ""
+        if mode:
+            self._last_mode = str(mode).upper()
+
+        status = str(payload.get("status") or "").strip().lower()
+        summary = str(payload.get("summary") or payload.get("reason") or "").strip()
+        if topic.startswith("learning/"):
+            status = topic.split("/", 1)[1]
+        elif payload.get("completed_file") or "completed" in summary.lower():
+            status = "completed"
+        elif status == "" and (self._last_file or payload.get("active_file")):
+            status = "active"
+        if status:
+            self._last_status = status
+
+        files_done = int(payload.get("files_completed_count", 0) or 0)
+        applied = int(payload.get("rules_applied_total", payload.get("applied", 0)) or 0)
+        accepted = payload.get("accepted")
+        duplicates = payload.get("duplicates")
+        rejected = payload.get("rejected")
+        outstanding = int(payload.get("outstanding_batches", 0) or 0)
+        counter_parts = [f"files {files_done}"]
+        if accepted is not None:
+            counter_parts.append(f"accepted {int(accepted or 0)}")
+        counter_parts.append(f"pending {outstanding}")
+        if duplicates is not None:
+            counter_parts.append(f"dupes {int(duplicates or 0)}")
+        if rejected is not None:
+            counter_parts.append(f"rejected {int(rejected or 0)}")
+        if applied:
+            counter_parts.append(f"committed total {applied}")
+
+        workspace_bits: list[str] = []
+        workspace = payload.get("workspace")
+        if isinstance(workspace, Mapping):
+            if "clean" in workspace:
+                workspace_bits.append("clean" if workspace.get("clean") else "dirty")
+            if "baseline_restored" in workspace:
+                workspace_bits.append("baseline restored" if workspace.get("baseline_restored") else "baseline pending")
+        if "workspace_clean" in payload:
+            workspace_bits.append("clean" if payload.get("workspace_clean") else "dirty")
+        if "baseline_restored" in payload:
+            workspace_bits.append("baseline restored" if payload.get("baseline_restored") else "baseline pending")
+        warnings = payload.get("warnings")
+        if isinstance(warnings, (list, tuple)) and warnings:
+            workspace_bits.append(f"warnings {len(warnings)}")
+
+        composer_busy = bool(payload.get("composer_busy", False))
+        composer_deferred = bool(payload.get("composer_learned_deferred", False))
+        flush_batches = int(payload.get("composer_flush_batches", 0) or 0)
+        if composer_busy:
+            composer_text = "committing learned memory"
+        elif composer_deferred:
+            composer_text = f"buffering {outstanding}/{flush_batches or '?'} batches"
+        elif outstanding:
+            composer_text = f"queued {outstanding} batch(es)"
+        else:
+            composer_text = "idle / caught up"
+
+        self.state_value.setText(self._last_status or "idle")
+        self.file_value.setText(self._last_file or "—")
+        self.mode_value.setText(self._last_mode or "—")
+        self.counts_value.setText(" | ".join(counter_parts))
+        self.workspace_value.setText(" | ".join(workspace_bits) if workspace_bits else "—")
+        self.composer_value.setText(composer_text)
+        self._update_composer_health(payload)
+        self._update_progress(payload)
+
+        if append_history:
+            stamp = time.strftime("%H:%M:%S")
+            text = summary or _summary(payload, 260)
+            signature = f"{topic}|{text}"
+            if text and signature != self._last_history_signature:
+                self.history.appendPlainText(f"{stamp}  {topic}> {text}")
+                self._last_history_signature = signature
+        self._emit_compact_status()
+
+
+    @staticmethod
+    def _age_text(ts: object) -> str:
+        try:
+            stamp = float(ts or 0.0)
+        except (TypeError, ValueError):
+            return "never"
+        if stamp <= 0.0:
+            return "never"
+        age = max(0.0, time.time() - stamp)
+        if age < 10.0:
+            return f"{age:.1f}s ago"
+        if age < 120.0:
+            return f"{int(age)}s ago"
+        if age < 7200.0:
+            return f"{age / 60.0:.1f}m ago"
+        return f"{age / 3600.0:.1f}h ago"
+
+    @staticmethod
+    def _tier_counts_text(value: object) -> str:
+        if not isinstance(value, Mapping):
+            return "0"
+        bits = []
+        labels = (("learned", "L"), ("now", "N"), ("short", "S"), ("long", "G"))
+        for key, label in labels:
+            count = int(value.get(key, 0) or 0)
+            if count:
+                bits.append(f"{label}:{count}")
+        return " ".join(bits) if bits else "0"
+
+    def _update_composer_health(self, payload: Mapping[str, Any]) -> None:
+        health = payload.get("composer_health")
+        if isinstance(health, Mapping) and health:
+            self._last_composer_health = dict(health)
+        elif self._last_composer_health:
+            # SLEARN progress/status events often do not carry the full composer
+            # health snapshot.  Keep the last real health instead of flickering
+            # back to legacy mode between bus messages.
+            health = dict(self._last_composer_health)
+        else:
+            self.composer_worker_value.setText("legacy telemetry only")
+            pending = payload.get("composer_pending", {})
+            self.composer_queue_value.setText(f"pending {self._tier_counts_text(pending)}")
+            self.composer_cycle_value.setText("—")
+            self.composer_fault_value.setText(str(payload.get("composer_last_error", "") or "none"))
+            return
+
+        state = str(health.get("state", "unknown") or "unknown")
+        task_alive = bool(health.get("task_alive", False))
+        busy_age = float(health.get("busy_age_s", 0.0) or 0.0)
+        pulse_age = self._age_text(health.get("ts"))
+        phase = health.get("compose_phase")
+        if not isinstance(phase, Mapping):
+            phase = {}
+        phase_name = str(phase.get("phase", "") or "")
+        phase_tier = str(phase.get("tier", "") or "")
+        phase_detail = str(phase.get("detail", "") or "")
+        phase_file = str(phase.get("file", "") or "")
+        phase_age = float(phase.get("phase_age_s", 0.0) or 0.0)
+        phase_pulse_age = float(phase.get("phase_pulse_age_s", 0.0) or 0.0)
+        worker_bits = ["alive" if task_alive else "DEAD", state, f"pulse {pulse_age}"]
+        if busy_age > 0.0:
+            worker_bits.append(f"busy {busy_age:.1f}s")
+        if phase_name and phase_name != "idle":
+            phase_bits = [phase_name]
+            if phase_tier:
+                phase_bits.append(phase_tier)
+            if phase_age > 0.0:
+                phase_bits.append(f"{phase_age:.1f}s")
+            if phase_pulse_age > 5.0:
+                phase_bits.append(f"pulse stale {phase_pulse_age:.1f}s")
+            worker_bits.append("phase " + " ".join(phase_bits))
+        if health.get("lock_exists"):
+            worker_bits.append(f"lock {float(health.get('lock_age_s', 0.0) or 0.0):.1f}s")
+        queue_scan_age = float(health.get("queue_scan_age_s", 0.0) or 0.0)
+        if health.get("queue_scan_stalled"):
+            worker_bits.append(f"queue scan STALLED {queue_scan_age:.1f}s")
+        elif health.get("queue_scan_running"):
+            worker_bits.append(f"queue scan {queue_scan_age:.1f}s")
+        scan_tiers = health.get("scan_tiers")
+        if isinstance(scan_tiers, (list, tuple)) and scan_tiers:
+            worker_bits.append("scan " + ",".join(str(t) for t in scan_tiers))
+        reason = str(health.get("target_tiers_reason", "") or "")
+        if reason and reason != "normal":
+            worker_bits.append(reason)
+        self.composer_worker_value.setText(" | ".join(worker_bits))
+
+        pending_text = self._tier_counts_text(health.get("pending", {}))
+        processing_text = self._tier_counts_text(health.get("processing", {}))
+        self.composer_queue_value.setText(f"pending {pending_text} | processing {processing_text}")
+
+        last_status = health.get("last_status")
+        if not isinstance(last_status, Mapping):
+            last_status = {}
+        cycle_bits = [f"#{int(health.get('cycle_index', 0) or 0)}"]
+        elapsed = float(health.get("last_cycle_elapsed_s", 0.0) or 0.0)
+        if elapsed > 0.0:
+            cycle_bits.append(f"last {elapsed:.2f}s")
+        if health.get("last_success_ts"):
+            cycle_bits.append(f"good {self._age_text(health.get('last_success_ts'))}")
+        files_processed = int(last_status.get("files_processed", 0) or 0)
+        rows_applied = int(last_status.get("rows_applied", 0) or 0)
+        if files_processed or rows_applied:
+            cycle_bits.append(f"{files_processed} files / {rows_applied} rows")
+        if phase_name and phase_name != "idle":
+            phase_summary = phase_name
+            if phase_tier:
+                phase_summary += f" {phase_tier}"
+            if phase_detail:
+                phase_summary += f" · {phase_detail}"
+            if phase_file:
+                phase_summary += f" · {phase_file[:42]}"
+            ops_applied = int(phase.get("operations_applied", 0) or 0)
+            ops_loaded = int(phase.get("operations_loaded", 0) or 0)
+            if ops_loaded:
+                phase_summary += f" · ops {ops_applied}/{ops_loaded}"
+            cycle_bits.append(phase_summary)
+        self.composer_cycle_value.setText(" | ".join(cycle_bits))
+
+        error = str(health.get("last_error", "") or "")
+        error_type = str(health.get("last_error_type", "") or "")
+        queue_scan_error = str(health.get("queue_scan_error", "") or "")
+        if error:
+            fault = f"{error_type + ': ' if error_type else ''}{error}"
+            if health.get("last_error_ts"):
+                fault += f" | {self._age_text(health.get('last_error_ts'))}"
+            self.composer_fault_value.setText(fault)
+        elif state == "busy_long" and phase_name:
+            phase_fault = f"composer phase long: {phase_name}"
+            if phase_tier:
+                phase_fault += f"/{phase_tier}"
+            if phase_age:
+                phase_fault += f" {phase_age:.1f}s"
+            if phase_detail:
+                phase_fault += f" | {phase_detail}"
+            if phase_file:
+                phase_fault += f" | {phase_file}"
+            self.composer_fault_value.setText(phase_fault)
+        elif queue_scan_error:
+            self.composer_fault_value.setText(f"queue scan: {queue_scan_error}")
+        elif health.get("queue_scan_stalled"):
+            self.composer_fault_value.setText("queue directory scan stalled; composer/UI remain alive")
+        else:
+            self.composer_fault_value.setText("none")
+
+        if state in {"worker_dead", "error"}:
+            self.composer_worker_value.setStyleSheet(f"color: {HEARTBEAT_BAD_COLOR};")
+        elif state == "busy_long" or health.get("queue_scan_stalled"):
+            self.composer_worker_value.setStyleSheet(f"color: {HEARTBEAT_ALERT_COLOR};")
+        else:
+            self.composer_worker_value.setStyleSheet("")
+
+    def _update_progress(self, payload: Mapping[str, Any]) -> None:
+        progress_value = payload.get("progress_pct", payload.get("progress"))
+        percent: int | None = None
+        if isinstance(progress_value, (int, float)):
+            raw = float(progress_value)
+            if 0.0 <= raw <= 1.0:
+                raw *= 100.0
+            percent = max(0, min(100, int(round(raw))))
+        else:
+            processed = payload.get("processed")
+            total = payload.get("total") or payload.get("total_lines")
+            if isinstance(processed, (int, float)) and isinstance(total, (int, float)) and float(total) > 0:
+                percent = max(0, min(100, int(round((float(processed) / float(total)) * 100.0))))
+
+        if self._last_status == "completed":
+            self.progress.setRange(0, 100)
+            self.progress.setValue(100)
+            self.progress.setFormat("completed")
+        elif percent is not None:
+            self.progress.setRange(0, 100)
+            self.progress.setValue(percent)
+            self.progress.setFormat(f"{percent}%")
+        elif self._last_status in {"active", "running", "ingesting", "preflight", "cleaning"}:
+            self.progress.setRange(0, 0)
+            self.progress.setFormat(self._last_status)
+        else:
+            self.progress.setRange(0, 100)
+            self.progress.setValue(0)
+            self.progress.setFormat(self._last_status or "idle")
+
+    def _emit_compact_status(self) -> None:
+        if not callable(self._status_callback):
+            return
+        bits = [self._last_status]
+        if self._last_mode:
+            bits.append(self._last_mode)
+        if self._last_file:
+            bits.append(self._last_file)
+        self._status_callback(" · ".join(bit for bit in bits if bit))
+
+
 class VisionCanvas(QWidget):
+    """Live camera canvas with overlays supplied by the vision organ.
+
+    The dashboard does not infer objects. It only renders the current object
+    state that the vision system reports.
+    """
+
     def __init__(self) -> None:
         super().__init__()
         self.setMinimumSize(480, 300)
@@ -106,6 +815,13 @@ class VisionCanvas(QWidget):
         self._overlays: list[dict[str, Any]] = []
         self._source_size = (0, 0)
         self._label = "No vision frame yet"
+        self._show_boxes = True
+        self._show_labels = True
+        self._show_confidence = True
+        self._show_track_ids = False
+        self._show_motion = False
+        self._highlight_track_id = ""
+        self._highlight_generation = 0
 
     def set_frame(self, path: str, width: int = 0, height: int = 0) -> None:
         candidate = Path(path)
@@ -116,9 +832,82 @@ class VisionCanvas(QWidget):
             self._label = candidate.name
             self.update()
 
-    def set_overlays(self, overlays: list[dict[str, Any]]) -> None:
-        self._overlays = overlays[-32:]
+    def set_frame_bytes(self, data: bytes | bytearray, width: int = 0, height: int = 0, label: str = "RAM frame") -> None:
+        pixmap = QPixmap()
+        if not isinstance(data, (bytes, bytearray)) or not pixmap.loadFromData(bytes(data)):
+            return
+        self._pixmap = pixmap
+        self._source_size = (width or pixmap.width(), height or pixmap.height())
+        self._label = str(label or "RAM frame")
         self.update()
+
+    def set_overlays(self, overlays: list[dict[str, Any]]) -> None:
+        self._overlays = [dict(item) for item in overlays[-64:] if isinstance(item, Mapping)]
+        self.update()
+
+    def set_display_options(
+        self,
+        *,
+        boxes: bool | None = None,
+        labels: bool | None = None,
+        confidence: bool | None = None,
+        track_ids: bool | None = None,
+        motion: bool | None = None,
+    ) -> None:
+        if boxes is not None:
+            self._show_boxes = bool(boxes)
+        if labels is not None:
+            self._show_labels = bool(labels)
+        if confidence is not None:
+            self._show_confidence = bool(confidence)
+        if track_ids is not None:
+            self._show_track_ids = bool(track_ids)
+        if motion is not None:
+            self._show_motion = bool(motion)
+        self.update()
+
+    def flash_object(self, track_id: str) -> None:
+        self._highlight_track_id = str(track_id or "")
+        self._highlight_generation += 1
+        generation = self._highlight_generation
+        self.update()
+
+        def clear() -> None:
+            if generation != self._highlight_generation:
+                return
+            self._highlight_track_id = ""
+            self.update()
+
+        QTimer.singleShot(VISION_SELECTION_FLASH_MS, clear)
+
+    @staticmethod
+    def _state_key(item: Mapping[str, Any]) -> str:
+        status = str(item.get("status") or "").strip().lower()
+        label = str(item.get("label") or "").strip().lower()
+        if bool(item.get("hazard", False)) or status in {"hazard", "danger", "emergency"}:
+            return "hazard"
+        if status in {"lost", "missing", "stale"}:
+            return "lost"
+        if status in {"unknown", "candidate", "proto"} or label in {"", "unknown", "thing", "that thing"}:
+            return "unknown"
+        try:
+            confidence = float(item.get("confidence", 0.0) or 0.0)
+        except Exception:
+            confidence = 0.0
+        return "identified" if confidence >= VISION_CONFIDENT_THRESHOLD else "uncertain"
+
+    @staticmethod
+    def _state_color(item: Mapping[str, Any]) -> QColor:
+        key = VisionCanvas._state_key(item)
+        return QColor(
+            {
+                "identified": VISION_COLOR_IDENTIFIED,
+                "uncertain": VISION_COLOR_UNCERTAIN,
+                "unknown": VISION_COLOR_UNKNOWN,
+                "hazard": VISION_COLOR_HAZARD,
+                "lost": VISION_COLOR_LOST,
+            }.get(key, VISION_COLOR_UNKNOWN)
+        )
 
     def paintEvent(self, event) -> None:  # noqa: N802
         painter = QPainter(self)
@@ -127,6 +916,7 @@ class VisionCanvas(QWidget):
             painter.setPen(self.palette().text().color())
             painter.drawText(self.rect(), Qt.AlignCenter, self._label)
             return
+
         scaled = self._pixmap.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
         x0 = (self.width() - scaled.width()) // 2
         y0 = (self.height() - scaled.height()) // 2
@@ -135,30 +925,168 @@ class VisionCanvas(QWidget):
         if sw <= 0 or sh <= 0:
             return
         sx, sy = scaled.width() / sw, scaled.height() / sh
-        pen = QPen(self.palette().highlight().color(), VISION_OVERLAY_LINE_WIDTH)
-        painter.setPen(pen)
+
         for item in self._overlays:
-            bbox = item.get("bbox")
-            if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+            coords = bbox_xywh(item.get("bbox"), source_width=sw, source_height=sh)
+            if coords is None:
                 continue
-            try:
-                bx, by, bw, bh = [float(v) for v in bbox[:4]]
-            except Exception:
-                continue
-            if max(abs(bx), abs(by), abs(bw), abs(bh)) <= 1.5:
-                bx, bw = bx * sw, bw * sw
-                by, bh = by * sh, bh * sh
+            bx, by, bw, bh = coords
             rx, ry, rw, rh = x0 + bx * sx, y0 + by * sy, bw * sx, bh * sy
-            painter.drawRect(int(rx), int(ry), int(rw), int(rh))
-            label = str(item.get("label") or "object")
-            conf = item.get("confidence")
-            if conf is not None:
+            track_id = str(item.get("track_id") or item.get("object_id") or item.get("proto_id") or "")
+            selected = bool(track_id and track_id == self._highlight_track_id)
+            color = QColor(VISION_COLOR_SELECTED) if selected else self._state_color(item)
+            width = VISION_OVERLAY_SELECTED_LINE_WIDTH if selected else VISION_OVERLAY_LINE_WIDTH
+            pen = QPen(color, width)
+            if str(item.get("status") or "").lower() in {"lost", "missing", "searching"}:
+                pen.setStyle(Qt.DashLine)
+            painter.setPen(pen)
+
+            if self._show_boxes:
+                contour = item.get("contour")
+                polygon_points: list[QPointF] = []
+                if isinstance(contour, (list, tuple)):
+                    for point in contour:
+                        if not isinstance(point, (list, tuple)) or len(point) < 2:
+                            continue
+                        try:
+                            px, py = float(point[0]), float(point[1])
+                        except Exception:
+                            continue
+                        polygon_points.append(QPointF(x0 + px * sx, y0 + py * sy))
+                if len(polygon_points) >= 3:
+                    painter.drawPolygon(QPolygonF(polygon_points))
+                else:
+                    painter.drawRect(int(rx), int(ry), int(rw), int(rh))
+
+            parts: list[str] = []
+            if self._show_labels:
+                parts.append(str(item.get("label") or "object"))
+            if self._show_confidence and item.get("confidence") is not None:
                 try:
-                    label += f" {float(conf):.2f}"
+                    parts.append(f"{float(item.get('confidence')):.2f}")
                 except Exception:
                     pass
-            painter.drawText(int(rx) + 3, int(ry) + 14, label)
-            painter.drawLine(self.width() // 2, self.height() // 2, int(rx + rw / 2), int(ry + rh / 2))
+            if self._show_track_ids and track_id:
+                parts.append(track_id[:18])
+            if parts:
+                painter.drawText(int(rx) + 3, max(14, int(ry) + 14), "  ".join(parts))
+
+            if self._show_motion:
+                motion = item.get("motion")
+                dx = dy = 0.0
+                if isinstance(motion, Mapping):
+                    try:
+                        dx = float(motion.get("dx", motion.get("x", 0.0)) or 0.0)
+                        dy = float(motion.get("dy", motion.get("y", 0.0)) or 0.0)
+                    except Exception:
+                        dx = dy = 0.0
+                elif isinstance(motion, (list, tuple)) and len(motion) >= 2:
+                    try:
+                        dx, dy = float(motion[0]), float(motion[1])
+                    except Exception:
+                        dx = dy = 0.0
+                if abs(dx) <= 1.5 and abs(dy) <= 1.5:
+                    dx *= sw
+                    dy *= sh
+                if dx or dy:
+                    cx, cy = rx + rw / 2.0, ry + rh / 2.0
+                    painter.drawLine(int(cx), int(cy), int(cx + dx * sx), int(cy + dy * sy))
+
+            # Clicking an object in the left inspector produces a short, explicit
+            # cue from the camera's left edge to the corresponding object.
+            if selected:
+                cx, cy = rx + rw / 2.0, ry + rh / 2.0
+                painter.drawLine(int(x0), int(cy), int(cx), int(cy))
+
+
+class VisionInspectorWidget(QWidget):
+    """Window-1 object list and overlay controls for the live visual scene."""
+
+    def __init__(self, canvas: VisionCanvas, on_attention_select=None) -> None:
+        super().__init__()
+        self.canvas = canvas
+        self._on_attention_select = on_attention_select
+        self._objects: list[dict[str, Any]] = []
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+
+        self.boxes = QCheckBox("Boxes"); self.boxes.setChecked(True)
+        self.labels = QCheckBox("Labels"); self.labels.setChecked(True)
+        self.confidence = QCheckBox("Confidence"); self.confidence.setChecked(True)
+        self.track_ids = QCheckBox("Track IDs")
+        self.motion = QCheckBox("Motion")
+        for checkbox in (self.boxes, self.labels, self.confidence, self.track_ids, self.motion):
+            checkbox.toggled.connect(self._apply_options)
+            layout.addWidget(checkbox)
+
+        self.freeze = QPushButton("Freeze tracks")
+        self.freeze.setCheckable(True)
+        self.freeze.setToolTip("Hold the current object map while the camera feed continues.")
+        self.freeze.toggled.connect(lambda on: self.freeze.setText("Tracks frozen" if on else "Freeze tracks"))
+        layout.addWidget(self.freeze)
+
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(["Object", "Conf", "Track"])
+        self.tree.setRootIsDecorated(False)
+        self.tree.itemClicked.connect(self._selected)
+        layout.addWidget(self.tree, 1)
+        self.detail = QLabel("No current objects")
+        self.detail.setWordWrap(True)
+        layout.addWidget(self.detail)
+        self._apply_options()
+
+    @property
+    def frozen(self) -> bool:
+        return self.freeze.isChecked()
+
+    def _apply_options(self, *_args) -> None:
+        self.canvas.set_display_options(
+            boxes=self.boxes.isChecked(),
+            labels=self.labels.isChecked(),
+            confidence=self.confidence.isChecked(),
+            track_ids=self.track_ids.isChecked(),
+            motion=self.motion.isChecked(),
+        )
+
+    def set_objects(self, objects: list[dict[str, Any]]) -> None:
+        if self.frozen:
+            return
+        self._objects = [dict(item) for item in objects if isinstance(item, Mapping)]
+        self.tree.clear()
+        for obj in self._objects:
+            label = str(obj.get("label") or "unknown")
+            try:
+                confidence = float(obj.get("confidence", 0.0) or 0.0)
+                conf_text = f"{confidence:.2f}"
+            except Exception:
+                conf_text = "—"
+            track_id = str(obj.get("track_id") or "")
+            item = QTreeWidgetItem([f"● {label}", conf_text, track_id[:16]])
+            item.setData(0, Qt.UserRole, track_id)
+            color = VisionCanvas._state_color(obj)
+            item.setForeground(0, QBrush(color))
+            item.setForeground(1, QBrush(color))
+            self.tree.addTopLevelItem(item)
+        self.detail.setText(f"{len(self._objects)} current object{'s' if len(self._objects) != 1 else ''}") if self._objects else self.detail.setText("No current objects")
+
+    def _selected(self, item: QTreeWidgetItem, column: int) -> None:
+        track_id = str(item.data(0, Qt.UserRole) or "")
+        if not track_id:
+            return
+        self.canvas.flash_object(track_id)
+        if callable(self._on_attention_select):
+            self._on_attention_select(track_id)
+        obj = next((row for row in self._objects if str(row.get("track_id") or "") == track_id), None)
+        if not isinstance(obj, Mapping):
+            return
+        label = str(obj.get("label") or "unknown")
+        status = str(obj.get("status") or "unknown")
+        try:
+            confidence = f"{float(obj.get('confidence', 0.0) or 0.0):.2f}"
+        except Exception:
+            confidence = "—"
+        self.detail.setText(f"{label} · {status} · confidence {confidence}\n{track_id}")
 
 
 class BodyMapWidget(QWidget):
@@ -238,15 +1166,15 @@ class PresenceWindow(QMainWindow):
         layout = QVBoxLayout(root)
         self.status = QLabel("body> starting | pulse> waiting")
         layout.addWidget(self.status)
-        top = QSplitter(Qt.Horizontal)
+
+        self.main_splitter = QSplitter(Qt.Vertical)
+        self.top_splitter = QSplitter(Qt.Horizontal)
+        self.bottom_splitter = QSplitter(Qt.Horizontal)
+        self.panels: dict[str, CompactablePanel] = {}
+
         self.vision = VisionCanvas()
+        self.vision_inspector = VisionInspectorWidget(self.vision, self.controller.select_visual_object)
         self.body = BodyMapWidget()
-        top.addWidget(self.vision)
-        top.addWidget(self.body)
-        top.setStretchFactor(0, 3)
-        top.setStretchFactor(1, 1)
-        layout.addWidget(top, 3)
-        bottom = QSplitter(Qt.Horizontal)
         self.conversation = QPlainTextEdit()
         self.conversation.setReadOnly(True)
         self.conversation.setPlaceholderText("Conversation / visible interaction")
@@ -254,11 +1182,36 @@ class PresenceWindow(QMainWindow):
         self.process_log.setReadOnly(True)
         self.process_log.setPlaceholderText("Process / component trace")
         self.process_log.setMaximumBlockCount(MAX_RAW_LINES)
-        bottom.addWidget(self.conversation)
-        bottom.addWidget(self.process_log)
-        bottom.setStretchFactor(0, 3)
-        bottom.setStretchFactor(1, 2)
-        layout.addWidget(bottom, 2)
+        self.capability_strip = CapabilityStatusStrip("CAP")
+        process_container = QWidget()
+        process_layout = QVBoxLayout(process_container)
+        process_layout.setContentsMargins(0, 0, 0, 0)
+        process_layout.setSpacing(2)
+        process_layout.addWidget(self.capability_strip)
+        process_layout.addWidget(self.process_log, 1)
+
+        self.panels["vision_inspector"] = CompactablePanel("Vision / objects", self.vision_inspector)
+        self.panels["vision"] = CompactablePanel("Vision", self.vision)
+        self.panels["body"] = CompactablePanel("Body / proprioception", self.body)
+        self.panels["conversation"] = CompactablePanel("Conversation", self.conversation)
+        self.panels["process"] = CompactablePanel("Process", process_container)
+
+        self.top_splitter.addWidget(self.panels["vision_inspector"])
+        self.top_splitter.addWidget(self.panels["vision"])
+        self.top_splitter.addWidget(self.panels["body"])
+        self.top_splitter.setStretchFactor(0, 1)
+        self.top_splitter.setStretchFactor(1, 4)
+        self.top_splitter.setStretchFactor(2, 1)
+        self.bottom_splitter.addWidget(self.panels["conversation"])
+        self.bottom_splitter.addWidget(self.panels["process"])
+        self.bottom_splitter.setStretchFactor(0, 3)
+        self.bottom_splitter.setStretchFactor(1, 2)
+        self.main_splitter.addWidget(self.top_splitter)
+        self.main_splitter.addWidget(self.bottom_splitter)
+        self.main_splitter.setStretchFactor(0, 3)
+        self.main_splitter.setStretchFactor(1, 2)
+        layout.addWidget(self.main_splitter, 1)
+
         send_row = QHBoxLayout()
         self.input = QLineEdit()
         self.input.setPlaceholderText("Type here…")
@@ -269,6 +1222,25 @@ class PresenceWindow(QMainWindow):
         self.setCentralWidget(root)
         self.send_button.clicked.connect(self._submit)
         self.input.returnPressed.connect(self._submit)
+
+    def save_workspace(self, settings: QSettings) -> None:
+        settings.setValue("presence/main_splitter", _sizes_text(self.main_splitter))
+        settings.setValue("presence/top_splitter", _sizes_text(self.top_splitter))
+        settings.setValue("presence/bottom_splitter", _sizes_text(self.bottom_splitter))
+        for key, panel in self.panels.items():
+            settings.setValue(f"presence/panel/{key}/compact", panel.is_compact)
+
+    def restore_workspace(self, settings: QSettings) -> None:
+        for key, splitter in (
+            ("presence/main_splitter", self.main_splitter),
+            ("presence/top_splitter", self.top_splitter),
+            ("presence/bottom_splitter", self.bottom_splitter),
+        ):
+            sizes = _settings_sizes(settings.value(key))
+            if len(sizes) == splitter.count() and any(v > 0 for v in sizes):
+                splitter.setSizes(sizes)
+        for key, panel in self.panels.items():
+            panel.set_compact(_settings_bool(settings.value(f"presence/panel/{key}/compact"), False))
 
     def _submit(self) -> None:
         text = self.input.text().strip()
@@ -281,6 +1253,25 @@ class PresenceWindow(QMainWindow):
 
     def append_process(self, line: str) -> None:
         self.process_log.appendPlainText(line)
+
+    def update_snapshot(self, payload: Mapping[str, Any]) -> None:
+        capability = payload.get("capability", {}) if isinstance(payload.get("capability"), Mapping) else {}
+        self.capability_strip.update_payload(capability)
+        current = self.panels["process"].status_label.text().split(" | cap ", 1)[0]
+        self.panels["process"].set_status(f"{current} | {self.capability_strip.compact_text()}")
+
+        vision = payload.get("vision", {}) if isinstance(payload.get("vision"), Mapping) else {}
+        objects = vision.get("objects") if isinstance(vision.get("objects"), list) else []
+        if objects and not self.vision_inspector.frozen:
+            normalized = [dict(item) for item in objects if isinstance(item, Mapping)]
+            self.vision.set_overlays(normalized)
+            self.vision_inspector.set_objects(normalized)
+            count = len(normalized)
+            self.panels["vision_inspector"].set_status(f"{count} object{'s' if count != 1 else ''}")
+            self.panels["vision"].set_status(f"{count} tracked")
+        ref = str(vision.get("frame_ref") or "")
+        if ref and not ref.startswith("ram:vision:"):
+            self.vision.set_frame(ref)
 
     def update_pressure(self, payload: Mapping[str, Any]) -> None:
         body = payload.get("body", {}) if isinstance(payload.get("body"), Mapping) else {}
@@ -298,33 +1289,46 @@ class PresenceWindow(QMainWindow):
                 state=pulse.get("thought_status", "idle"),
             )
         )
+        self.panels["body"].set_status(str(body.get("power_mode", "awake")))
+        self.panels["process"].set_status(
+            f"{pulse.get('thought_intent', 'idle')}/{pulse.get('thought_status', 'idle')} | "
+            f"{self.capability_strip.compact_text()}"
+        )
 
     def process(self, msg: UIMessage) -> None:
         self.body.update_event(msg)
         payload = msg.payload if isinstance(msg.payload, Mapping) else {}
+        if msg.topic == "capability/state":
+            self.capability_strip.update_payload(payload)
+            current = self.panels["process"].status_label.text().split(" | cap ", 1)[0]
+            self.panels["process"].set_status(f"{current} | {self.capability_strip.compact_text()}")
+            return
         if msg.topic == "percept/vision":
-            ref = str(payload.get("data_ref") or "")
-            if ref:
-                self.vision.set_frame(ref, int(payload.get("width") or 0), int(payload.get("height") or 0))
-        overlays: list[dict[str, Any]] = []
-        if msg.topic == "vision/percept_commit":
-            overlays = [{"bbox": payload.get("crop_box"), "label": payload.get("resolved_label"), "confidence": payload.get("max_stability")}]
+            ref = str(payload.get("data_ref") or payload.get("frame_ref") or "")
+            frame_bytes = payload.get("jpeg_bytes")
+            width = int(payload.get("width") or 0)
+            height = int(payload.get("height") or 0)
+            if isinstance(frame_bytes, (bytes, bytearray)):
+                self.vision.set_frame_bytes(frame_bytes, width, height, ref or "RAM frame")
+                self.panels["vision"].set_status(f"RAM frame {payload.get('frame_id', '')}")
+            elif ref and not ref.startswith("ram:vision:"):
+                self.vision.set_frame(ref, width, height)
+                self.panels["vision"].set_status(Path(ref).name)
+            return
+
+        if msg.topic == "ui/vision_current":
+            objects = payload.get("objects") if isinstance(payload.get("objects"), list) else []
+            normalized = [dict(item) for item in objects if isinstance(item, Mapping)]
+            if not self.vision_inspector.frozen:
+                self.vision.set_overlays(normalized)
+                self.vision_inspector.set_objects(normalized)
             ref = str(payload.get("frame_ref") or "")
             if ref:
                 self.vision.set_frame(ref)
-        elif msg.topic == "percept/vision/features":
-            raw = payload.get("objects") or payload.get("features") or []
-            overlays = [dict(x) for x in raw if isinstance(x, Mapping)] if isinstance(raw, list) else []
-        elif msg.topic == "vision/object_delta":
-            ref = str(payload.get("image_ref") or "")
-            if ref:
-                self.vision.set_frame(ref)
-            for delta in payload.get("deltas", []) if isinstance(payload.get("deltas"), list) else []:
-                cur = delta.get("current") if isinstance(delta, Mapping) else None
-                if isinstance(cur, Mapping):
-                    overlays.append(dict(cur))
-        if overlays:
-            self.vision.set_overlays(overlays)
+            count = len(normalized)
+            self.panels["vision_inspector"].set_status(f"{count} object{'s' if count != 1 else ''}")
+            self.panels["vision"].set_status(f"{count} tracked")
+            return
 
 
 class EngineeringWindow(QMainWindow):
@@ -338,6 +1342,7 @@ class EngineeringWindow(QMainWindow):
         self.setCentralWidget(self.trace)
         self._groups: dict[str, QTreeWidgetItem] = {}
         self._messages: dict[int, UIMessage] = {}
+        self.docks: dict[str, CompactDockWidget] = {}
 
         self.raw = QPlainTextEdit(); self.raw.setReadOnly(True); self.raw.setMaximumBlockCount(MAX_RAW_LINES)
         self.detail = QPlainTextEdit(); self.detail.setReadOnly(True)
@@ -346,16 +1351,50 @@ class EngineeringWindow(QMainWindow):
         self.organs = QPlainTextEdit(); self.organs.setReadOnly(True)
         self.runtime_log = LogTailWidget(Path(self.controller.bridge.memdir) / "logs" / "microbrain.log")
         self.tuning_tabs = self._build_tuning_tabs()
-        self._dock("Raw event bus", self.raw, Qt.BottomDockWidgetArea)
-        self._dock("Runtime log", self.runtime_log, Qt.BottomDockWidgetArea)
-        self._dock("Selected event", self.detail, Qt.RightDockWidgetArea)
-        self._dock("Evidence links", self.evidence, Qt.RightDockWidgetArea)
-        self._dock("DDNA / tuning / laws", self.tuning_tabs, Qt.LeftDockWidgetArea)
-        self._dock("Organ / bus status", self.organs, Qt.BottomDockWidgetArea)
+        self.slearn = SlearnJobWidget()
+        self.heartbeat_strip = HeartbeatStatusStrip()
+        self.capability_strip = CapabilityStatusStrip("CAP")
+        self.statusBar().setSizeGripEnabled(False)
+        self.statusBar().addPermanentWidget(self.heartbeat_strip, 1)
+        self.statusBar().addPermanentWidget(self.capability_strip, 2)
+
+        self._dock("Raw event bus", self.raw, Qt.BottomDockWidgetArea, "raw_event_bus")
+        self._dock("Runtime log", self.runtime_log, Qt.BottomDockWidgetArea, "runtime_log")
+        self._dock("Selected event", self.detail, Qt.RightDockWidgetArea, "selected_event")
+        self._dock("Evidence links", self.evidence, Qt.RightDockWidgetArea, "evidence_links")
+        self._dock("DDNA / tuning / laws", self.tuning_tabs, Qt.LeftDockWidgetArea, "tuning")
+        self._dock("Organ / bus status", self.organs, Qt.BottomDockWidgetArea, "organ_status")
+        slearn_dock = self._dock("SLEARN / learning jobs", self.slearn, Qt.BottomDockWidgetArea, "slearn_jobs")
+        self.slearn.set_status_callback(slearn_dock.set_compact_status)
         self._load_config_catalog()
 
-    def _dock(self, title: str, widget: QWidget, area: Qt.DockWidgetArea) -> None:
-        dock = QDockWidget(title, self); dock.setWidget(widget); self.addDockWidget(area, dock)
+    def _dock(
+        self,
+        title: str,
+        widget: QWidget,
+        area: Qt.DockWidgetArea,
+        key: str,
+    ) -> CompactDockWidget:
+        dock = CompactDockWidget(title, widget, self)
+        dock.setObjectName(f"dashboard_dock_{key}")
+        self.addDockWidget(area, dock)
+        self.docks[key] = dock
+        return dock
+
+    def save_workspace(self, settings: QSettings) -> None:
+        settings.setValue("engineering/dock_state", self.saveState(WORKSPACE_SETTINGS_VERSION))
+        for key, dock in self.docks.items():
+            settings.setValue(f"engineering/dock/{key}/compact", dock.is_compact)
+
+    def restore_workspace(self, settings: QSettings) -> None:
+        state = settings.value("engineering/dock_state")
+        if state is not None:
+            try:
+                self.restoreState(state, WORKSPACE_SETTINGS_VERSION)
+            except Exception:
+                pass
+        for key, dock in self.docks.items():
+            dock.set_compact(_settings_bool(settings.value(f"engineering/dock/{key}/compact"), False))
 
     def _build_tuning_tabs(self) -> QTabWidget:
         tabs = QTabWidget()
@@ -382,7 +1421,14 @@ class EngineeringWindow(QMainWindow):
                 item = QTableWidgetItem(str(value)); item.setFlags(item.flags() & ~Qt.ItemIsEditable); self.catalog_table.setItem(row, col, item)
 
     def update_snapshot(self, payload: Mapping[str, Any]) -> None:
-        self.organs.setPlainText(_pretty({k: payload.get(k) for k in ("queue_depth", "dashboard_queue_depth", "dashboard_dropped_events", "neurons", "bus", "organs", "hypothesis_tuning", "release_tuning")}))
+        self.organs.setPlainText(_pretty({k: payload.get(k) for k in ("queue_depth", "body_queue_depth", "dashboard_queue_depth", "dashboard_dropped_events", "neurons", "bus", "body_bus", "heartbeat", "adrenaline", "organs", "hypothesis_tuning", "release_tuning")}))
+        heartbeat = payload.get("heartbeat", {}) if isinstance(payload.get("heartbeat"), Mapping) else {}
+        adrenaline = payload.get("adrenaline", {}) if isinstance(payload.get("adrenaline"), Mapping) else {}
+        self.heartbeat_strip.update_payloads(heartbeat, adrenaline)
+        capability = payload.get("capability", {}) if isinstance(payload.get("capability"), Mapping) else {}
+        self.capability_strip.update_payload(capability)
+        slearn = payload.get("slearn", {}) if isinstance(payload.get("slearn"), Mapping) else {}
+        self.slearn.update_snapshot(slearn)
         tunables = payload.get("runtime_tunables", {}) if isinstance(payload.get("runtime_tunables"), Mapping) else {}
         self.runtime_table.setRowCount(len(tunables))
         for row, (key, value) in enumerate(sorted(tunables.items())):
@@ -407,6 +1453,23 @@ class EngineeringWindow(QMainWindow):
             asyncio.create_task(self.controller.apply_runtime_tuning(key_item.text(), value_item.text()))
 
     def add_message(self, msg: UIMessage) -> None:
+        if _is_status_instrument_event(msg) or _is_ephemeral_visual_sample(msg):
+            if msg.topic == "capability/state":
+                payload = msg.payload if isinstance(msg.payload, Mapping) else {}
+                self.capability_strip.update_payload(payload)
+            # Current visual objects are a Window-1 instrument. Do not turn the
+            # live object map into repeating Engineering trace/raw-event lines.
+            return
+
+        # SLEARN's workbench traffic belongs in its own engineering instrument,
+        # not in the cognition trace. Meaningful learning/* result events still
+        # continue through the normal trace after updating the job panel.
+        if _is_slearn_diagnostic(msg):
+            self.slearn.update_event(msg)
+            return
+        if msg.topic.startswith("learning/"):
+            self.slearn.update_event(msg)
+
         raw = {"topic": msg.topic, "source": msg.source, "correlation_id": msg.correlation_id, "payload": safe_json(msg.payload), "meta": safe_json(msg.meta or {})}
         self.raw.appendPlainText(json.dumps(raw, ensure_ascii=False, sort_keys=True))
         corr = msg.correlation_id or "uncorrelated"
@@ -446,6 +1509,7 @@ class EngineeringWindow(QMainWindow):
 class DashboardController:
     def __init__(self, bridge, *, memdir: str | None = None) -> None:
         self.bridge = bridge
+        self.settings = QSettings(WORKSPACE_SETTINGS_ORG, WORKSPACE_SETTINGS_APP)
         self.assistant_label, self.user_label = load_display_labels(memdir)
         self.transcript = TranscriptWriter(memdir, prefix="dashboard")
         self.presence = PresenceWindow(self)
@@ -453,6 +1517,42 @@ class DashboardController:
         self.timer = QTimer(); self.timer.timeout.connect(self._poll); self.timer.start(UI_POLL_MS)
         self.presence.append_conversation(f"{self.assistant_label} dashboard online. (/quit to close)")
         self.transcript.append_conversation(f"{self.assistant_label} dashboard online. (/quit to close)")
+        app = QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self.save_workspace)
+
+    def save_workspace(self) -> None:
+        self.settings.setValue("workspace/version", WORKSPACE_SETTINGS_VERSION)
+        self.settings.setValue("presence/geometry", self.presence.saveGeometry())
+        self.settings.setValue("engineering/geometry", self.engineering.saveGeometry())
+        self.presence.save_workspace(self.settings)
+        self.engineering.save_workspace(self.settings)
+        self.settings.sync()
+
+    def restore_workspace(self) -> bool:
+        try:
+            version = int(self.settings.value("workspace/version", 0) or 0)
+        except Exception:
+            version = 0
+        if version != WORKSPACE_SETTINGS_VERSION:
+            return False
+
+        restored = False
+        presence_geometry = self.settings.value("presence/geometry")
+        engineering_geometry = self.settings.value("engineering/geometry")
+        if presence_geometry is not None:
+            try:
+                restored = bool(self.presence.restoreGeometry(presence_geometry)) or restored
+            except Exception:
+                pass
+        if engineering_geometry is not None:
+            try:
+                restored = bool(self.engineering.restoreGeometry(engineering_geometry)) or restored
+            except Exception:
+                pass
+        self.presence.restore_workspace(self.settings)
+        self.engineering.restore_workspace(self.settings)
+        return restored
 
     def submit_text(self, text: str) -> None:
         if text.lower().startswith("/user "):
@@ -465,6 +1565,13 @@ class DashboardController:
             QApplication.instance().quit(); return
         asyncio.create_task(self.bridge.send_text(text))
 
+    def select_visual_object(self, track_id: str) -> None:
+        """Treat an inspector click as pointing, not as labeling."""
+        track_id = str(track_id or "").strip()
+        if not track_id:
+            return
+        asyncio.create_task(self.bridge.select_visual_object(track_id))
+
     async def apply_runtime_tuning(self, key: str, value: str) -> None:
         try:
             record = await self.bridge.set_runtime_tuning(key, value)
@@ -473,6 +1580,8 @@ class DashboardController:
             self.presence.append_conversation(f"error> tuning change rejected: {exc}")
 
     def _conversation_line(self, msg: UIMessage, text: str, channel: str, source: str) -> str | None:
+        if _is_slearn_diagnostic(msg):
+            return None
         if msg.topic in {"ui/error", "control/error"}:
             return f"error> {text or _summary(msg.payload, 240)}"
         if msg.topic in {"ui/status", "control/status"}:
@@ -482,6 +1591,10 @@ class DashboardController:
         return None
 
     def _process_line(self, msg: UIMessage, text: str, channel: str, source: str) -> str | None:
+        if _is_slearn_diagnostic(msg):
+            return None
+        if _is_status_instrument_event(msg) or _is_ephemeral_visual_sample(msg):
+            return None
         if msg.topic in {"ui/pressure_state", "ui/dashboard_snapshot"}:
             return None
         if msg.topic == "ui/input_submitted":
@@ -500,11 +1613,14 @@ class DashboardController:
 
     def _poll(self) -> None:
         for msg in self.bridge.drain_nowait(limit=MAX_MESSAGES_PER_POLL):
-            self.transcript.append_raw(msg)
+            if not _is_ephemeral_visual_sample(msg):
+                self.transcript.append_raw(msg)
             if msg.topic == "ui/pressure_state" and isinstance(msg.payload, Mapping):
                 self.presence.update_pressure(msg.payload); continue
             if msg.topic == "ui/dashboard_snapshot" and isinstance(msg.payload, Mapping):
-                self.engineering.update_snapshot(msg.payload); continue
+                self.presence.update_snapshot(msg.payload)
+                self.engineering.update_snapshot(msg.payload)
+                continue
             self.presence.process(msg); self.engineering.add_message(msg)
             text, channel, source = extract_text_and_channels(msg)
             convo_line = self._conversation_line(msg, text, channel, source)
@@ -530,6 +1646,7 @@ def place_windows(presence: QMainWindow, engineering: QMainWindow) -> None:
 
 def create_dashboard(bridge, *, memdir: str | None = None) -> DashboardController:
     controller = DashboardController(bridge, memdir=memdir)
-    place_windows(controller.presence, controller.engineering)
+    if not controller.restore_workspace():
+        place_windows(controller.presence, controller.engineering)
     controller.presence.show(); controller.engineering.show()
     return controller

@@ -52,6 +52,7 @@ class ContextBuilderNeuron(BaseNeuron):
         source = str(payload.get("source", "user") or "user")
         channel = str(payload.get("channel", "default") or "default")
         raw_meta = dict(payload.get("raw_meta", {}) or {})
+        visual_attention_ref = raw_meta.get("visual_attention_ref") if isinstance(raw_meta.get("visual_attention_ref"), dict) else {}
 
         lowered = text.lower()
         tokens = [tok for tok in lowered.replace("?", " ").replace("!", " ").replace(",", " ").replace(".", " ").split() if tok]
@@ -150,6 +151,11 @@ class ContextBuilderNeuron(BaseNeuron):
             },
             "hrm": {
                 "last_idx": hrm_last_idx,
+            },
+            "attention": {
+                "visual_ref": visual_attention_ref,
+                "deictic_binding_hint": str(raw_meta.get("deictic_binding_hint") or ""),
+                "rule": "selected_visual_ref_is_attention_context_not_identity_truth" if visual_attention_ref else "",
             },
             "cues": cues,
             "last_decision": last_decision if isinstance(last_decision, dict) else {},

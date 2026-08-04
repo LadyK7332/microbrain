@@ -7,7 +7,10 @@ from typing import Iterable, Any, Dict
 from microbrain.orchestrator.neuron_base import BaseNeuron, NeuronConfig, Event
 from microbrain.orchestrator.orchestrator import Orchestrator
 
+from microbrain.utils.heartbeat_stream import service_topic
+
 NEURON_NAME = Path(__file__).stem
+SERVICE_TOPIC = service_topic("affect")
 
 
 def _clamp01(value: float) -> float:
@@ -60,7 +63,7 @@ class SocialInteractionDriveNeuron(BaseNeuron):
     async def process(self, event: Event, ctx) -> Iterable[Event]:
         self.debug("received", topic=event.topic, payload=event.payload, source=event.source, meta=event.meta)
 
-        if event.topic not in ("clock/tick", "percept/text", "act/speech", "control/reinforce"):
+        if event.topic not in (SERVICE_TOPIC, "percept/text", "act/speech", "control/reinforce"):
             return []
 
         now = time.time()
@@ -112,7 +115,7 @@ class SocialInteractionDriveNeuron(BaseNeuron):
                 last_mb_output_ts = now
                 awaiting_response = True
                 result = "awaiting_user_response"
-                # Speaking relieves a little pressure, but if ignored the clock will raise it again.
+                # Speaking relieves a little pressure, but if ignored, later affect-service opportunities will raise it again.
                 level = max(0.0, level - 0.06)
 
         elif event.topic == "control/reinforce":
@@ -122,7 +125,7 @@ class SocialInteractionDriveNeuron(BaseNeuron):
             unanswered_attempts = 0
             result = "reinforced_feedback"
 
-        if event.topic == "clock/tick":
+        if event.topic == SERVICE_TOPIC:
             silence_s = max(0.0, now - last_user_ts)
             if silence_s > 30.0:
                 # Slow rise during social silence.
@@ -200,7 +203,7 @@ class SocialInteractionDriveNeuron(BaseNeuron):
 def build_neurons(orchestrator: Orchestrator):
     cfg = NeuronConfig(
         name=NEURON_NAME,
-        subscribed_topics=["clock/tick", "percept/text", "act/speech", "control/reinforce"],
+        subscribed_topics=[SERVICE_TOPIC, "percept/text", "act/speech", "control/reinforce"],
         output_topics=[],
         priority=-9,
     )

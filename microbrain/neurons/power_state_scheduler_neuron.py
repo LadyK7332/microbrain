@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -11,7 +11,10 @@ from zoneinfo import ZoneInfo
 from microbrain.orchestrator.neuron_base import BaseNeuron, Event, NeuronConfig
 from microbrain.orchestrator.orchestrator import Orchestrator
 
+from microbrain.utils.heartbeat_stream import service_topic
+
 NEURON_NAME = Path(__file__).stem
+SERVICE_TOPIC = service_topic("power")
 
 
 def _parse_hhmm(s: str) -> Optional[tuple[int, int]]:
@@ -77,7 +80,7 @@ class PowerStateSchedulerNeuron(BaseNeuron):
             await ctx.set_kv("power:charging_last_event_ts", time.time())
             await ctx.set_kv("power:charging_last_set_ts", time.time())
 
-        if event.topic not in ("clock/tick", "power/charging"):
+        if event.topic not in (SERVICE_TOPIC, "power/charging"):
             return []
 
         enabled = bool(await ctx.get_kv("power:schedule_enabled", True))
@@ -94,11 +97,26 @@ class PowerStateSchedulerNeuron(BaseNeuron):
 
         charging = bool(await ctx.get_kv("power:charging", False))
         tz_name = str(await ctx.get_kv("power:timezone", "America/Chicago") or "America/Chicago")
+        tz_fallback_active = False
         try:
             tz = ZoneInfo(tz_name)
+            tz_effective = tz_name
         except Exception:
-            tz = ZoneInfo("UTC")
+            # Windows Python installations may not have the optional tzdata
+            # package. Fall back to the host-local zone first, then stdlib UTC;
+            # never throw merely because scheduling was serviced by the body bus.
+            tz_fallback_active = True
+            try:
+                tz = datetime.now().astimezone().tzinfo
+            except Exception:
+                tz = None
+            if tz is None:
+                tz = timezone.utc
+            tz_effective = str(getattr(tz, "key", None) or tz)
 
+        await ctx.set_kv("power:timezone_requested", tz_name)
+        await ctx.set_kv("power:timezone_effective", tz_effective)
+        await ctx.set_kv("power:timezone_fallback_active", tz_fallback_active)
         dt = datetime.now(tz)
         start_s = str(await ctx.get_kv("power:charge_window_start", "22:00") or "22:00")
         end_s = str(await ctx.get_kv("power:charge_window_end", "06:00") or "06:00")
@@ -191,7 +209,9 @@ class PowerStateSchedulerNeuron(BaseNeuron):
                         "charging": charging,
                         "in_window": inwin,
                         "window": {"start": start_s, "end": end_s},
-                        "tz": tz_name,
+                        "tz": tz_effective,
+                        "tz_requested": tz_name,
+                        "tz_fallback_active": tz_fallback_active,
                     },
                     source=NEURON_NAME,
                     correlation_id=event.correlation_id,
@@ -204,7 +224,7 @@ class PowerStateSchedulerNeuron(BaseNeuron):
 def build_neurons(orchestrator: Orchestrator):
     cfg = NeuronConfig(
         name=NEURON_NAME,
-        subscribed_topics=["clock/tick", "power/charging"],
+        subscribed_topics=[SERVICE_TOPIC, "power/charging"],
         output_topics=["power/state"],
         priority=50,  # late-ish
         cooldown_sec=0.0,

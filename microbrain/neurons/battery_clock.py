@@ -7,7 +7,10 @@ from typing import Any, Dict, Iterable
 from microbrain.orchestrator.neuron_base import BaseNeuron, NeuronConfig, Event
 from microbrain.orchestrator.orchestrator import Orchestrator
 
+from microbrain.utils.heartbeat_stream import service_topic
+
 NEURON_NAME = Path(__file__).stem
+SERVICE_TOPIC = service_topic("power")
 SECONDS_PER_DAY = 86400.0
 
 
@@ -175,7 +178,7 @@ class BatteryClockNeuron(BaseNeuron):
             await self._apply_action_cost(ctx, event, now)
             return []
 
-        if event.topic != "clock/tick":
+        if event.topic != SERVICE_TOPIC:
             return []
 
         state = _state_dict(await ctx.get_kv("power:state", None), now)
@@ -222,7 +225,7 @@ class BatteryClockNeuron(BaseNeuron):
 def build_neurons(orchestrator: Orchestrator):
     cfg = NeuronConfig(
         name=NEURON_NAME,
-        subscribed_topics=["clock/tick", "control/power", "reason/request", "act/speech", "task/start", "act/motor"],
+        subscribed_topics=[SERVICE_TOPIC, "control/power", "reason/request", "act/speech", "task/start", "act/motor"],
         output_topics=[],
         priority=3,
         cooldown_sec=0.0,

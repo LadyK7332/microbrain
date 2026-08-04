@@ -7,7 +7,10 @@ from typing import Any, Dict, Iterable, List
 from microbrain.orchestrator.neuron_base import BaseNeuron, NeuronConfig, Event
 from microbrain.orchestrator.orchestrator import Orchestrator
 
+from microbrain.utils.heartbeat_stream import service_topic
+
 NEURON_NAME = Path(__file__).stem
+SERVICE_TOPIC = service_topic("power")
 
 
 def _safe_float(x: Any, default: float) -> float:
@@ -358,7 +361,7 @@ class NeedReleaseVectorNeuron(BaseNeuron):
 def build_neurons(orchestrator: Orchestrator):
     cfg = NeuronConfig(
         name=NEURON_NAME,
-        subscribed_topics=["clock/tick", "control/power", "event/relief/power"],
+        subscribed_topics=[SERVICE_TOPIC, "control/power", "event/relief/power"],
         output_topics=["thought/internal", "drive/power_request", "speech/reason", "ui/status"],
         priority=8,
         cooldown_sec=0.0,

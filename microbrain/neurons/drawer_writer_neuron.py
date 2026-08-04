@@ -8,6 +8,9 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
 
 from microbrain.orchestrator.neuron_base import BaseNeuron, Event, NeuronConfig
+from microbrain.utils.heartbeat_stream import service_topic
+
+SERVICE_TOPIC = service_topic("maintenance")
 
 @dataclass
 class _PendingWrite:
@@ -219,12 +222,12 @@ class DrawerWriterNeuron(BaseNeuron):
         )
 
         # -----------------------------
-        # Periodic flush on clock/tick
+        # Periodic flush on body/service/maintenance
         # -----------------------------
-        if event.topic == "clock/tick":
+        if event.topic == SERVICE_TOPIC:
             now = time.time()
             if self._buf and (now - self._last_flush) >= float(self.flush_interval_s):
-                return self._flush(correlation_id=event.correlation_id, reason="clock/tick")
+                return self._flush(correlation_id=event.correlation_id, reason=SERVICE_TOPIC)
             return []
 
         if event.topic != "drawer/write":
@@ -271,7 +274,7 @@ def build_neurons(orchestrator) -> Iterable[BaseNeuron]:
 
     config = NeuronConfig(
         name="drawer_writer",
-        subscribed_topics=["drawer/write", "clock/tick"],
+        subscribed_topics=["drawer/write", SERVICE_TOPIC],
         output_topics=["drawer/done", "drawer/error"],
         priority=5,
         cooldown_sec=0.0,

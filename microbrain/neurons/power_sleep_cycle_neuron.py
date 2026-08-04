@@ -7,7 +7,10 @@ from typing import Iterable
 from microbrain.orchestrator.neuron_base import BaseNeuron, Event, NeuronConfig
 from microbrain.orchestrator.orchestrator import Orchestrator
 
+from microbrain.utils.heartbeat_stream import service_topic
+
 NEURON_NAME = Path(__file__).stem
+SERVICE_TOPIC = service_topic("power")
 
 
 class PowerSleepCycleNeuron(BaseNeuron):
@@ -18,7 +21,7 @@ class PowerSleepCycleNeuron(BaseNeuron):
       - power:last_external_ts (set by router_text on percept/text)
     """
     async def process(self, event: Event, ctx) -> Iterable[Event]:
-        if event.topic != "clock/tick":
+        if event.topic != SERVICE_TOPIC:
             return []
 
         sleep_on = bool(await ctx.get_kv("power:sleep", False))
@@ -62,7 +65,7 @@ class PowerSleepCycleNeuron(BaseNeuron):
 def build_neurons(orchestrator: Orchestrator):
     cfg = NeuronConfig(
         name=NEURON_NAME,
-        subscribed_topics=["clock/tick"],
+        subscribed_topics=[SERVICE_TOPIC],
         output_topics=["power/sleep_cycle"],
         priority=60,
         cooldown_sec=0.0,

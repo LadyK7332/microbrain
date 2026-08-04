@@ -4,7 +4,7 @@ import re
 from typing import Any, Dict
 
 from microbrain.orchestrator.neuron_base import Event
-from microbrain.utils.heartbeat_stream import is_heartbeat_event
+from microbrain.utils.heartbeat_stream import is_infrastructure_event
 
 _INTERNAL_CHANNELS = {"thought", "internal"}
 _CONTROL_UI_TOPICS = {"ui/status", "ui/error", "control/status", "control/error"}
@@ -40,11 +40,11 @@ def _raw_meta(payload: Any) -> Dict[str, Any]:
     return {}
 
 def classify_event_for_memory(event: Event) -> Dict[str, Any]:
-    if is_heartbeat_event(event):
+    if is_infrastructure_event(event):
         return {
             "text": "",
             "channel": "body",
-            "kind": "body_heartbeat",
+            "kind": "body_infrastructure",
             "source": str(event.source or "system"),
             "transport_source": str(event.source or "system"),
             "role": "system",
@@ -52,7 +52,7 @@ def classify_event_for_memory(event: Event) -> Dict[str, Any]:
             "is_system": True,
             "is_control_ui_topic": False,
             "explicit_no_memory": True,
-            "junk_reason": "heartbeat_infrastructure",
+            "junk_reason": "body_infrastructure",
             "allow_longterm": False,
             "allow_trace": False,
             "allow_hrm": False,

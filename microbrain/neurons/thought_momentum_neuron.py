@@ -7,9 +7,10 @@ from typing import Any, Dict, Iterable, List, Mapping
 from microbrain.hormone import derive_ddna_modulators
 from microbrain.orchestrator.neuron_base import BaseNeuron, Event, NeuronConfig
 from microbrain.orchestrator.orchestrator import Orchestrator
-from microbrain.utils.heartbeat_stream import PRIMARY_HEARTBEAT_TOPIC, is_heartbeat_event
+from microbrain.utils.heartbeat_stream import service_tick_is_for, service_topic
 
 NEURON_NAME = Path(__file__).stem
+SERVICE_TOPIC = service_topic("cognition")
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -28,7 +29,7 @@ def _norm_intent(text: str) -> str:
 
 
 def _is_control_event(event: Event) -> bool:
-    if is_heartbeat_event(event):
+    if service_tick_is_for(event, "cognition"):
         return False
     meta = event.meta if isinstance(event.meta, Mapping) else {}
     if event.topic.startswith(("ui/", "control/", "debug/")):
@@ -83,17 +84,30 @@ class ThoughtMomentumNeuron(BaseNeuron):
         state = await self._load_state(ctx, now)
         prior_summary = state.get("summary", {}) if isinstance(state.get("summary"), Mapping) else {}
         prior_last_cognitive = str(prior_summary.get("last_cognitive_topic") or prior_summary.get("last_event_topic") or "")
-        vectors = list(state.get("active_vectors", []) or [])
-        vectors = self._decay_vectors(vectors, now, decay_resistance=persistence_gain)
+        prior_vectors = [dict(v) for v in list(state.get("active_vectors", []) or []) if isinstance(v, Mapping)]
+        vectors = self._decay_vectors(prior_vectors, now, decay_resistance=persistence_gain)
 
         changed = False
         additions: List[Dict[str, Any]] = []
-        heartbeat = is_heartbeat_event(event)
+        service_tick = service_tick_is_for(event, "cognition")
 
-        if heartbeat:
-            changed = bool(vectors)
+        if service_tick:
+            # Full-rate cognitive timing may decay internal momentum, but it must
+            # remain private state work: no thought/momentum bus event and no
+            # replacement of the last meaningful cognitive topic.
+            summary = self._summarize(vectors, now)
+            summary["last_trigger_topic"] = SERVICE_TOPIC
+            summary["last_event_topic"] = prior_last_cognitive
+            summary["last_cognitive_topic"] = prior_last_cognitive
+            summary["last_update_reason"] = "passive_decay"
+            summary["updated_at"] = now
+            if vectors != prior_vectors or prior_summary != summary:
+                await ctx.set_kv("thought:momentum", summary)
+                await ctx.set_kv("thought:momentum:active_vectors", vectors)
+                await ctx.set_kv("thought:momentum:last_update_ts", now)
+            return []
 
-        elif event.topic == "percept/text":
+        if event.topic == "percept/text":
             additions.extend(self._vectors_from_text(event, now))
 
         elif event.topic == "thought/internal":
@@ -124,10 +138,10 @@ class ThoughtMomentumNeuron(BaseNeuron):
 
         vectors = self._rank_vectors(vectors)[: self.MAX_VECTORS]
         summary = self._summarize(vectors, now)
-        summary["last_trigger_topic"] = PRIMARY_HEARTBEAT_TOPIC if heartbeat else event.topic
-        summary["last_event_topic"] = prior_last_cognitive if heartbeat else event.topic
-        summary["last_cognitive_topic"] = prior_last_cognitive if heartbeat else event.topic
-        summary["heartbeat_decay_only"] = bool(heartbeat)
+        summary["last_trigger_topic"] = event.topic
+        summary["last_event_topic"] = event.topic
+        summary["last_cognitive_topic"] = event.topic
+        summary["last_update_reason"] = "semantic_update"
         summary["updated_at"] = now
 
         if changed:
@@ -336,8 +350,7 @@ def build_neurons(orchestrator: Orchestrator):
             "curiosity/adjust",
             "reinforcement/feedback",
             "control/reinforce",
-            "clock/tick",
-            PRIMARY_HEARTBEAT_TOPIC,
+            SERVICE_TOPIC,
             "thought/internal",
         ],
         output_topics=["thought/momentum"],

@@ -5,7 +5,7 @@ import json
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from microbrain.memory.mem_cell_store import MemCellStore
 from microbrain.orchestrator.neuron_base import BaseNeuron, Event, NeuronConfig
@@ -38,6 +38,7 @@ CONDITION_OPERATOR_RE = re.compile(
 AND_SPLIT_RE = re.compile(r"\s+AND\s+")
 ELSE_SPLIT_RE = re.compile(r"\s+ELSE\s+")
 TOKEN_RE = re.compile(r"[a-z0-9_']+")
+SLOT_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
 def _norm_text(text: str) -> str:
@@ -51,11 +52,82 @@ def _strip_outer_quotes(text: str) -> str:
     return text
 
 
+def strip_slearn_inline_comment(text: str) -> str:
+    """Strip a trailing # comment while preserving # characters inside quotes."""
+    raw = str(text or "")
+    out: List[str] = []
+    quote = ""
+    escaped = False
+    for ch in raw:
+        if escaped:
+            out.append(ch)
+            escaped = False
+            continue
+        if ch == "\\":
+            out.append(ch)
+            escaped = True
+            continue
+        if quote:
+            out.append(ch)
+            if ch == quote:
+                quote = ""
+            continue
+        if ch in {"\"", "'"}:
+            quote = ch
+            out.append(ch)
+            continue
+        if ch == "#":
+            break
+        out.append(ch)
+    return "".join(out).rstrip()
+
+
+def _mask_quoted_text(text: str) -> str:
+    """Mask quoted data before checking whether control rails are lowercase."""
+    raw = str(text or "")
+    out: List[str] = []
+    quote = ""
+    escaped = False
+    for ch in raw:
+        if escaped:
+            out.append(" ")
+            escaped = False
+            continue
+        if ch == "\\" and quote:
+            out.append(" ")
+            escaped = True
+            continue
+        if quote:
+            out.append(" ")
+            if ch == quote:
+                quote = ""
+            continue
+        if ch in {"\"", "'"}:
+            quote = ch
+            out.append(" ")
+            continue
+        out.append(ch)
+    return "".join(out)
+
+
 def _classifier_list(raw: str) -> List[str]:
     out: List[str] = []
     seen: set[str] = set()
     for part in str(raw or "").split(","):
         name = _norm_text(part).replace(" ", "_")
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return out
+
+
+def _template_slots(text: str) -> List[str]:
+    """Return ordered, unique {slot} names used by a SLEARN template."""
+    out: List[str] = []
+    seen: set[str] = set()
+    for match in SLOT_RE.finditer(str(text or "")):
+        name = str(match.group(1) or "").strip()
         if not name or name in seen:
             continue
         seen.add(name)
@@ -174,13 +246,16 @@ class SyntaxLearningNeuron(BaseNeuron):
             return None
 
     def _parse_teaching_note(self, note: str) -> Dict[str, Any]:
-        # Require all grammar words that are present to be ALL CAPS. This keeps
-        # normal conversational language from accidentally becoming syntax.
+        # Comments and quoted domain text are data, not control rails.  Mask them
+        # before the lowercase-rail check so a gloss containing "and" or a term
+        # such as "rock and roll" cannot invalidate an otherwise safe CAPS rule.
+        note = strip_slearn_inline_comment(note).strip()
+        rail_scan = _mask_quoted_text(note)
         for word in CONTROL_WORDS:
-            if re.search(rf"\b{word.lower()}\b", note):
+            if re.search(rf"\b{word.lower()}\b", rail_scan):
                 return {}
 
-        m = IF_RULE_RE.match(note.strip())
+        m = IF_RULE_RE.match(note)
         if not m:
             return {}
 
@@ -216,10 +291,28 @@ class SyntaxLearningNeuron(BaseNeuron):
         ddna_targets = [name for name in classifiers if name in DDNA_TARGETS]
         concept_classifiers = [name for name in classifiers if name not in DDNA_TARGETS]
         rule_kind = self._rule_kind_for(condition)
+        condition_text_for_slots = str(condition.get("condition_text", "") or "")
+        condition_slots = _template_slots(condition_text_for_slots)
+        reply_slots = _template_slots(reply_text)
+
+        # Refuse an unanchored catch-all such as USER says "{payload}". A learned
+        # speech template must contain at least one literal word/number so it can
+        # compete as a specific language rule instead of swallowing every input.
+        if condition_slots and not re.search(r"[A-Za-z0-9]", SLOT_RE.sub("", condition_text_for_slots)):
+            return {}
+
+        # A templated reply may only use values captured by the condition.
+        # This keeps SLEARN declarative: the sheet can route bound input data,
+        # but it cannot conjure unbound placeholders at runtime.
+        if any(slot not in condition_slots for slot in reply_slots):
+            return {}
 
         return {
             **condition,
             "rule_kind": rule_kind,
+            "condition_slots": condition_slots,
+            "reply_slots": reply_slots,
+            "is_template_rule": bool(condition_slots),
             "classifiers": classifiers,
             "concept_classifiers": concept_classifiers,
             "ddna_targets": ddna_targets,
@@ -289,7 +382,74 @@ class SyntaxLearningNeuron(BaseNeuron):
             return "reasoning_rule"
         return "curriculum_rule"
 
-    def _store_rule(self, store: MemCellStore, rule: Dict[str, Any]) -> int:
+    def apply_slearn_batch(
+        self,
+        store: MemCellStore,
+        items: Sequence[Dict[str, Any]],
+        *,
+        weight: int = 3,
+    ) -> Dict[str, Any]:
+        """Parse/store a SLEARN batch without emitting one event per rule.
+
+        The read sidecar runs this method in a worker thread.  Pure classifier
+        rules are built as deterministic cells and staged in one composer file;
+        reply-bearing rules keep the richer trainer-alignment path but defer its
+        flush until the end of the batch.
+        """
+        bounded_weight = max(1, min(5, int(weight or 3)))
+        accepted = 0
+        rejected = 0
+        saved_cells = 0
+        direct_cells: List[Dict[str, Any]] = []
+        errors: List[str] = []
+
+        for item in items or []:
+            note = str(item.get("teaching_note", "") or item.get("rule", "") or "").strip()
+            if not note:
+                rejected += 1
+                continue
+            parsed = self._parse_teaching_note(note)
+            if not parsed:
+                rejected += 1
+                continue
+
+            parsed["reinforce_weight"] = bounded_weight
+            parsed["target_text"] = str(item.get("target_text", "") or "")
+            parsed["target_role"] = str(item.get("target_role", "") or "")
+            parsed["target_hrm_idx"] = item.get("target_hrm_idx")
+            parsed["nonce"] = str(item.get("nonce", "") or "")
+            parsed["teaching_note"] = note
+            parsed["source_mode"] = "slearn"
+            parsed["source_name"] = str(item.get("source_name", "") or "")
+            parsed["source_path"] = str(item.get("source_path", "") or "")
+            parsed["source_line"] = item.get("source_line")
+            parsed["ts"] = time.time()
+
+            try:
+                if str(parsed.get("reply_text", "") or "").strip():
+                    saved_cells += self._store_rule(store, parsed, flush=False)
+                else:
+                    direct_cells.append(self._build_rule_cell(parsed))
+                    saved_cells += 1
+                accepted += 1
+            except Exception as exc:
+                rejected += 1
+                errors.append(repr(exc))
+
+        if direct_cells:
+            store.stage_cells(direct_cells, tier="learned", touch=True)
+        if store.dirty_count("learned"):
+            store.flush_tier("learned")
+
+        return {
+            "accepted": accepted,
+            "rejected": rejected,
+            "saved_cells": saved_cells,
+            "staged_paths": store.take_staged_paths("learned"),
+            "errors": errors[:8],
+        }
+
+    def _store_rule(self, store: MemCellStore, rule: Dict[str, Any], *, flush: bool = True) -> int:
         condition = str(rule.get("condition_text", "") or "").strip()
         if not condition:
             return 0
@@ -300,7 +460,8 @@ class SyntaxLearningNeuron(BaseNeuron):
 
         saved = 0
         reply_text = str(rule.get("reply_text", "") or "").strip()
-        if reply_text:
+        is_template_rule = bool(rule.get("is_template_rule", False) or rule.get("condition_slots"))
+        if reply_text and not is_template_rule:
             store.ingest_trainer_alignment(
                 desired_text=reply_text,
                 context_query=condition,
@@ -321,11 +482,39 @@ class SyntaxLearningNeuron(BaseNeuron):
                     "source_line": rule.get("source_line"),
                 },
                 tier="learned",
+                flush=flush,
             )
             saved += 1
 
+        store.upsert_cell(self._build_rule_cell(rule), tier="learned", flush=flush)
+        saved += 1
+        return saved
+
+    def _build_rule_cell(self, rule: Dict[str, Any]) -> Dict[str, Any]:
+        condition = str(rule.get("condition_text", "") or "").strip()
+        weight = int(rule.get("reinforce_weight", 0) or 0)
+        ddna_strength = max(1, abs(weight))
+        ddna_map = {name: ddna_strength for name in list(rule.get("ddna_targets", []) or [])}
+        reply_text = str(rule.get("reply_text", "") or "").strip()
+
+        # Rule identity is semantic and restart-stable.  Volatile fields such as
+        # timestamps, source line numbers, and job nonces must not mint a new
+        # memory cell when a resumable SLEARN job sees the same rule again.
+        identity = {
+            "rule_kind": str(rule.get("rule_kind", "") or ""),
+            "condition_raw": str(rule.get("condition_raw", condition) or condition),
+            "classifiers": list(rule.get("classifiers", []) or []),
+            "concept_classifiers": list(rule.get("concept_classifiers", []) or []),
+            "ddna_targets": list(rule.get("ddna_targets", []) or []),
+            "reply_text": reply_text,
+            "condition_slots": list(rule.get("condition_slots", []) or []),
+            "reply_slots": list(rule.get("reply_slots", []) or []),
+            "avoid_replies": list(rule.get("avoid_replies", []) or []),
+            "suppress_targets": list(rule.get("suppress_targets", []) or []),
+            "reinforce_weight": weight,
+        }
         digest = hashlib.blake2b(
-            jsonish(rule).encode("utf-8", errors="ignore"),
+            jsonish(identity).encode("utf-8", errors="ignore"),
             digest_size=8,
         ).hexdigest()
         now_ts = time.time()
@@ -349,11 +538,9 @@ class SyntaxLearningNeuron(BaseNeuron):
         rule_kind = str(rule.get("rule_kind", "syntax_rule") or "syntax_rule")
         trust = 0.94 if weight >= 0 else 0.80
         if source_mode == "slearn":
-            # Preseeded curriculum should start useful, but yield to lived
-            # experience over time. Reinforcement can still promote it later.
             trust = 0.86 if weight >= 0 else 0.72
 
-        cell = {
+        return {
             "id": f"sr{digest}",
             "kind": rule_kind,
             "tier": "learned",
@@ -376,6 +563,9 @@ class SyntaxLearningNeuron(BaseNeuron):
                 "condition_subject": str(rule.get("condition_subject", "") or ""),
                 "condition_object": str(rule.get("condition_object", "") or ""),
                 "condition_norm": _norm_text(condition),
+                "condition_slots": list(rule.get("condition_slots", []) or []),
+                "reply_slots": list(rule.get("reply_slots", []) or []),
+                "is_template_rule": bool(rule.get("is_template_rule", False) or rule.get("condition_slots")),
                 "syntax_classifiers": list(rule.get("classifiers", []) or []),
                 "concept_classifiers": list(rule.get("concept_classifiers", []) or []),
                 "ddna_targets": ddna_map,
@@ -386,7 +576,7 @@ class SyntaxLearningNeuron(BaseNeuron):
                 "source_decay_bias": 0.85 if source_mode == "slearn" else 1.0,
                 "lived_experience_can_override": True,
                 "target_text": str(rule.get("target_text", "") or ""),
-                "source_mode": str(rule.get("source_mode", "reinforcement") or "reinforcement"),
+                "source_mode": source_mode,
                 "source_name": str(rule.get("source_name", "") or ""),
                 "source_path": str(rule.get("source_path", "") or ""),
                 "source_line": rule.get("source_line"),
@@ -396,9 +586,6 @@ class SyntaxLearningNeuron(BaseNeuron):
             "encounter_count": 1,
             "revision": 0,
         }
-        store.upsert_cell(cell, tier="learned")
-        saved += 1
-        return saved
 
     def _status(self, text: str, event: Event) -> Event:
         return Event(

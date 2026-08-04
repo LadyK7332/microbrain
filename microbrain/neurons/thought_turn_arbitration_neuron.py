@@ -8,9 +8,10 @@ from typing import Any, Iterable, Mapping
 from microbrain.hormone import derive_ddna_modulators
 from microbrain.orchestrator.neuron_base import BaseNeuron, Event, NeuronConfig
 from microbrain.orchestrator.orchestrator import Orchestrator
-from microbrain.utils.heartbeat_stream import PRIMARY_HEARTBEAT_TOPIC, heartbeat_reason, is_heartbeat_event
+from microbrain.utils.heartbeat_stream import service_tick_is_for, service_topic
 
 NEURON_NAME = Path(__file__).stem
+SERVICE_TOPIC = service_topic("cognition")
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -82,16 +83,17 @@ class ThoughtTurnArbitrationNeuron(BaseNeuron):
         drawer = await self._load_drawer(ctx, now)
         outputs: list[Event] = []
 
-        if is_heartbeat_event(event):
+        if service_tick_is_for(event, "cognition"):
+            # Full-rate cognition service is housekeeping only. It may advance
+            # drawer expiry/recheck state in RAM, but it must never emit a
+            # thought/turn_state event or replace the last meaningful turn state.
             due = self._due_drawer_thoughts(drawer, now)
+            available = await self._available_components(ctx) if due else {}
             for thought in due:
-                self._recheck_thought(thought, await self._available_components(ctx), now)
+                self._recheck_thought(thought, available, now)
             drawer = self._prune_and_rank(drawer, now)
-            state = self._turn_state(drawer, now, reason=heartbeat_reason())
-            await self._save_drawer(ctx, drawer, state)
-            if due:
-                outputs.append(self._state_event(event, state))
-            return outputs
+            await self._save_drawer_housekeeping(ctx, drawer, now)
+            return []
 
         if event.topic == "thought/drawer_recheck":
             payload = event.payload if isinstance(event.payload, Mapping) else {}
@@ -169,6 +171,14 @@ class ThoughtTurnArbitrationNeuron(BaseNeuron):
         waiting = [t for t in drawer if t.get("status") == "drawer_waiting"]
         await ctx.set_kv("thought:drawer:ready", ready[:8])
         await ctx.set_kv("thought:drawer:waiting", waiting[: self.MAX_DRAWER])
+
+    async def _save_drawer_housekeeping(self, ctx, drawer: list[dict[str, Any]], now: float) -> None:
+        await ctx.set_kv("thought:drawer", drawer)
+        ready = [t for t in drawer if t.get("status") == "ready"]
+        waiting = [t for t in drawer if t.get("status") == "drawer_waiting"]
+        await ctx.set_kv("thought:drawer:ready", ready[:8])
+        await ctx.set_kv("thought:drawer:waiting", waiting[: self.MAX_DRAWER])
+        await ctx.set_kv("thought:turn:last_housekeeping_ts", now)
 
     async def _available_components(self, ctx) -> dict[str, bool]:
         audio_pref = str(await ctx.get_kv("speech:audio_preferred_transport", "none") or "none").lower()
@@ -663,8 +673,7 @@ def build_neurons(orchestrator: Orchestrator):
     cfg = NeuronConfig(
         name=NEURON_NAME,
         subscribed_topics=[
-            "clock/tick",
-            PRIMARY_HEARTBEAT_TOPIC,
+            SERVICE_TOPIC,
             "thought/internal",
             "drive/power_request",
             "drive:boredom",

@@ -11,7 +11,10 @@ from microbrain.orchestrator.orchestrator import Orchestrator
 
 from microbrain.patterns.pattern_edge_log import PatternEdgeLog
 
+from microbrain.utils.heartbeat_stream import service_topic
+
 NEURON_NAME = Path(__file__).stem
+SERVICE_TOPIC = service_topic("affect")
 
 # We keep the outcome namespace separate so later you can have:
 # outcome:hazard, outcome:reward, outcome:social_good, outcome:maintenance_need, etc.
@@ -73,7 +76,7 @@ class StressNeuron(BaseNeuron):
     Watches:
       - reason/request  (normalized text stream, good for teaching phrases)
       - percept/vision  (vision descriptions/objects)
-      - clock/tick      (stress decay)
+      - body/service/affect  (stress decay opportunity)
 
     Learns:
       concept:<x> -> outcome:hazard  (PatternEdgeLog edge: concept_outcome)
@@ -202,7 +205,7 @@ class StressNeuron(BaseNeuron):
         # ------------------------------
         # Passive decay
         # ------------------------------
-        if event.topic == "clock/tick":
+        if event.topic == SERVICE_TOPIC:
             dt = max(0.0, now - float(self._last_tick_ts or now))
             self._last_tick_ts = now
 
@@ -321,7 +324,7 @@ def build_neurons(orchestrator: Orchestrator):
     cfg = NeuronConfig(
         name=NEURON_NAME,
         subscribed_topics=[
-            "clock/tick",
+            SERVICE_TOPIC,
             "reason/request",
             "percept/vision",  # safe even if vision isn't enabled
         ],

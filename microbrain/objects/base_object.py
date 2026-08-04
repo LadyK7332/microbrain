@@ -98,47 +98,101 @@ def tokenize(text: str) -> list[str]:
     return re.findall(r"[a-z0-9']+", (text or "").lower())
 
 
-def infer_grammar_roles(text: str) -> Dict[str, list[str]]:
-    """Very small language-facing role hints.
+def infer_grammar_roles(text: str) -> Dict[str, Any]:
+    """Return lightweight but structure-aware language roles.
 
-    These are not the deepest ontology. They are speech/parser handles that can
-    point toward object kinds later:
-      noun-ish -> entity.object
-      verb-ish -> action/process.object
-      adjective-ish -> state/property.object
+    The base object keeps only a compact slice of the richer parser output so
+    scene objects can benefit from English word order without turning every
+    utterance into a giant parse dump. Unknown words remain candidates rather
+    than being forced into one permanent part of speech.
     """
     tokens = tokenize(text)
-    state_words: list[str] = []
-    action_words: list[str] = []
-    entity_words: list[str] = []
-    for tok in tokens:
-        if tok in TEXT_STATE_HINTS or tok.endswith(("able", "ful", "less", "ous", "ive")):
-            if tok not in state_words:
-                state_words.append(tok)
-            continue
-        if tok in TEXT_ACTION_HINTS or tok.endswith(("ing", "ed")):
-            if tok not in action_words:
-                action_words.append(tok)
-            continue
-        if len(tok) >= 3 and tok not in TEXT_STOP_HINTS:
-            if tok not in entity_words:
-                entity_words.append(tok)
-    return {
-        "tokens": tokens,
-        "noun_like": entity_words[:16],
-        "verb_like": action_words[:16],
-        "adjective_like": state_words[:16],
-    }
+    try:
+        from microbrain.language_scaffold import analyze_english_structure
+
+        structure = analyze_english_structure(text)
+        role_candidates = list(structure.get("role_candidates", []) or [])
+        noun_like: list[str] = []
+        verb_like: list[str] = []
+        adjective_like: list[str] = []
+        for candidate in role_candidates:
+            if not isinstance(candidate, Mapping):
+                continue
+            norm = str(candidate.get("norm", "") or "").strip().lower()
+            best_role = str(candidate.get("best_role", "") or "").strip().lower()
+            if not norm:
+                continue
+            if best_role in {"noun", "proper_noun", "pronoun"} and norm not in noun_like:
+                noun_like.append(norm)
+            elif best_role == "verb" and norm not in verb_like:
+                verb_like.append(norm)
+            elif best_role == "adjective" and norm not in adjective_like:
+                adjective_like.append(norm)
+
+        compact_candidates = []
+        for candidate in role_candidates[:16]:
+            if not isinstance(candidate, Mapping):
+                continue
+            compact_candidates.append({
+                "token": str(candidate.get("norm", "") or candidate.get("text", "") or ""),
+                "best_role": str(candidate.get("best_role", "") or ""),
+                "confidence": float(candidate.get("confidence", 0.0) or 0.0),
+                "alternatives": [
+                    {"role": str(item.get("role", "") or ""), "score": float(item.get("score", 0.0) or 0.0)}
+                    for item in list(candidate.get("candidates", []) or [])[:3]
+                    if isinstance(item, Mapping)
+                ],
+            })
+
+        return {
+            "tokens": tokens,
+            "noun_like": noun_like[:16],
+            "verb_like": verb_like[:16],
+            "adjective_like": adjective_like[:16],
+            "role_candidates": compact_candidates,
+            "best_clause": dict(structure.get("best_clause", {}) or {}),
+        }
+    except Exception:
+        # Keep startup and event framing resilient if the richer language layer
+        # is unavailable for any reason.
+        state_words: list[str] = []
+        action_words: list[str] = []
+        entity_words: list[str] = []
+        for tok in tokens:
+            if tok in TEXT_STATE_HINTS or tok.endswith(("able", "ful", "less", "ous", "ive")):
+                if tok not in state_words:
+                    state_words.append(tok)
+                continue
+            if tok in TEXT_ACTION_HINTS or tok.endswith(("ing", "ed")):
+                if tok not in action_words:
+                    action_words.append(tok)
+                continue
+            if len(tok) >= 3 and tok not in TEXT_STOP_HINTS:
+                if tok not in entity_words:
+                    entity_words.append(tok)
+        return {
+            "tokens": tokens,
+            "noun_like": entity_words[:16],
+            "verb_like": action_words[:16],
+            "adjective_like": state_words[:16],
+            "role_candidates": [],
+            "best_clause": {},
+        }
 
 
-def infer_text_classifiers(text: str, raw_meta: Mapping[str, Any] | None = None) -> list[str]:
+def infer_text_classifiers(
+    text: str,
+    raw_meta: Mapping[str, Any] | None = None,
+    grammar_roles: Mapping[str, Any] | None = None,
+) -> list[str]:
     raw_meta = raw_meta or {}
     tokens = tokenize(text)
     lowered = " ".join(tokens)
     classifiers: list[str] = ["utterance"]
     if any(tok in GREETING_HINTS for tok in tokens) or lowered in {"good morning", "good evening", "good afternoon"}:
         classifiers.append("social_greeting")
-    for state in infer_grammar_roles(text).get("adjective_like", []):
+    roles = dict(grammar_roles or infer_grammar_roles(text))
+    for state in roles.get("adjective_like", []):
         classifiers.append(f"state.{state}")
 
     try:
@@ -244,7 +298,7 @@ def build_event_object(event: Event, *, internal_state: Mapping[str, Any] | None
             },
         }
         grammar_roles = infer_grammar_roles(text)
-        classifiers.extend(infer_text_classifiers(text, raw_meta))
+        classifiers.extend(infer_text_classifiers(text, raw_meta, grammar_roles))
         if raw_meta.get("salience_delta") is not None or raw_meta.get("preference_delta") is not None:
             salience["textual_accent"] = {
                 "salience_delta": raw_meta.get("salience_delta"),

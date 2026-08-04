@@ -10,7 +10,10 @@ from microbrain.orchestrator.orchestrator import Orchestrator
 from microbrain.memory.mem_cell_store import MemCellStore
 from microbrain.utils.memdir import resolve_memdir_ctx
 
+from microbrain.utils.heartbeat_stream import service_topic
+
 NEURON_NAME = Path(__file__).stem
+SERVICE_TOPIC = service_topic("curiosity")
 
 
 def _safe_float(x: Any, default: float) -> float:
@@ -53,7 +56,7 @@ class LightProbeNeuron(BaseNeuron):
         return self._mem_cells
 
     async def process(self, event: Event, ctx) -> Iterable[Event]:
-        if event.topic != "clock/tick":
+        if event.topic != SERVICE_TOPIC:
             return []
 
         store = await self._ensure_store(ctx)
@@ -135,7 +138,7 @@ class LightProbeNeuron(BaseNeuron):
 def build_neurons(orchestrator: Orchestrator):
     cfg = NeuronConfig(
         name=NEURON_NAME,
-        subscribed_topics=["clock/tick"],
+        subscribed_topics=[SERVICE_TOPIC],
         output_topics=["thought/probe"],
         priority=1,
         cooldown_sec=0.0,

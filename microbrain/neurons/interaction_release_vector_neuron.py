@@ -7,6 +7,7 @@ from typing import Any, Dict, Iterable
 
 from microbrain.orchestrator.neuron_base import BaseNeuron, Event, NeuronConfig
 from microbrain.orchestrator.orchestrator import Orchestrator
+from microbrain.utils.heartbeat_stream import service_topic
 
 # ---------------------------------------------------------------------------
 # Behavioral tuning
@@ -82,7 +83,9 @@ CHARGING_RELEASE_MIN_URGENCY = 0.78
 
 # Fixed bus routes and identity markers. Changing these requires updating every
 # producer/subscriber that participates in the interaction-pressure protocol.
+
 NEURON_NAME = Path(__file__).stem
+SERVICE_TOPIC = service_topic("affect")
 
 # Unified response-ownership law. External participant turns are interpreted
 # and released by the hypothesis path. This neuron may measure and publish
@@ -235,7 +238,7 @@ class InteractionReleaseVectorNeuron(BaseNeuron):
 
         # InitiativeThresholdNeuron runs later than this neuron on the same
         # percept/text event, so a brand-new user input could otherwise be
-        # invisible until the next clock tick. Use a short-lived input stimulus
+        # invisible until the next affect-service opportunity. Use a short-lived input stimulus
         # as the immediate reflex source for interaction pressure.
         stimulus = await ctx.get_kv("drive:interaction:last_input_stimulus", {}) or {}
         if isinstance(stimulus, dict):
@@ -637,7 +640,7 @@ class InteractionReleaseVectorNeuron(BaseNeuron):
 def build_neurons(orchestrator: Orchestrator):
     cfg = NeuronConfig(
         name=NEURON_NAME,
-        subscribed_topics=["clock/tick", "percept/text", "act/speech", "event/relief/interaction"],
+        subscribed_topics=[SERVICE_TOPIC, "percept/text", "act/speech", "event/relief/interaction"],
         output_topics=[INTERACTION_REQUEST_TOPIC, SPEECH_REASON_TOPIC],
         priority=8,
         cooldown_sec=0.0,

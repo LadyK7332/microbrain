@@ -11,6 +11,7 @@ from microbrain.orchestrator.orchestrator import Orchestrator
 from microbrain.utils.memdir import resolve_memdir_ctx
 
 # Reuse the small MB vision utilities (pygetwindow + mss)
+from microbrain.utils.mb_vision.ram_frames import encode_jpeg_bytes, store_ram_frame
 from microbrain.utils.mb_vision.window_grabber import (
     list_windows,
     pick_window,
@@ -19,7 +20,10 @@ from microbrain.utils.mb_vision.window_grabber import (
     draw_focus_reticle,
 )
 
+from microbrain.utils.heartbeat_stream import service_topic
+
 NEURON_NAME = Path(__file__).stem
+SERVICE_TOPIC = service_topic("vision")
 
 
 class VisionWindowCaptureNeuron(BaseNeuron):
@@ -36,6 +40,9 @@ class VisionWindowCaptureNeuron(BaseNeuron):
 
     Emits:
       - percept/vision payload {ts, frame_id, data_ref, width, height, format, window}
+
+    Raw frames are RAM-first. ``vision:save_mode=ram`` is the default; durable
+    JPEG writes occur only when explicitly switched to latest/gated/all.
     """
     PREVIEW_WINDOW = "MB Vision Preview"
 
@@ -60,7 +67,7 @@ class VisionWindowCaptureNeuron(BaseNeuron):
         if event.topic == "control/focus":
             return await self._handle_focus(event, ctx)
 
-        if event.topic == "clock/tick":
+        if event.topic == SERVICE_TOPIC:
             return await self._tick_capture(event, ctx)
 
         return []
@@ -265,67 +272,76 @@ class VisionWindowCaptureNeuron(BaseNeuron):
             except Exception as e:
                 self.debug("vision_preview_error", err=repr(e))
 
-        # Frame-write gating (prevents saving hundreds of near-identical frames)
-        save_mode = str(await ctx.get_kv("vision:save_mode", "gated") or "gated").lower().strip()
-        dupe_thresh = float(await ctx.get_kv("vision:dupe_thresh", 0.06) or 0.06)   # 0..1 (dHash ratio)
-        max_stale_s = float(await ctx.get_kv("vision:max_stale_s", 20.0) or 20.0)   # force-save occasionally
-
-        cur_hash = self._dhash64(frame)
-        last_hash = int(await self.load_state(ctx, "last_saved_dhash", 0) or 0)
-        last_save_ts = float(await self.load_state(ctx, "last_saved_frame_ts", 0.0) or 0.0)
-
-        dist = (cur_hash ^ last_hash).bit_count() if last_hash else 64
-        ratio = dist / 64.0
-        stale = (last_save_ts <= 0.0) or ((now - last_save_ts) >= max_stale_s)
-
-        if save_mode == "gated" and (not stale) and last_hash and ratio < dupe_thresh:
-            self.debug("vision_frame_skip_duplicate", ratio=ratio, dupe_thresh=dupe_thresh, stale=stale)
-            return []
+        # Raw frames live in a bounded RAM ring by default. Disk persistence is
+        # opt-in (latest/gated/all) and is for evidence/debugging, not perception.
+        save_mode = str(await ctx.get_kv("vision:save_mode", "ram") or "ram").lower().strip()
+        jpeg_quality = int(await ctx.get_kv("vision:ram_jpeg_quality", 82) or 82)
 
         frame_id = int(await self.load_state(ctx, "frame_id", 0) or 0) + 1
         await self.save_state(ctx, "frame_id", frame_id)
-
-        memdir = await resolve_memdir_ctx(ctx, fallback=None)
-        base = Path(memdir) / "sight" / "frames"
-        base.mkdir(parents=True, exist_ok=True)
-
-        if save_mode == "latest":
-            out_path = base / "latest.jpg"
-        else:
-            out_path = base / f"frame-{frame_id:06d}.jpg"
-
         try:
-            save_jpeg(frame, str(out_path))
+            jpeg_bytes = encode_jpeg_bytes(frame, quality=jpeg_quality)
         except Exception as e:
-            self.debug("vision_save_error", err=repr(e), path=str(out_path))
+            self.debug("vision_ram_encode_error", err=repr(e), rect=rect)
             return []
 
-        await self.save_state(ctx, "last_saved_dhash", int(cur_hash))
-        await self.save_state(ctx, "last_saved_frame_ts", now)
+        ram_ref = await store_ram_frame(
+            ctx,
+            sensor="window",
+            frame_id=frame_id,
+            timestamp=now,
+            jpeg_bytes=jpeg_bytes,
+            width=int(w),
+            height=int(h),
+        )
 
-        # Optional: keep frames dir bounded even in "all" mode
-        frames_keep = await ctx.get_kv("vision:frames_keep", 500)
-        try:
-            frames_keep = int(frames_keep)
-        except Exception:
-            frames_keep = 500
-        if save_mode != "latest" and frames_keep > 0:
-            try:
-                files = sorted(base.glob("frame-*.jpg"))
-                if len(files) > frames_keep:
-                    for p in files[: len(files) - frames_keep]:
+        persistent_ref = ""
+        if save_mode in {"latest", "gated", "all"}:
+            dupe_thresh = float(await ctx.get_kv("vision:dupe_thresh", 0.06) or 0.06)
+            max_stale_s = float(await ctx.get_kv("vision:max_stale_s", 20.0) or 20.0)
+            cur_hash = self._dhash64(frame)
+            last_hash = int(await self.load_state(ctx, "last_saved_dhash", 0) or 0)
+            last_save_ts = float(await self.load_state(ctx, "last_saved_frame_ts", 0.0) or 0.0)
+            dist = (cur_hash ^ last_hash).bit_count() if last_hash else 64
+            ratio = dist / 64.0
+            stale = (last_save_ts <= 0.0) or ((now - last_save_ts) >= max_stale_s)
+            persist = save_mode in {"latest", "all"} or not last_hash or stale or ratio >= dupe_thresh
+
+            if persist:
+                memdir = await resolve_memdir_ctx(ctx, fallback=None)
+                base = Path(memdir) / "sight" / "frames"
+                base.mkdir(parents=True, exist_ok=True)
+                out_path = base / ("latest.jpg" if save_mode == "latest" else f"frame-{frame_id:06d}.jpg")
+                try:
+                    save_jpeg(frame, str(out_path))
+                    persistent_ref = str(out_path)
+                    await self.save_state(ctx, "last_saved_dhash", int(cur_hash))
+                    await self.save_state(ctx, "last_saved_frame_ts", now)
+                except Exception as e:
+                    self.debug("vision_save_error", err=repr(e), path=str(out_path))
+
+                if save_mode != "latest":
+                    frames_keep = int(await ctx.get_kv("vision:frames_keep", 500) or 500)
+                    if frames_keep > 0:
                         try:
-                            p.unlink()
+                            files = sorted(base.glob("frame-*.jpg"))
+                            if len(files) > frames_keep:
+                                for old_path in files[: len(files) - frames_keep]:
+                                    try:
+                                        old_path.unlink()
+                                    except Exception:
+                                        pass
                         except Exception:
                             pass
-            except Exception:
-                pass
 
         focus_state = await self._read_focus_state(ctx)
         payload = {
             "ts": now,
             "frame_id": frame_id,
-            "data_ref": str(out_path),
+            "data_ref": ram_ref,
+            "frame_ref": ram_ref,
+            "persistent_ref": persistent_ref,
+            "storage": "ram" if not persistent_ref else "ram+disk",
             "width": int(w),
             "height": int(h),
             "format": "jpeg",
@@ -446,7 +462,7 @@ def build_neurons(orchestrator: Orchestrator) -> Iterable[BaseNeuron]:
     cfg = NeuronConfig(
         name=NEURON_NAME,
         subscribed_topics=[
-            "clock/tick",
+            SERVICE_TOPIC,
             "control/vision",
             "control/focus",
         ],

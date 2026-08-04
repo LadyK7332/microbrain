@@ -11,7 +11,10 @@ from microbrain.orchestrator.neuron_base import BaseNeuron, NeuronConfig, Event
 from microbrain.orchestrator.orchestrator import Orchestrator
 
 # Neuron name = this file's basename without .py
+from microbrain.utils.heartbeat_stream import service_topic
+
 NEURON_NAME = Path(__file__).stem
+SERVICE_TOPIC = service_topic("affect")
 
 
 def _clamp01(value: float) -> float:
@@ -77,7 +80,7 @@ class BoredomDriveNeuron(BaseNeuron):
         )
 
         if event.topic not in (
-            "clock/tick",
+            SERVICE_TOPIC,
             "percept/text",
             "percept/vision",
             "act/speech",
@@ -206,12 +209,12 @@ class BoredomDriveNeuron(BaseNeuron):
 
         if isinstance(boredom_relief_state, dict):
             relief_level = _clamp01(float(boredom_relief_state.get("level", 0.0) or 0.0))
-            if relief_level > 0.0 and event.topic == "clock/tick":
+            if relief_level > 0.0 and event.topic == SERVICE_TOPIC:
                 novelty_delta += 0.025 * relief_level * novelty_gain
                 level = max(0.0, level - (0.035 * relief_level * boredom_relief_gain))
 
         idle = (now - last_external_ts) > 2.0
-        if event.topic == "clock/tick":
+        if event.topic == SERVICE_TOPIC:
             if idle:
                 level += dt * idle_growth_per_s
             else:
@@ -219,10 +222,10 @@ class BoredomDriveNeuron(BaseNeuron):
 
         level = _clamp01(level)
 
-        # HRM repetition boredom: only on clock ticks so it reflects "stuck over time".
+        # HRM repetition boredom: only on affect-service opportunities so it reflects "stuck over time".
         if prev_idx is None and hrm_last_idx is not None:
             prev_idx = hrm_last_idx
-        elif event.topic == "clock/tick" and hrm_last_idx is not None:
+        elif event.topic == SERVICE_TOPIC and hrm_last_idx is not None:
             if hrm_last_idx == prev_idx:
                 repetitions += 1
                 base_inc = 0.02
@@ -294,7 +297,7 @@ def build_neurons(orchestrator: Orchestrator):
     cfg = NeuronConfig(
         name=NEURON_NAME,
         subscribed_topics=[
-            "clock/tick",
+            SERVICE_TOPIC,
             "percept/text",
             "percept/vision",
             "act/speech",

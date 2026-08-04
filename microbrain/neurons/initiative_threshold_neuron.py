@@ -9,7 +9,10 @@ from microbrain.hormone import derive_ddna_modulators, derive_rosehip_state, mer
 from microbrain.orchestrator.neuron_base import BaseNeuron, Event, NeuronConfig
 from microbrain.orchestrator.orchestrator import Orchestrator
 
+from microbrain.utils.heartbeat_stream import service_topic
+
 NEURON_NAME = Path(__file__).stem
+SERVICE_TOPIC = service_topic("curiosity")
 
 _UNCERTAINTY_PATTERNS = (
     "?",
@@ -99,7 +102,7 @@ class InitiativeThresholdNeuron(BaseNeuron):
 
     async def process(self, event: Event, ctx) -> Iterable[Event]:
         if event.topic not in (
-            "clock/tick",
+            SERVICE_TOPIC,
             "percept/text",
             "percept/vision",
             "act/speech",
@@ -768,7 +771,7 @@ def build_neurons(orchestrator: Orchestrator):
     cfg = NeuronConfig(
         name=NEURON_NAME,
         subscribed_topics=[
-            "clock/tick",
+            SERVICE_TOPIC,
             "percept/text",
             "percept/vision",
             "act/speech",

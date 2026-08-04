@@ -16,7 +16,10 @@ from microbrain.hormone import (
 from microbrain.orchestrator.neuron_base import BaseNeuron, Event, NeuronConfig
 from microbrain.orchestrator.orchestrator import Orchestrator
 
+from microbrain.utils.heartbeat_stream import service_topic
+
 NEURON_NAME = Path(__file__).stem
+SERVICE_TOPIC = service_topic("affect")
 
 
 class HormoneStateNeuron(BaseNeuron):
@@ -34,7 +37,7 @@ class HormoneStateNeuron(BaseNeuron):
 
     async def process(self, event: Event, ctx) -> Iterable[Event]:
         if event.topic not in (
-            "clock/tick",
+            SERVICE_TOPIC,
             "percept/text",
             "percept/vision",
             "act/speech",
@@ -64,7 +67,7 @@ class HormoneStateNeuron(BaseNeuron):
                 state["last_external_ts"] = now
 
         last_update_ts = safe_float(state.get("last_update_ts", now), now)
-        dt_s = max(0.25, min(10.0, now - last_update_ts)) if last_update_ts > 0 else 1.0
+        dt_s = max(0.0, min(10.0, now - last_update_ts)) if last_update_ts > 0 else 1.0
         state["last_update_ts"] = now
 
         boredom = await ctx.get_kv("drive:boredom", {}) or {}
@@ -164,7 +167,7 @@ def build_neurons(orchestrator: Orchestrator):
     cfg = NeuronConfig(
         name=NEURON_NAME,
         subscribed_topics=[
-            "clock/tick",
+            SERVICE_TOPIC,
             "percept/text",
             "percept/vision",
             "act/speech",

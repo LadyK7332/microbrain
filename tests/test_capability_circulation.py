@@ -3,6 +3,7 @@ import asyncio
 from microbrain.neurons.capability_circulation_neuron import CapabilityCirculationNeuron
 from microbrain.neurons.thought_turn_arbitration_neuron import ThoughtTurnArbitrationNeuron
 from microbrain.orchestrator.neuron_base import Event, NeuronConfig
+from microbrain.utils.heartbeat_stream import service_topic
 
 
 class FakeCtx:
@@ -32,7 +33,7 @@ def make_capability():
     return CapabilityCirculationNeuron(
         NeuronConfig(
             name="capability_circulation_neuron",
-            subscribed_topics=["control/capability", "thought/action_candidate", "clock/tick"],
+            subscribed_topics=["control/capability", "thought/action_candidate", service_topic("capability")],
             output_topics=["capability/state", "capability/readiness", "thought/drawer_recheck"],
         )
     )

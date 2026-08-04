@@ -15,7 +15,7 @@ ACTION_HINTS = {
     "makes", "make", "made", "moves", "move", "moved", "chops", "chop", "chopped", "cuts", "cut",
     "cutting", "using", "used", "use", "helps", "help", "works", "work", "working",
 }
-STRUCTURAL_KINDS = {"general_pattern", "compressed_general_pattern", "trainer_alignment"}
+STRUCTURAL_KINDS = {"general_pattern", "compressed_general_pattern", "clause_frame", "trainer_alignment"}
 
 
 def _norm(text: str) -> str:
@@ -70,6 +70,16 @@ def _render_candidate(candidate: Mapping[str, Any]) -> str:
     meta = dict(candidate.get("meta", {}) or {})
     if kind in {"general_pattern", "compressed_general_pattern"}:
         return _render_general_pattern(candidate)
+    if kind == "clause_frame":
+        slots = dict(meta.get("slots", {}) or {})
+        subject = str(slots.get("subject", "") or "").strip()
+        action = str(slots.get("action", "") or "").strip()
+        obj = str(slots.get("object", "") or "").strip()
+        complement = str(slots.get("complement", "") or "").strip()
+        if str(meta.get("clause_type", "") or "") == "copular" and subject and complement:
+            return f"{subject} is {complement}".strip()
+        if subject and action:
+            return " ".join([p for p in [subject, action, obj] if p]).strip()
     if kind == "trainer_alignment":
         desired = str(meta.get("desired_utterance", "") or "").strip()
         if desired:
@@ -116,7 +126,7 @@ def gather_support(
         queries.append(query_text)
         seen = set()
         for q in queries:
-            for hit in mem_cell_store.search_text_cells(q, limit=10, tiers=("long", "now", "short")):
+            for hit in mem_cell_store.search_text_cells(q, limit=10, tiers=("long", "hot", "now", "short")):
                 hid = str(hit.get("cell_id", "") or "")
                 if not hid or hid in seen:
                     continue
@@ -133,7 +143,7 @@ def gather_support(
                 transport_source = str(meta.get("transport_source", "") or "")
                 channel = str(meta.get("channel", "") or "")
 
-                if kind in {"general_pattern", "compressed_general_pattern"}:
+                if kind in {"general_pattern", "compressed_general_pattern", "clause_frame"}:
                     pattern_type = str(meta.get("pattern_type", "") or "")
                     score += 0.18
                     if kind == "compressed_general_pattern" or tier == "derived":
@@ -150,12 +160,12 @@ def gather_support(
                     score += 0.08
                     if any(tok in ACTION_HINTS for tok in _tokens(anchor_text)):
                         score += 0.10
-                if qtype == "what_is" and kind in {"utterance_anchor", "general_pattern", "compressed_general_pattern", "trainer_alignment"}:
+                if qtype == "what_is" and kind in {"utterance_anchor", "general_pattern", "compressed_general_pattern", "clause_frame", "trainer_alignment"}:
                     score += 0.07
 
                 # Reading should shape structure more than it quotes surface lines.
                 if transport_source == "reading":
-                    if kind in {"general_pattern", "compressed_general_pattern"}:
+                    if kind in {"general_pattern", "compressed_general_pattern", "clause_frame"}:
                         score += 0.10
                     elif kind == "utterance_anchor":
                         score -= 0.18
@@ -313,12 +323,12 @@ def compose_answer(bundle: Mapping[str, Any]) -> Tuple[str, float, Dict[str, Any
             forge_intent=str(forge_bundle.get("intent", "") or ""),
             forge_workspace=forge_workspace,
             forge_choice=forge_choice,
-            used_general_pattern=str(best.get("kind", "") or "") in {"general_pattern", "compressed_general_pattern", "trainer_alignment"},
+            used_general_pattern=str(best.get("kind", "") or "") in {"general_pattern", "compressed_general_pattern", "clause_frame", "trainer_alignment"},
             used_compressed=str(best.get("kind", "") or "") == "compressed_general_pattern",
             used_trainer_alignment=str(best.get("kind", "") or "") == "trainer_alignment",
         )
 
-    if str(best.get("kind", "") or "") in {"general_pattern", "compressed_general_pattern", "trainer_alignment"}:
+    if str(best.get("kind", "") or "") in {"general_pattern", "compressed_general_pattern", "clause_frame", "trainer_alignment"}:
         rendered = _render_candidate(best)
         if rendered:
             cleaned = rendered.rstrip(" .")

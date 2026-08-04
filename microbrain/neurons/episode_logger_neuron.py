@@ -18,7 +18,10 @@ try:
 except Exception:  # pragma: no cover
     JSONLStore = None  # type: ignore
 
+from microbrain.utils.heartbeat_stream import service_topic
+
 NEURON_NAME = Path(__file__).stem
+SERVICE_TOPIC = service_topic("memory")
 
 
 @dataclass
@@ -73,7 +76,7 @@ class EpisodeLoggerNeuron(BaseNeuron):
     async def process(self, ctx, event: Event) -> Iterable[Event]:
         await self._ensure_store(ctx)
         # Don't spam the episode file with ticks; we only use tick to bootstrap.
-        if event.topic == "clock/tick":
+        if event.topic == SERVICE_TOPIC:
             return []
 
         # --- debug roll call (only active when --debug is passed) ----
@@ -113,7 +116,7 @@ def build_neurons(orchestrator: Orchestrator) -> Iterable[BaseNeuron]:
         cfg = NeuronConfig(
             name=NEURON_NAME,
             subscribed_topics=[
-                "clock/tick",
+                SERVICE_TOPIC,
                 "percept/text",
                 "act/speech",
                 "percept/vision",

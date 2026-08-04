@@ -10,7 +10,10 @@ from microbrain.orchestrator.neuron_base import BaseNeuron, Event, NeuronConfig
 from microbrain.orchestrator.orchestrator import Orchestrator
 from microbrain.pdna.access import profile_path
 
+from microbrain.utils.heartbeat_stream import service_topic
+
 NEURON_NAME = Path(__file__).stem
+SERVICE_TOPIC = service_topic("affect")
 
 
 def _clamp(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
@@ -248,7 +251,7 @@ class RewardNoveltyPulseNeuron(BaseNeuron):
 
     async def process(self, event: Event, ctx) -> Iterable[Event]:
         if event.topic not in {
-            "clock/tick",
+            SERVICE_TOPIC,
             "percept/text",
             "percept/vision",
             "act/speech",
@@ -275,7 +278,7 @@ class RewardNoveltyPulseNeuron(BaseNeuron):
         relief_gain = _clamp(_safe_float(mods.get("boredom_relief_gain"), 1.0), 0.25, 2.00)
         trainer_gain = _clamp(_safe_float(mods.get("trainer_alignment_gain"), 1.0), 0.25, 2.00)
 
-        if event.topic == "clock/tick":
+        if event.topic == SERVICE_TOPIC:
             await self._persist(ctx, state, reason=reason, delta=0.0, source_topic=event.topic)
             return []
 
@@ -415,7 +418,7 @@ def build_neurons(orchestrator: Orchestrator):
     cfg = NeuronConfig(
         name=NEURON_NAME,
         subscribed_topics=[
-            "clock/tick",
+            SERVICE_TOPIC,
             "percept/text",
             "percept/vision",
             "act/speech",

@@ -10,7 +10,10 @@ from microbrain.orchestrator.orchestrator import Orchestrator
 from microbrain.patterns.pattern_edge_log import PatternEdgeLog
 from microbrain.utils.memdir import resolve_memdir_ctx
 
+from microbrain.utils.heartbeat_stream import service_topic
+
 NEURON_NAME = Path(__file__).stem
+SERVICE_TOPIC = service_topic("maintenance")
 
 
 def _safe_float(x: Any, default: float) -> float:
@@ -69,7 +72,7 @@ class EntropyNeuron(BaseNeuron):
         return self._edges
     
     async def process(self, event: Event, ctx) -> Iterable[Event]:
-        if event.topic != "clock/tick":
+        if event.topic != SERVICE_TOPIC:
             return []
 
         allowed = bool(await ctx.get_kv("entropy:allowed", False))
@@ -288,7 +291,7 @@ class EntropyNeuron(BaseNeuron):
 def build_neurons(orchestrator: Orchestrator):
     cfg = NeuronConfig(
         name=NEURON_NAME,
-        subscribed_topics=["clock/tick"],
+        subscribed_topics=[SERVICE_TOPIC],
         output_topics=[],
         priority=9,       # late; after learning edges were written
         cooldown_sec=0.0,  # quiet: use internal run_every_s instead of base cooldown spam

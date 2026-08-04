@@ -44,6 +44,7 @@ RUNTIME_TUNING_NAME_TOKENS = (
     "scale",
     "window",
     "attempt",
+    "batch",
     "max_",
     "min_",
 )
@@ -59,6 +60,7 @@ RUNTIME_TUNING_PREFIXES = (
     "mem_cell:",
     "memory:",
     "scene:",
+    "slearn:",
     "thought:",
     "vision:",
 )

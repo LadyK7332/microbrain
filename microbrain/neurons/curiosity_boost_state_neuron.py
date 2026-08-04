@@ -7,7 +7,10 @@ from typing import Iterable
 from microbrain.orchestrator.neuron_base import BaseNeuron, NeuronConfig, Event
 from microbrain.orchestrator.orchestrator import Orchestrator
 
+from microbrain.utils.heartbeat_stream import service_topic
+
 NEURON_NAME = Path(__file__).stem
+SERVICE_TOPIC = service_topic("affect")
 
 
 class CuriosityBoostStateNeuron(BaseNeuron):
@@ -16,7 +19,7 @@ class CuriosityBoostStateNeuron(BaseNeuron):
 
     Inputs:
       - curiosity/adjust payload {"boost": float, "pause_s": float, "reason": str, ...}
-      - clock/tick payload {"ts": ...}
+      - body/service/affect payload {"ts": ...}
 
     KV keys written:
       - curiosity:boost (float 0..1)
@@ -92,7 +95,7 @@ class CuriosityBoostStateNeuron(BaseNeuron):
             )
             return []
 
-        if event.topic == "clock/tick":
+        if event.topic == SERVICE_TOPIC:
             now = time.time()
 
             boost = float(await ctx.get_kv("curiosity:boost", 0.0) or 0.0)
@@ -132,7 +135,7 @@ def build_neurons(orchestrator: Orchestrator):
         name=NEURON_NAME,
         subscribed_topics=[
             "curiosity/adjust",
-            "clock/tick",
+            SERVICE_TOPIC,
         ],
         output_topics=[],
         priority=5,  # early-ish (after feedback, before most drives is fine)

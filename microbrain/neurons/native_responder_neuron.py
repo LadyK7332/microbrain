@@ -12,6 +12,7 @@ from microbrain.orchestrator.neuron_base import BaseNeuron, Event, NeuronConfig
 from microbrain.orchestrator.orchestrator import Orchestrator
 
 NEURON_NAME = Path(__file__).stem
+SLEARN_SLOT_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
 def _norm(text: str) -> str:
@@ -31,6 +32,81 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except Exception:
         return float(default)
+
+
+def _strip_outer_quotes(text: str) -> str:
+    raw = str(text or "").strip()
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {"\"", "'"}:
+        return raw[1:-1].strip()
+    return raw
+
+
+def _flex_literal_regex(text: str) -> str:
+    parts = re.split(r"(\s+)", str(text or ""))
+    return "".join(r"\s+" if part.isspace() else re.escape(part) for part in parts if part)
+
+
+def _match_slearn_template(pattern: str, text: str) -> Dict[str, str] | None:
+    """Bind {slot} placeholders in a learned USER-speech condition."""
+    pattern = str(pattern or "").strip()
+    raw_text = str(text or "").strip()
+    matches = list(SLEARN_SLOT_RE.finditer(pattern))
+    if not pattern or not raw_text or not matches:
+        return None
+
+    # Do not allow a bare {anything} rule to become a catch-all speech rule.
+    literal_text = SLEARN_SLOT_RE.sub("", pattern)
+    if not re.search(r"[A-Za-z0-9]", literal_text):
+        return None
+
+    parts: List[str] = [r"^\s*"]
+    seen: set[str] = set()
+    pos = 0
+    for match in matches:
+        parts.append(_flex_literal_regex(pattern[pos:match.start()]))
+        name = str(match.group(1) or "").strip()
+        if name in seen:
+            parts.append(rf"(?P={name})")
+        else:
+            parts.append(rf"(?P<{name}>.+?)")
+            seen.add(name)
+        pos = match.end()
+    parts.append(_flex_literal_regex(pattern[pos:]))
+    parts.append(r"\s*$")
+
+    try:
+        matched = re.match("".join(parts), raw_text, flags=re.IGNORECASE | re.DOTALL)
+    except re.error:
+        return None
+    if not matched:
+        return None
+
+    bindings: Dict[str, str] = {}
+    for name, value in matched.groupdict().items():
+        clean = _strip_outer_quotes(str(value or "").strip())
+        if not clean:
+            return None
+        bindings[name] = clean
+    return bindings
+
+
+def _render_slearn_template(template: str, bindings: Mapping[str, str]) -> str:
+    raw = str(template or "").strip()
+    if not raw:
+        return ""
+
+    unresolved = False
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal unresolved
+        name = str(match.group(1) or "")
+        if name not in bindings:
+            unresolved = True
+            return ""
+        return str(bindings.get(name, "") or "")
+
+    rendered = SLEARN_SLOT_RE.sub(replace, raw).strip()
+    return "" if unresolved else rendered
 
 
 def _looks_stock_reply(text: str) -> bool:
@@ -165,7 +241,7 @@ class NativeResponderNeuron(BaseNeuron):
         if not isinstance(mem_store, MemCellStore) or not str(lookup_text or "").strip():
             return guidance
         try:
-            hits = mem_store.search_text_cells(lookup_text, limit=16, tiers=("learned", "long", "now", "short"))
+            hits = mem_store.search_text_cells(lookup_text, limit=16, tiers=("learned", "long", "hot", "now", "short"))
         except Exception:
             return guidance
 
@@ -178,7 +254,25 @@ class NativeResponderNeuron(BaseNeuron):
             kind = str(hit.get("kind", "") or meta.get("kind", "") or "")
             if kind not in {"syntax_rule", "trainer_alignment"}:
                 continue
+
+            template_bindings: Dict[str, str] = {}
+            condition_text = str(meta.get("condition_text", "") or "").strip()
+            condition_slots = [str(v or "").strip() for v in list(meta.get("condition_slots", []) or []) if str(v or "").strip()]
+            if kind == "syntax_rule" and not condition_slots and condition_text:
+                condition_slots = [str(m.group(1) or "").strip() for m in SLEARN_SLOT_RE.finditer(condition_text) if str(m.group(1) or "").strip()]
+            if kind == "syntax_rule" and condition_slots:
+                matched = _match_slearn_template(condition_text, lookup_text)
+                if matched is None:
+                    continue
+                template_bindings = matched
+
             score = _safe_float(hit.get("score", 0.0), 0.0)
+            if template_bindings:
+                # A full learned template match is stronger evidence than fuzzy
+                # token overlap used only to retrieve the candidate rule.
+                score += 0.45
+                meta["template_bindings"] = dict(template_bindings)
+
             for key, value in self._meta_ddna_targets(meta).items():
                 guidance["ddna_targets"][key] = max(float(guidance["ddna_targets"].get(key, 0.0)), value)
             for classifier in list(meta.get("syntax_classifiers", []) or []):
@@ -186,6 +280,11 @@ class NativeResponderNeuron(BaseNeuron):
                 if name and name not in guidance["classifiers"]:
                     guidance["classifiers"].append(name)
             reply = str(meta.get("reply_text", "") or meta.get("desired_utterance", "") or "").strip()
+            if template_bindings and reply:
+                reply = _render_slearn_template(reply, template_bindings)
+            elif reply and SLEARN_SLOT_RE.search(reply):
+                # Never speak an unresolved learned placeholder literally.
+                reply = ""
             if reply and not _looks_stock_reply(reply):
                 norm = _norm(reply)
                 if norm and norm not in seen_reply:
@@ -419,6 +518,20 @@ class NativeResponderNeuron(BaseNeuron):
             return True
         return False
 
+    async def _mem_store(self, ctx) -> MemCellStore | None:
+        store = await ctx.get_kv("memory:mem_cell_store", None)
+        if isinstance(store, MemCellStore):
+            return store
+        memdir = await ctx.get_kv("cfg:memdir", None) or await ctx.get_kv("memdir", None)
+        if not memdir:
+            return None
+        try:
+            store = MemCellStore(str(memdir))
+            await ctx.set_kv("memory:mem_cell_store", store)
+            return store
+        except Exception:
+            return None
+
     async def process(self, event: Event, ctx) -> Iterable[Event]:
         self.debug(
             "received",
@@ -451,6 +564,10 @@ class NativeResponderNeuron(BaseNeuron):
         if channel in ("internal", "thought"):
             return []
 
+        mem_store = await self._mem_store(ctx)
+        syntax_guidance = self._syntax_guidance(mem_store, text)
+        learned_direct_reply = bool(list(syntax_guidance.get("preferred_replies", []) or []))
+
         shape = await self._shape_reply(
             ctx,
             text=text,
@@ -459,6 +576,7 @@ class NativeResponderNeuron(BaseNeuron):
             raw_meta=raw_meta,
             hypothesis=hypothesis,
             selected_action=selected_action,
+            learned_direct_reply=learned_direct_reply,
         )
         if shape.get("suppress", False):
             await ctx.log_debug(
@@ -468,7 +586,14 @@ class NativeResponderNeuron(BaseNeuron):
             )
             return []
 
-        reply = await self._build_response(ctx, text=text, shape=shape, payload=payload)
+        reply = await self._build_response(
+            ctx,
+            text=text,
+            shape=shape,
+            payload=payload,
+            mem_store=mem_store,
+            syntax_guidance=syntax_guidance,
+        )
         if not reply:
             return []
 
@@ -532,6 +657,7 @@ class NativeResponderNeuron(BaseNeuron):
         raw_meta: Mapping[str, Any] | None = None,
         hypothesis: Mapping[str, Any] | None = None,
         selected_action: str = "",
+        learned_direct_reply: bool = False,
     ) -> Dict[str, Any]:
         hormones = await ctx.get_kv("drive:hormones", {}) or {}
         wants = await ctx.get_kv("drive:want_vector", {}) or {}
@@ -561,7 +687,6 @@ class NativeResponderNeuron(BaseNeuron):
         parse_request = any(
             key in text_norm for key in ("what did you parse", "what do you see", "what did you get")
         )
-        say_request = text_norm.startswith("say ")
         greeting = text_norm in ("hi", "hello", "hey", "yo", "howdy")
 
         externalize = _safe_float(wants.get("externalize", 0.0))
@@ -585,7 +710,7 @@ class NativeResponderNeuron(BaseNeuron):
             direct_bonus += 0.28
         if direct_response_request:
             direct_bonus += 0.32
-        if parse_request or say_request or greeting:
+        if parse_request or learned_direct_reply or greeting:
             direct_bonus += 0.24
         if transport_source in ("textual", "cli", "ui", "mic"):
             direct_bonus += 0.12
@@ -657,7 +782,7 @@ class NativeResponderNeuron(BaseNeuron):
             - (0.24 * sleep_quiet_brake)
             - (0.10 * confidence_brake)
         )
-        if is_question or direct_response_request or parse_request or say_request or greeting:
+        if is_question or direct_response_request or parse_request or learned_direct_reply or greeting:
             release_score = max(release_score, direct_reply_floor)
         elif hypothesis_should_respond:
             hypothesis_floor = min(0.38, 0.16 + (0.22 * hypothesis_response_demand))
@@ -706,7 +831,7 @@ class NativeResponderNeuron(BaseNeuron):
         if sleep_quiet_brake >= 0.70:
             suppress = True
             reason = "rosehip_sleep_quiet"
-        elif not (is_question or direct_response_request or parse_request or say_request or greeting or hypothesis_should_respond):
+        elif not (is_question or direct_response_request or parse_request or learned_direct_reply or greeting or hypothesis_should_respond):
             if release_score < 0.18:
                 suppress = True
                 reason = "low_release_score"
@@ -716,7 +841,7 @@ class NativeResponderNeuron(BaseNeuron):
             mode = "clarify"
         elif selected_action in {"acknowledge", "acknowledge_revision"}:
             mode = "ack"
-        elif clarify_first >= 0.52 and is_question and not parse_request and not say_request:
+        elif clarify_first >= 0.52 and is_question and not parse_request and not learned_direct_reply:
             mode = "clarify"
         elif release_score < 0.28 and not (is_question or direct_response_request):
             mode = "ack"
@@ -758,7 +883,16 @@ class NativeResponderNeuron(BaseNeuron):
             "selected_action": selected_action,
         }
 
-    async def _build_response(self, ctx, *, text: str, shape: Dict[str, Any], payload: Dict[str, Any]) -> str:
+    async def _build_response(
+        self,
+        ctx,
+        *,
+        text: str,
+        shape: Dict[str, Any],
+        payload: Dict[str, Any],
+        mem_store: MemCellStore | None = None,
+        syntax_guidance: Mapping[str, Any] | None = None,
+    ) -> str:
         """Build only from learned/internal sources; no canned speech fallbacks.
 
         Prebuilt test-pulse lines proved the routes were live. This responder now
@@ -769,15 +903,8 @@ class NativeResponderNeuron(BaseNeuron):
         norm = _norm(text)
         atomized = await ctx.get_kv("language:last_atomized", {}) or {}
         relations = atomized.get("relations", []) if isinstance(atomized, Mapping) else []
-        mem_store = await ctx.get_kv("memory:mem_cell_store", None)
-        if mem_store is None:
-            memdir = await ctx.get_kv("cfg:memdir", None) or await ctx.get_kv("memdir", None)
-            if memdir:
-                try:
-                    mem_store = MemCellStore(str(memdir))
-                    await ctx.set_kv("memory:mem_cell_store", mem_store)
-                except Exception:
-                    mem_store = None
+        if not isinstance(mem_store, MemCellStore):
+            mem_store = await self._mem_store(ctx)
 
         thought_path_last = await ctx.get_kv("thought_path:last", {}) or {}
         power_state = await ctx.get_kv("power:state", {}) or {}
@@ -789,8 +916,9 @@ class NativeResponderNeuron(BaseNeuron):
 
         warm = _safe_float(shape.get("warm", 0.0))
         mode = str(shape.get("mode", "direct") or "direct")
-        syntax_guidance = self._syntax_guidance(mem_store, text)
-        syntax_reply = self._preferred_rule_reply(syntax_guidance, warm=warm)
+        if not isinstance(syntax_guidance, Mapping):
+            syntax_guidance = self._syntax_guidance(mem_store, text)
+        syntax_reply = self._preferred_rule_reply(dict(syntax_guidance), warm=warm)
         avoid_norms = {_norm(t) for t in list(syntax_guidance.get("avoid_replies", []) or []) if _norm(str(t or ""))}
 
         internal_status_reply = await self._internal_status_reply(ctx, text=text, norm=norm, terse=_safe_float(shape.get("terse", 0.0)))

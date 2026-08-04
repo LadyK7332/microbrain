@@ -3,6 +3,12 @@ import asyncio
 from microbrain.neurons.capability_circulation_neuron import CapabilityCirculationNeuron
 from microbrain.neurons.thought_momentum_neuron import ThoughtMomentumNeuron
 from microbrain.orchestrator.neuron_base import BaseNeuron, Event, NeuronConfig
+from microbrain.utils.heartbeat_stream import (
+    heartbeat_meta,
+    service_tick_meta,
+    service_tick_payload,
+    service_topic,
+)
 
 
 class FakeCtx:
@@ -34,7 +40,7 @@ class EchoOutputNeuron(BaseNeuron):
         return [Event(topic="state/pulse", payload={"seen": event.topic}, source=self.name)]
 
 
-def test_clock_tick_never_earns_hebbian_weight_even_when_neuron_outputs():
+def test_legacy_clock_subscription_normalizes_but_body_pulse_never_learns_or_traces():
     async def run():
         ctx = FakeCtx()
         neuron = EchoOutputNeuron(
@@ -45,25 +51,51 @@ def test_clock_tick_never_earns_hebbian_weight_even_when_neuron_outputs():
                 hebbian_learning_rate=0.5,
             )
         )
+        # Legacy subscriptions normalize to the one canonical heartbeat topic.
+        assert neuron.subscribed_topics == ("body/heartbeat",)
+
         event = Event(
-            topic="clock/tick",
-            payload={"ts": 1.0},
+            topic="body/heartbeat",
+            payload={"tick": 1, "ts": 1.0},
             source="system_clock",
-            meta={
-                "event_class": "infrastructure",
-                "semantic_input": False,
-                "reinforcement_eligible": False,
-            },
+            meta=heartbeat_meta(),
         )
         outputs = list(await neuron.handle_event(event, ctx))
         assert len(outputs) == 1
-        assert neuron.get_hebbian_weight("clock/tick") == 0.0
-        record = neuron.get_activation_history()[-1]
-        assert record.hebbian_context == ""
-        assert record.hebbian_weight_after == 0.0
+        assert neuron.get_hebbian_weight("body/heartbeat") == 0.0
+        # Body cadence is intentionally absent from cognitive activation history.
+        assert neuron.get_activation_history() == ()
+        # A meaningful output must not inherit the infrastructure correlation.
+        assert outputs[0].correlation_id != event.correlation_id
 
     asyncio.run(run())
 
+
+
+def test_body_cadence_is_independent_of_semantic_cooldown():
+    async def run():
+        ctx = FakeCtx()
+        neuron = EchoOutputNeuron(
+            NeuronConfig(
+                name="cooldown_isolation",
+                subscribed_topics=["body/heartbeat"],
+                output_topics=["state/pulse"],
+                cooldown_sec=60.0,
+            )
+        )
+        neuron._last_fire_time = 1234.5
+        outputs = list(await neuron.handle_event(
+            Event(
+                topic="body/heartbeat",
+                payload={"tick": 1, "ts": 1.0},
+                meta=heartbeat_meta(),
+            ),
+            ctx,
+        ))
+        assert len(outputs) == 1
+        assert neuron._last_fire_time == 1234.5
+
+    asyncio.run(run())
 
 def test_reinforcement_ineligible_semantic_event_does_not_gain_weight():
     async def run():
@@ -87,13 +119,28 @@ def test_reinforcement_ineligible_semantic_event_does_not_gain_weight():
     asyncio.run(run())
 
 
-def test_thought_momentum_uses_clock_only_for_passive_decay():
+def _service_event(target: str, tick: int = 1) -> Event:
+    heartbeat = {
+        "tick": tick,
+        "epoch_s": 1000.0 + (tick * 0.05),
+        "monotonic_s": 10.0 + (tick * 0.05),
+        "delta_s": 0.05,
+    }
+    return Event(
+        topic=service_topic(target),
+        payload=service_tick_payload(heartbeat, target=target, mode="normal", divisor=1),
+        source="body_adrenaline_scheduler_neuron",
+        meta=service_tick_meta(target),
+    )
+
+
+def test_thought_momentum_uses_cognition_service_only_for_private_passive_decay():
     async def run():
         ctx = FakeCtx()
         neuron = ThoughtMomentumNeuron(
             NeuronConfig(
                 name="thought_momentum_neuron",
-                subscribed_topics=["percept/text", "clock/tick"],
+                subscribed_topics=["percept/text", service_topic("cognition")],
                 output_topics=["thought/momentum"],
             )
         )
@@ -103,13 +150,7 @@ def test_thought_momentum_uses_clock_only_for_passive_decay():
         assert semantic_outputs
         assert ctx.kv["thought:momentum"]["last_event_topic"] == "percept/text"
 
-        tick = Event(
-            topic="clock/tick",
-            payload={"ts": 2.0},
-            source="system_clock",
-            meta={"event_class": "infrastructure", "semantic_input": False},
-        )
-        tick_outputs = list(await neuron.process(tick, ctx))
+        tick_outputs = list(await neuron.process(_service_event("cognition", 2), ctx))
         assert tick_outputs == []
         assert ctx.kv["thought:momentum"]["last_event_topic"] == "percept/text"
         assert ctx.kv["thought:momentum"]["last_update_reason"] == "passive_decay"
@@ -117,29 +158,31 @@ def test_thought_momentum_uses_clock_only_for_passive_decay():
     asyncio.run(run())
 
 
-def test_capability_clock_tick_does_not_publish_unchanged_state():
+def test_capability_service_does_not_publish_unchanged_state():
     async def run():
         ctx = FakeCtx()
         neuron = CapabilityCirculationNeuron(
             NeuronConfig(
                 name="capability_circulation_neuron",
-                subscribed_topics=["clock/tick"],
+                subscribed_topics=[service_topic("capability")],
                 output_topics=["capability/state", "thought/drawer_recheck"],
             )
         )
-        tick = Event(
-            topic="clock/tick",
-            payload={"ts": 1.0},
-            source="system_clock",
-            meta={"event_class": "infrastructure", "semantic_input": False},
-        )
-        # First tick is allowed to publish because it initializes capability state.
-        first_outputs = list(await neuron.process(tick, ctx))
-        assert first_outputs
+        service = _service_event("capability", 4)
+        # First service initializes the dashboard/KV instrument privately.
+        first_outputs = list(await neuron.process(service, ctx))
+        assert first_outputs == []
         assert "capability:state" in ctx.kv
 
-        # Once state is stable, repeated scheduler pulses remain internal.
-        second_outputs = list(await neuron.process(tick, ctx))
+        # Once state is stable, repeated scheduler opportunities remain internal.
+        second_outputs = list(await neuron.process(service, ctx))
         assert second_outputs == []
+
+        # A real capability change still emits state + drawer recheck immediately.
+        changed_outputs = list(await neuron.process(
+            Event(topic="control/capability", payload={"component": "motion_available", "available": True, "ttl_s": 0}),
+            ctx,
+        ))
+        assert {ev.topic for ev in changed_outputs} == {"capability/state", "thought/drawer_recheck"}
 
     asyncio.run(run())

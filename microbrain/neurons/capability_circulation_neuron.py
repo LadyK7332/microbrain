@@ -6,9 +6,10 @@ from typing import Any, Iterable, Mapping
 
 from microbrain.orchestrator.neuron_base import BaseNeuron, Event, NeuronConfig
 from microbrain.orchestrator.orchestrator import Orchestrator
-from microbrain.utils.heartbeat_stream import PRIMARY_HEARTBEAT_TOPIC, is_heartbeat_event
+from microbrain.utils.heartbeat_stream import service_topic
 
 NEURON_NAME = Path(__file__).stem
+SERVICE_TOPIC = service_topic("capability")
 
 
 READY_STATUSES = {"ready", "available", "online", "idle", "ok", "clear", "present", "enabled", "active"}
@@ -108,6 +109,8 @@ class CapabilityCirculationNeuron(BaseNeuron):
         now = time.time()
         changed = False
         outputs: list[Event] = []
+        prior_state = await ctx.get_kv("capability:state", None)
+        had_state = isinstance(prior_state, Mapping) and bool(prior_state)
 
         components = await self._load_components(ctx, now)
         components, kv_changed = await self._refresh_from_kv(ctx, components, now)
@@ -137,13 +140,14 @@ class CapabilityCirculationNeuron(BaseNeuron):
                     await ctx.set_kv(f"capability:readiness:{readiness['thought_id']}", readiness)
                 outputs.append(self._readiness_event(event, readiness))
 
-        if changed or is_heartbeat_event(event):
-            await self._save_components(ctx, components, available, alias_available, state)
+        # Body service may refresh expiry/KV state, but initialization itself is
+        # not a cognitive change.  Seed the RAM/KV instrument silently on the
+        # first service pass; later genuine expiry/KV changes still publish.
+        await self._save_components(ctx, components, available, alias_available, state)
+        publish_change = changed and (event.topic != SERVICE_TOPIC or had_state)
+        if publish_change:
             outputs.append(self._state_event(event, state))
-            if changed:
-                outputs.append(self._drawer_recheck_event(event, state, reason="capability_changed"))
-        else:
-            await self._save_components(ctx, components, available, alias_available, state)
+            outputs.append(self._drawer_recheck_event(event, state, reason="capability_changed"))
 
         return outputs
 
@@ -514,8 +518,7 @@ def build_neurons(orchestrator: Orchestrator):
     cfg = NeuronConfig(
         name=NEURON_NAME,
         subscribed_topics=[
-            "clock/tick",
-            PRIMARY_HEARTBEAT_TOPIC,
+            SERVICE_TOPIC,
             "power/state",
             "component/status",
             "equipment/status",

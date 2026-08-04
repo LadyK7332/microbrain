@@ -7,7 +7,10 @@ from typing import Any, Dict, Iterable, Optional
 from microbrain.orchestrator.neuron_base import BaseNeuron, NeuronConfig, Event
 from microbrain.orchestrator.orchestrator import Orchestrator
 
+from microbrain.utils.heartbeat_stream import service_topic
+
 NEURON_NAME = Path(__file__).stem
+SERVICE_TOPIC = service_topic("cognition")
 
 
 class AttentionControllerNeuron(BaseNeuron):
@@ -102,9 +105,9 @@ class AttentionControllerNeuron(BaseNeuron):
             return []
 
         # ------------------------------
-        # Step 4.1: Heartbeat-driven attention gate
+        # Step 4.1: cognition-service attention gate
         # ------------------------------
-        if event.topic == "clock/tick":
+        if event.topic == SERVICE_TOPIC:
             state: Dict[str, Any] = await self.load_state(
                 ctx,
                 "attention_state",
@@ -344,7 +347,7 @@ def build_neurons(orchestrator: Orchestrator):
     cfg = NeuronConfig(
         name=NEURON_NAME,
         subscribed_topics=[
-            "clock/tick",
+            SERVICE_TOPIC,
             "curiosity/adjust",
             "percept/text",
             "percept/vision",  # safe even if not yet used

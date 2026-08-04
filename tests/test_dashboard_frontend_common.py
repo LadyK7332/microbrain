@@ -71,3 +71,66 @@ def test_config_catalog_classifies_tune_and_law(tmp_path: Path) -> None:
     )
     entries = scan_file(source, root=tmp_path)
     assert [(e.category, e.name) for e in entries] == [("tune", "FOO"), ("law", "BAR")]
+
+
+def test_dashboard_snapshot_exposes_slearn_engineering_state(tmp_path: Path) -> None:
+    from microbrain.ui.dashboard.bridge import DashboardBridge
+
+    orch = Orchestrator()
+    orch.kv_store.update(
+        {
+            "slearn:sidecar_started": True,
+            "slearn:enabled": True,
+            "slearn:active_file": str(tmp_path / "wordnet_12.slearn"),
+            "slearn:chunk_index": 17,
+            "slearn:files_completed_count": 9,
+            "slearn:rules_emitted_total": 42000,
+            "slearn:rules_applied_total": 41950,
+            "slearn:mode": "bucket",
+            "slearn:workspace": {"clean": True},
+            "slearn:last_result": {"summary": "bucket 17 committed"},
+            "visual:current": {
+                "schema": "visual.current.v1",
+                "frame_ref": "frame.jpg",
+                "object_count": 1,
+                "objects": [{"track_id": "chair-1", "label": "chair", "confidence": 0.9}],
+            },
+        }
+    )
+    bridge = DashboardBridge(orch, memdir=str(tmp_path))
+    snap = bridge.runtime_snapshot()
+    assert snap["slearn"]["sidecar_started"] is True
+    assert snap["slearn"]["active_file"].endswith("wordnet_12.slearn")
+    assert snap["slearn"]["chunk_index"] == 17
+    assert snap["slearn"]["mode"] == "bucket"
+    assert snap["slearn"]["workspace"] == {"clean": True}
+    assert snap["slearn"]["last_result"]["summary"] == "bucket 17 committed"
+    assert snap["vision"]["object_count"] == 1
+    assert snap["vision"]["objects"][0]["track_id"] == "chair-1"
+
+
+def test_dashboard_bridge_attaches_ram_frame_bytes_without_persisting_them(tmp_path: Path) -> None:
+    import asyncio
+
+    from microbrain.ui.dashboard.bridge import DashboardBridge
+    from microbrain.orchestrator.neuron_base import Event
+
+    async def run():
+        orch = Orchestrator()
+        bridge = DashboardBridge(orch, memdir=str(tmp_path))
+        orch.kv_store["vision:frame:latest"] = {
+            "ref": "ram:vision:camera:7",
+            "jpeg_bytes": b"jpeg-data",
+        }
+        await bridge._tap_event(
+            Event(
+                topic="percept/vision",
+                payload={"frame_id": 7, "data_ref": "ram:vision:camera:7", "width": 10, "height": 10},
+                source="camera_capture_neuron",
+            )
+        )
+        msg = bridge.recv_q.get_nowait()
+        assert msg.payload["jpeg_bytes"] == b"jpeg-data"
+        assert msg.payload["data_ref"] == "ram:vision:camera:7"
+
+    asyncio.run(run())
