@@ -91,3 +91,37 @@ The dashboard is intentionally unable to edit DDNA in v1.
 ## Validation boundary
 
 The build environment used for this patch did not provide installable PySide6/qasync wheels, so the Qt windows could not be rendered in that environment. The Python source was compile-checked, and the transport/common/event-bus/config-catalog logic is covered by non-Qt tests. Runtime Qt validation should be done on the Windows project host after installing `requirements-dashboard.txt`.
+
+## Hybrid multi-window workspace update — 2026-07-24
+
+The dashboard keeps its independent top-level windows. Presence / Perception and
+Engineering / Internal remain separate native windows so they can stay parked on
+different monitors or stable desktop regions.
+
+Panels inside those windows can now be compacted in place:
+
+- Presence panels collapse inside their existing splitter slot and expand back
+  to their prior allocation.
+- Engineering docks retain Qt move/float/close behavior and add a compact toggle.
+- Window geometry, engineering dock layout, splitter sizes, and compact states
+  persist through Qt workspace settings and are restored on the next launch.
+- First launch still uses the automatic one-monitor/two-monitor placement rule.
+
+This is intentionally a hybrid layout: top-level windows provide stable workflow
+zones; compactable panels provide local density control without turning the
+application into a single monolithic dashboard.
+
+### SLEARN engineering instrument
+
+Window 2 now owns a dedicated **SLEARN / learning jobs** dock. Detailed
+`slearn/*` and `ui/status` events marked `kind=slearn_status` are routed to this
+instrument instead of the Presence conversation/process views or the general
+cognitive trace. The panel accepts both the current chunk-based status payloads
+and the richer planned preflight/bucket/workspace fields.
+
+The runtime dashboard snapshot now carries SLEARN sidecar state, active file,
+chunk, totals, selected mode, preflight/workspace summaries, and the last result.
+Future meaningful `learning/completed`, `learning/blocked`, and `learning/failed`
+events may update the SLEARN panel while still remaining visible to the normal
+cognitive trace, because those are outcome signals rather than ingestion
+machinery.

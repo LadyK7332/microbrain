@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import threading
+
 from microbrain.memory.mem_cell_composer import MemCellComposer
 from microbrain.memory.mem_cell_store import MemCellStore
 from microbrain.orchestrator.orchestrator import Orchestrator
@@ -118,3 +121,168 @@ def test_composer_health_snapshot_exposes_real_exception_text(tmp_path):
     assert health["state"] == "error"
     assert health["last_error_type"] == "RuntimeError"
     assert "boom" in health["last_error"]
+
+
+def test_composer_start_does_not_wait_for_network_queue_scan(tmp_path):
+    async def scenario() -> None:
+        orch = Orchestrator()
+        sidecar = MemoryComposerSidecar(orch, memdir=tmp_path)
+        release_scan = threading.Event()
+
+        def slow_storage_probe():
+            release_scan.wait(timeout=0.5)
+            return {
+                "pending": {tier: 0 for tier in ("now", "short", "long", "learned")},
+                "processing": {tier: 0 for tier in ("now", "short", "long", "learned")},
+                "lock_exists": False,
+                "lock_age_s": 0.0,
+            }
+
+        sidecar._raw_storage_health = slow_storage_probe  # type: ignore[method-assign]
+        await asyncio.wait_for(sidecar.start(), timeout=0.1)
+        assert orch.kv_store["mem_cell:composer:started"] is True
+        assert orch.kv_store["mem_cell:composer:health"]["pending_total"] == 0
+
+        # Let the detached probe finish before closing the temporary directory.
+        release_scan.set()
+        await asyncio.sleep(0.02)
+        await sidecar.stop()
+
+    asyncio.run(scenario())
+
+
+def test_cached_health_snapshot_never_touches_storage(tmp_path):
+    orch = Orchestrator()
+    sidecar = MemoryComposerSidecar(orch, memdir=tmp_path)
+
+    def fail_if_called():
+        raise AssertionError("filesystem health probe ran on the event-loop path")
+
+    sidecar._raw_storage_health = fail_if_called  # type: ignore[method-assign]
+    health = sidecar._health_snapshot(now=10.0, scan_queues=False)
+    assert health["pending_total"] == 0
+    assert health["processing_total"] == 0
+    assert health["lock_exists"] is False
+
+
+def test_health_marks_a_single_long_queue_scan_without_starting_more(tmp_path):
+    orch = Orchestrator()
+    sidecar = MemoryComposerSidecar(orch, memdir=tmp_path)
+
+    class _LiveTask:
+        @staticmethod
+        def done() -> bool:
+            return False
+
+    sidecar._task = _LiveTask()  # type: ignore[assignment]
+    sidecar._queue_scan_task = _LiveTask()  # type: ignore[assignment]
+    sidecar._queue_scan_started_ts = 100.0
+    orch.kv_store["mem_cell:composer:started"] = True
+
+    health = sidecar._health_snapshot(now=111.0, scan_queues=False)
+    assert health["task_alive"] is True
+    assert health["queue_scan_running"] is True
+    assert health["queue_scan_stalled"] is True
+    assert health["queue_scan_age_s"] == 11.0
+
+
+def test_bucket_waiting_commit_targets_learned_only_even_before_eof_flag(tmp_path):
+    orch = Orchestrator()
+    orch.kv_store.update({
+        "slearn:active_file": "wordnet.slearn",
+        "slearn:mode": "bucket",
+        "slearn:eof": False,
+        "slearn:phase": "waiting_commit",
+        "slearn:status": "waiting_commit",
+        "slearn:outstanding_batches": 51,
+        "slearn:composer_flush_batches": 64,
+    })
+    sidecar = MemoryComposerSidecar(orch, memdir=tmp_path)
+
+    tiers = sidecar._tiers_for_cycle()
+
+    assert tiers == ["learned"]
+    assert orch.kv_store["mem_cell:composer:learned_flush_due"] is True
+    assert orch.kv_store["mem_cell:composer:target_tiers_reason"] == "slearn_waiting_commit"
+
+
+def test_slearn_learned_flush_health_scan_ignores_now_tier(tmp_path):
+    orch = Orchestrator()
+    orch.kv_store.update({
+        "slearn:active_file": "wordnet.slearn",
+        "slearn:mode": "bucket",
+        "slearn:phase": "waiting_commit",
+        "slearn:status": "waiting_commit",
+        "slearn:outstanding_batches": 51,
+    })
+    sidecar = MemoryComposerSidecar(orch, memdir=tmp_path)
+    assert sidecar._tiers_for_cycle() == ["learned"]
+
+    pending_now = tmp_path / "mem_cell" / "_pending" / "now"
+    pending_learned = tmp_path / "mem_cell" / "_pending" / "learned"
+    pending_now.mkdir(parents=True, exist_ok=True)
+    pending_learned.mkdir(parents=True, exist_ok=True)
+    (pending_now / "wrong.jsonl").write_text("{}\n", encoding="utf-8")
+    (pending_learned / "right.jsonl").write_text("{}\n", encoding="utf-8")
+
+    probe = sidecar._raw_storage_health()
+
+    assert probe["scan_tiers"] == ["learned"]
+    assert probe["pending"]["learned"] == 1
+    assert probe["pending"]["now"] == 0
+
+
+def test_receipt_focused_compose_ignores_unrelated_learned_backlog(tmp_path):
+    stale = MemCellStore(tmp_path, composer_enabled=True, writer_id="old-slearn-job")
+    for idx in range(7):
+        stale.stage_cells([{"id": f"old:{idx}", "kind": "stale"}], tier="learned")
+
+    current = MemCellStore(tmp_path, composer_enabled=True, writer_id="slearn-sidecar-job-current")
+    current.stage_cells([
+        {"id": "current:1", "kind": "slearn"},
+        {"id": "current:2", "kind": "slearn"},
+    ], tier="learned")
+    receipts = current.take_staged_paths("learned")
+    assert len(receipts) == 1
+
+    composer = MemCellComposer(tmp_path)
+    status = composer.compose_receipts(receipts, tier="learned")
+
+    assert status["receipt_focused"] is True
+    assert status["rows_applied"] == 2
+    assert status["tiers"]["learned"]["pending_remaining"] == 0
+
+    direct = MemCellStore(tmp_path, composer_enabled=False)
+    ids = {row.get("id") for row in direct._read_shard("learned")}
+    assert ids == {"current:1", "current:2"}
+    assert list((tmp_path / "mem_cell" / "_pending" / "learned").glob("*.jsonl"))
+    assert not any("current" in path.read_text(encoding="utf-8") for path in (tmp_path / "mem_cell" / "_pending" / "learned").glob("*.jsonl"))
+
+
+def test_slearn_receipt_health_counts_exact_receipts_not_backlog(tmp_path):
+    stale = MemCellStore(tmp_path, composer_enabled=True, writer_id="old-slearn-job")
+    for idx in range(5):
+        stale.stage_cells([{"id": f"old:{idx}", "kind": "stale"}], tier="learned")
+
+    current = MemCellStore(tmp_path, composer_enabled=True, writer_id="slearn-sidecar-job-current")
+    current.stage_cells([{"id": "current:1", "kind": "slearn"}], tier="learned")
+    receipts = current.take_staged_paths("learned")
+
+    orch = Orchestrator()
+    orch.kv_store.update({
+        "slearn:active_file": "wordnet.slearn",
+        "slearn:mode": "bucket",
+        "slearn:phase": "waiting_commit",
+        "slearn:status": "waiting_commit",
+        "slearn:outstanding_batches": len(receipts),
+        "slearn:receipt_paths": receipts,
+    })
+    sidecar = MemoryComposerSidecar(orch, memdir=tmp_path)
+    assert sidecar._tiers_for_cycle() == ["learned"]
+
+    probe = sidecar._raw_storage_health()
+
+    assert probe["receipt_focused"] is True
+    assert probe["receipts_observed"] == len(receipts)
+    assert probe["pending"]["learned"] == len(receipts)
+    assert probe["processing"]["learned"] == 0

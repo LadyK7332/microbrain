@@ -1,0 +1,2 @@
+# Reusable speech direction: bind whatever follows "say" and return it literally.
+IF USER says "say {payload}" THEN CLASSIFY literal_repeat, direct_speech_instruction AND REPLY "{payload}"

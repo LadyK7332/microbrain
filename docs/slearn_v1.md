@@ -80,6 +80,42 @@ Storage behavior:
 
 All `/slearn` cells include `source_mode: slearn`, `source_decay_bias`, and `lived_experience_can_override: true` so starter curriculum can yield to lived experience and reinforcement later.
 
+## v1.2: Bound speech slots
+
+User-speech rules may use named `{slot}` placeholders inside the condition and
+reuse those bound values in `REPLY`. This lets a learning sheet teach a reusable
+language operation rather than memorizing one literal input/output pair.
+
+Example:
+
+```text
+IF USER says "say {payload}" THEN CLASSIFY literal_repeat AND REPLY "{payload}"
+```
+
+At runtime:
+
+```text
+USER: say haz
+MB:   haz
+
+USER: say Rise of the Machine
+MB:   Rise of the Machine
+```
+
+Rules for bound slots:
+
+- slot names use `{name}` syntax;
+- a reply may only reference slots captured by its own condition;
+- captured text preserves the user's surface text; surrounding quote marks are
+  treated as wrappers and removed;
+- a bare catch-all such as `IF USER says "{payload}" ...` is not executable; the
+  condition must contain some literal text as an anchor;
+- templated replies are stored as syntax rules, not trainer-alignment utterances,
+  so `{payload}` never becomes a literal learned sentence.
+
+This keeps the split clean: SLEARN teaches what a phrase means, while the native
+responder only provides generic slot binding/rendering.
+
 ## Operator Visibility / Audit Trail
 
 `/slearn` now writes an operator audit trail so a curriculum run is visible even when the memory store writes quietly.
