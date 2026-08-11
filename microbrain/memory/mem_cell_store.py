@@ -61,7 +61,7 @@ _PROCESS_SHARD_LOCKS_GUARD = threading.Lock()
 
 
 DEIXIS_TOKENS = {"this", "that", "these", "those"}
-DETERMINERS = {"a", "an", "the"} | DEIXIS_TOKENS
+DETERMINERS = {"a", "an", "the", "another", "other"} | DEIXIS_TOKENS
 COPULA_TOKENS = {"is", "are", "was", "were", "be"}
 QUESTION_WORDS = {"what", "why", "how", "when", "where", "who", "which"}
 GREETING_TOKENS = {"hi", "hello", "hey", "yo", "howdy", "moin"}
@@ -1588,6 +1588,192 @@ class MemCellStore:
             })
         return out
 
+    def make_learning_frame_cells(
+        self,
+        *,
+        text: str,
+        parent_id: str,
+        structure: Optional[Mapping[str, Any]],
+        role: str,
+        tier: str = "now",
+        meta: Optional[Mapping[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Persist Language v3 definition/designation frames as soft evidence.
+
+        These cells are not canned answers.  They record that language supplied a
+        designation, definition, classification, contrast, or definition question
+        so memory can sharpen/reframe the concept over time.
+        """
+        if not structure:
+            return []
+        frames = [dict(f) for f in list(structure.get("learning_frames", []) or []) if isinstance(f, Mapping)]
+        if not frames:
+            return []
+
+        input_meta = dict(meta or {})
+        raw_meta = input_meta.get("raw_meta") if isinstance(input_meta.get("raw_meta"), Mapping) else {}
+        visual_attention_ref = input_meta.get("visual_attention_ref")
+        if not isinstance(visual_attention_ref, Mapping) and isinstance(raw_meta, Mapping):
+            visual_attention_ref = raw_meta.get("visual_attention_ref")
+        visual_attention_ref = dict(visual_attention_ref) if isinstance(visual_attention_ref, Mapping) else {}
+
+        out: List[Dict[str, Any]] = []
+        now_ts = time.time()
+        for idx, frame in enumerate(frames[:12]):
+            frame_type = str(frame.get("frame_type", "") or "learning_frame").strip() or "learning_frame"
+            subject = str(frame.get("subject", "") or frame.get("query_target", "") or "").strip().lower()
+            designation = str(frame.get("designation", "") or frame.get("category", "") or "").strip().lower()
+            definition = str(frame.get("definition", "") or "").strip()
+            query_target = str(frame.get("query_target", "") or "").strip().lower()
+            relation = str(frame.get("relation", "") or frame.get("act", "") or frame_type).strip().lower()
+            subtype_of = str(frame.get("subtype_of", "") or "").strip().lower()
+            visual_track_id = str(visual_attention_ref.get("track_id") or visual_attention_ref.get("selected_track_id") or "").strip()
+            surface_l = str(frame.get("surface", "") or text or "").lower()
+            compact_surface = "".join(ch for ch in surface_l if ch.isalnum())
+            compact_track = "".join(ch for ch in visual_track_id.lower() if ch.isalnum())
+            explicit_visual_subject = bool(
+                subject.startswith("vobj")
+                or (compact_track and compact_track in compact_surface)
+                or (str(visual_attention_ref.get("selected_track_id") or "").lower() in surface_l)
+            )
+            visual_binding = bool((frame.get("deictic", False) or explicit_visual_subject) and visual_track_id)
+
+            if frame_type == "definition_question":
+                canonical = self._canonical_text(["question definition", query_target or subject])
+                kind = "understanding_gap"
+                anchor_kind = "language/gap/definition_question"
+                activation = 0.58
+                promotion = 0.04
+            elif frame_type == "classification_claim":
+                canonical = self._canonical_text([subject, "classified as", designation or definition])
+                kind = "learning_frame"
+                anchor_kind = "language/learning/classification"
+                activation = 0.78
+                promotion = 0.10
+            elif frame_type == "designation_claim":
+                canonical = self._canonical_text([subject, "designated as", designation or definition, subtype_of])
+                kind = "learning_frame"
+                anchor_kind = "language/learning/designation"
+                activation = 0.82
+                promotion = 0.12
+                if visual_binding:
+                    canonical = self._canonical_text([visual_track_id, "visually designated as", designation or definition, subtype_of])
+                    anchor_kind = "language/learning/visual_designation"
+                    activation = 0.88
+                    promotion = 0.16
+            elif frame_type == "contrast_claim":
+                canonical = self._canonical_text([subject, "not", designation or definition])
+                kind = "learning_frame"
+                anchor_kind = "language/learning/contrast"
+                activation = 0.70
+                promotion = 0.08
+            else:
+                canonical = self._canonical_text([subject, "means", definition or designation])
+                kind = "learning_frame"
+                anchor_kind = "language/learning/definition"
+                activation = 0.84
+                promotion = 0.14
+
+            if not canonical:
+                continue
+            digest = hashlib.blake2b(
+                f"learning_frame|{frame_type}|{canonical}|{idx}".encode("utf-8", errors="ignore"),
+                digest_size=8,
+            ).hexdigest()
+            refs: List[Dict[str, Any]] = [{"kind": "learning_frame", "value": canonical}]
+            for name, value in (
+                ("subject", subject),
+                ("designation", designation),
+                ("definition", definition),
+                ("query_target", query_target),
+                ("relation", relation),
+                ("category", str(frame.get("category", "") or "").strip().lower()),
+                ("subtype_of", subtype_of),
+            ):
+                if value in (None, "", [], False):
+                    continue
+                refs.append({"kind": "slot", "name": name, "value": value})
+            if visual_binding:
+                refs.append({"kind": "visual_ref", "name": "subject", "value": visual_track_id})
+                evidence_ref = str(visual_attention_ref.get("visual_evidence_ref") or "").strip()
+                if evidence_ref:
+                    refs.append({"kind": "visual_evidence", "name": "selected_region", "value": evidence_ref})
+                snippet_ref = str(visual_attention_ref.get("snippet_ref") or "").strip()
+                if snippet_ref:
+                    refs.append({"kind": "visual_snippet", "name": "selected_crop", "value": snippet_ref})
+                source_ref = str(visual_attention_ref.get("source_ref") or visual_attention_ref.get("frame_label") or "").strip()
+                if source_ref:
+                    refs.append({"kind": "visual_frame", "name": "source", "value": source_ref})
+            for gap in list(frame.get("understanding_gaps", []) or [])[:4]:
+                if not isinstance(gap, Mapping):
+                    continue
+                term = str(gap.get("term", "") or "").strip().lower()
+                gap_type = str(gap.get("gap_type", "") or "").strip()
+                if term:
+                    refs.append({"kind": "understanding_gap", "name": gap_type or "needs_grounding", "value": term})
+
+            out.append({
+                "id": f"lf{digest}",
+                "kind": kind,
+                "tier": tier,
+                "anchor": {
+                    "kind": anchor_kind,
+                    "ref": canonical,
+                    "norm": self._norm_text(canonical),
+                },
+                "refs": refs,
+                "modalities": ["text", "vision"] if visual_binding else ["text"],
+                "links_explicit": [parent_id],
+                "activation": activation,
+                "promotion": promotion,
+                "decay": 1.0,
+                "trust": 0.74 if role == "user" else 0.58,
+                "meta": {
+                    "role": role,
+                    "pattern_type": frame_type,
+                    "language_layer": "learning_frame_v3",
+                    "canonical": canonical,
+                    "surface": str(frame.get("surface", "") or text)[:260],
+                    "parent_id": parent_id,
+                    "slots": {
+                        "subject": subject,
+                        "designation": designation,
+                        "definition": definition,
+                        "query_target": query_target,
+                        "relation": relation,
+                        "category": str(frame.get("category", "") or "").strip().lower(),
+                        "subtype_of": subtype_of,
+                        "deictic": bool(frame.get("deictic", False)),
+                        "negated": bool(frame.get("negated", False)),
+                        "visual_track_id": visual_track_id if visual_binding else "",
+                        "visual_evidence_ref": str(visual_attention_ref.get("visual_evidence_ref") or "") if visual_binding else "",
+                    },
+                    "visual_binding": {
+                        "bound": bool(visual_binding),
+                        "track_id": visual_track_id if visual_binding else "",
+                        "selected_track_id": str(visual_attention_ref.get("selected_track_id") or "") if visual_binding else "",
+                        "bbox": visual_attention_ref.get("bbox") if visual_binding else None,
+                        "contour": visual_attention_ref.get("contour") if visual_binding else None,
+                        "snippet_ref": str(visual_attention_ref.get("snippet_ref") or "") if visual_binding else "",
+                        "source_ref": str(visual_attention_ref.get("source_ref") or "") if visual_binding else "",
+                        "frame_label": str(visual_attention_ref.get("frame_label") or "") if visual_binding else "",
+                        "frozen": bool(visual_attention_ref.get("frozen", False)) if visual_binding else False,
+                        "visual_evidence_ref": str(visual_attention_ref.get("visual_evidence_ref") or "") if visual_binding else "",
+                        "semantics": "user_designation_claim_about_selected_visual_evidence" if visual_binding else "",
+                    },
+                    "learning_frame": frame,
+                    "understanding_gaps": list(frame.get("understanding_gaps", []) or [])[:8],
+                    "epistemic_status": "soft_revisable_claim",
+                    "parse_confidence": float(frame.get("confidence", 0.0) or 0.0),
+                    "creates_prebuilt_answer": False,
+                },
+                "ts": now_ts,
+                "last_seen": now_ts,
+                "encounter_count": 1,
+                "revision": 0,
+            })
+        return out
+
     def make_general_pattern_cells(
         self,
         *,
@@ -2155,6 +2341,17 @@ class MemCellStore:
                 tier=tier,
             )
         ]
+        learning_frame_cells = [
+            self.upsert_cell(c, tier=tier, touch=True, flush=False)
+            for c in self.make_learning_frame_cells(
+                text=text,
+                parent_id=parent_id,
+                structure=language_structure,
+                role=role,
+                tier=tier,
+                meta=meta,
+            )
+        ]
         general_pattern_cells = [
             self.upsert_cell(c, tier=tier, touch=True, flush=False)
             for c in self.make_general_pattern_cells(
@@ -2167,7 +2364,7 @@ class MemCellStore:
                 structure=language_structure,
             )
         ]
-        linker_source_cells = general_pattern_cells + thought_template_cells
+        linker_source_cells = general_pattern_cells + thought_template_cells + learning_frame_cells
         linker_cells = [
             self.upsert_cell(c, tier=tier, touch=True, flush=False)
             for c in self.make_linker_cells(
@@ -2180,7 +2377,7 @@ class MemCellStore:
         ]
         # back-link strongest immediate pieces into utterance. Raw tokens remain
         # evidence; word roles and thought templates are the reusable scaffold.
-        if token_cells or pattern_cells or word_role_cells or thought_template_cells or clause_frame_cells or general_pattern_cells or linker_cells:
+        if token_cells or pattern_cells or word_role_cells or thought_template_cells or clause_frame_cells or learning_frame_cells or general_pattern_cells or linker_cells:
             utterance['links_explicit'] = self._merge_unique_list(
                 list(utterance.get('links_explicit', []) or []),
                 [
@@ -2191,6 +2388,7 @@ class MemCellStore:
                         + word_role_cells[:4]
                         + thought_template_cells[:4]
                         + clause_frame_cells[:4]
+                        + learning_frame_cells[:4]
                         + general_pattern_cells[:4]
                         + linker_cells[:4]
                     )
@@ -2208,6 +2406,7 @@ class MemCellStore:
             'word_roles': word_role_cells,
             'thought_templates': thought_template_cells,
             'clause_frames': clause_frame_cells,
+            'learning_frames': learning_frame_cells,
             'general_patterns': general_pattern_cells,
             'linkers': linker_cells,
             'language_structure': language_structure,
@@ -2300,7 +2499,7 @@ class MemCellStore:
                 if not isinstance(row, dict):
                     continue
                 kind = str(row.get("kind", "") or "")
-                if kind not in {"token_anchor", "pattern_anchor", "pattern_role", "word_role", "thought_template", "clause_frame", "pattern_linker", "utterance_anchor"}:
+                if kind not in {"token_anchor", "pattern_anchor", "pattern_role", "word_role", "thought_template", "clause_frame", "learning_frame", "understanding_gap", "pattern_linker", "utterance_anchor"}:
                     continue
                 activation = self._clamp01(row.get("activation", 0.0))
                 if activation <= 0.04 or activation >= 0.72:

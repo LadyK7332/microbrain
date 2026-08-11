@@ -124,6 +124,7 @@ class MemoryLoggerNeuron(BaseNeuron):
         text: str = ""
         role: str = "user"
         transport_source: str = "user"
+        percept_raw_meta: Dict[str, Any] = {}
 
         if topic == "percept/text":
             # TextInputNeuron always passes a dict payload with 'text'
@@ -134,7 +135,8 @@ class MemoryLoggerNeuron(BaseNeuron):
                 role = str(payload.get("source", "user") or "user")
 
                 raw_meta = payload.get("raw_meta", {}) or {}
-                transport_source = str(raw_meta.get("transport_source", role) or role)
+                percept_raw_meta = dict(raw_meta) if isinstance(raw_meta, dict) else {}
+                transport_source = str(percept_raw_meta.get("transport_source", role) or role)
 
                 if role not in ("user", "assistant", "system"):
                     role = "user"
@@ -203,13 +205,29 @@ class MemoryLoggerNeuron(BaseNeuron):
         # --- Write to mem_cell/hot -----------------------------------------------
         try:
             if mem_cell_store is not None and role in ("user", "assistant"):
+                cell_meta = dict(event.meta or {})
+                if topic == "percept/text" and percept_raw_meta:
+                    # The normalized percept payload carries the useful semantic
+                    # context (visual attention anchors, deictic binding hints,
+                    # accent metadata).  Event.meta is transport/debug metadata.
+                    cell_meta["raw_meta"] = dict(percept_raw_meta)
+                    for key in (
+                        "visual_attention_ref",
+                        "deictic_binding_hint",
+                        "noun_id",
+                        "noun_label",
+                        "transport_source",
+                        "channel",
+                    ):
+                        if key in percept_raw_meta:
+                            cell_meta[key] = percept_raw_meta[key]
                 ingest_result = mem_cell_store.ingest_text(
                     text=text,
                     topic=topic,
                     role=role,
                     transport_source=transport_source,
                     source=str(event.source or role),
-                    meta=dict(event.meta or {}),
+                    meta=cell_meta,
                     tier="hot",
                 )
                 await ctx.set_kv("memory:last_memcell_ingest", {

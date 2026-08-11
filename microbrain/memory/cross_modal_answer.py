@@ -15,7 +15,7 @@ ACTION_HINTS = {
     "makes", "make", "made", "moves", "move", "moved", "chops", "chop", "chopped", "cuts", "cut",
     "cutting", "using", "used", "use", "helps", "help", "works", "work", "working",
 }
-STRUCTURAL_KINDS = {"general_pattern", "compressed_general_pattern", "clause_frame", "trainer_alignment"}
+STRUCTURAL_KINDS = {"general_pattern", "compressed_general_pattern", "clause_frame", "learning_frame", "understanding_gap", "trainer_alignment"}
 
 
 def _norm(text: str) -> str:
@@ -80,11 +80,61 @@ def _render_candidate(candidate: Mapping[str, Any]) -> str:
             return f"{subject} is {complement}".strip()
         if subject and action:
             return " ".join([p for p in [subject, action, obj] if p]).strip()
+    if kind in {"learning_frame", "understanding_gap"}:
+        rendered = _render_learning_frame(candidate)
+        if rendered:
+            return rendered
     if kind == "trainer_alignment":
         desired = str(meta.get("desired_utterance", "") or "").strip()
         if desired:
             return desired
     return str(candidate.get("anchor_text", "") or "").strip()
+
+
+
+def _render_learning_frame(candidate: Mapping[str, Any]) -> str:
+    meta = dict(candidate.get("meta", {}) or {})
+    slots = dict(meta.get("slots", {}) or {})
+    pattern_type = str(meta.get("pattern_type", "") or "").strip()
+    subject = str(slots.get("subject", "") or slots.get("query_target", "") or "").strip()
+    designation = str(slots.get("designation", "") or slots.get("category", "") or "").strip()
+    definition = str(slots.get("definition", "") or "").strip()
+    subtype_of = str(slots.get("subtype_of", "") or "").strip()
+    deictic = bool(slots.get("deictic", False))
+    if pattern_type == "definition_question":
+        target = str(slots.get("query_target", "") or subject).strip()
+        return f"I need a definition for {target}".strip() if target else "I need a definition"
+    if pattern_type == "contrast_claim" and subject and definition:
+        return f"{subject} is not {definition}".strip()
+    if pattern_type == "classification_claim" and subject and designation:
+        return f"{subject} is a {designation}".strip()
+    if pattern_type == "designation_claim" and subject:
+        if definition:
+            return f"{subject} is {definition}".strip()
+        if designation:
+            return f"{subject} is a {designation}".strip()
+        if subtype_of:
+            return f"{subject} is a kind of {subtype_of}".strip()
+    if pattern_type == "definition_claim" and subject:
+        if definition:
+            return f"{subject} is {definition}".strip()
+        if designation:
+            return f"{subject} is a {designation}".strip()
+    return str(candidate.get("anchor_text", "") or "").strip()
+
+
+def _learning_frame_matches_focus(candidate: Mapping[str, Any], focus: Sequence[str]) -> bool:
+    if not focus:
+        return True
+    meta = dict(candidate.get("meta", {}) or {})
+    slots = dict(meta.get("slots", {}) or {})
+    terms = {
+        str(slots.get("subject", "") or "").strip().lower(),
+        str(slots.get("query_target", "") or "").strip().lower(),
+        str(slots.get("designation", "") or "").strip().lower(),
+        str(slots.get("category", "") or "").strip().lower(),
+    }
+    return any(str(tok or "").strip().lower() in terms for tok in focus)
 
 
 def _is_reading_quote(candidate: Mapping[str, Any]) -> bool:
@@ -126,7 +176,7 @@ def gather_support(
         queries.append(query_text)
         seen = set()
         for q in queries:
-            for hit in mem_cell_store.search_text_cells(q, limit=10, tiers=("long", "hot", "now", "short")):
+            for hit in mem_cell_store.search_text_cells(q, limit=12, tiers=("learned", "long", "hot", "now", "short")):
                 hid = str(hit.get("cell_id", "") or "")
                 if not hid or hid in seen:
                     continue
@@ -143,11 +193,19 @@ def gather_support(
                 transport_source = str(meta.get("transport_source", "") or "")
                 channel = str(meta.get("channel", "") or "")
 
-                if kind in {"general_pattern", "compressed_general_pattern", "clause_frame"}:
+                if kind in {"general_pattern", "compressed_general_pattern", "clause_frame", "learning_frame", "understanding_gap"}:
                     pattern_type = str(meta.get("pattern_type", "") or "")
                     score += 0.18
                     if kind == "compressed_general_pattern" or tier == "derived":
                         score += 0.14
+                    if kind == "learning_frame":
+                        score += 0.18
+                        if qtype == "what_is" and pattern_type in ("definition_claim", "classification_claim", "designation_claim"):
+                            score += 0.30
+                        if qtype == "what_is" and _learning_frame_matches_focus(hit, focus):
+                            score += 0.22
+                    if kind == "understanding_gap" and qtype == "what_is":
+                        score -= 0.04
                     if qtype == "what_is" and pattern_type in ("assert_attribute", "assert_existence"):
                         score += 0.18
                     if qtype == "what_does" and pattern_type in ("assert_attribute", "social_redirect"):
@@ -310,6 +368,23 @@ def compose_answer(bundle: Mapping[str, Any]) -> Tuple[str, float, Dict[str, Any
     best_text = _render_candidate(best).strip()
     rendered_selected = [_render_candidate(c) for c in selected]
     candidate_texts = _dedupe_preserve(rendered_selected)
+
+    if qtype == "what_is":
+        learning_candidates = [
+            c for c in selected
+            if str(c.get("kind", "") or "") == "learning_frame"
+            and str((dict(c.get("meta", {}) or {}).get("pattern_type", "") or "")) in {"definition_claim", "classification_claim", "designation_claim"}
+            and _learning_frame_matches_focus(c, focus)
+        ]
+        if learning_candidates:
+            chosen = learning_candidates[0]
+            rendered = _render_learning_frame(chosen).strip().rstrip(" .")
+            if rendered:
+                return rendered[:1].upper() + rendered[1:] + ".", 0.86, _answer_meta(
+                    [chosen],
+                    used_learning_frame=True,
+                    used_prebuilt_answer=False,
+                )
 
     forge_workspace = build_forge_workspace(query_type=qtype, focus_tokens=focus, candidates=selected or candidates)
     forge_bundle = forge_from_workspace(forge_workspace)

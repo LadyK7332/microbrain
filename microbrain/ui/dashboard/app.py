@@ -822,8 +822,13 @@ class VisionCanvas(QWidget):
         self._show_motion = False
         self._highlight_track_id = ""
         self._highlight_generation = 0
+        self._frame_frozen = False
+        self._frozen_label = ""
+        self._freeze_generation = 0
 
     def set_frame(self, path: str, width: int = 0, height: int = 0) -> None:
+        if self._frame_frozen:
+            return
         candidate = Path(path)
         pixmap = QPixmap(str(candidate)) if candidate.exists() else QPixmap()
         if not pixmap.isNull():
@@ -833,6 +838,8 @@ class VisionCanvas(QWidget):
             self.update()
 
     def set_frame_bytes(self, data: bytes | bytearray, width: int = 0, height: int = 0, label: str = "RAM frame") -> None:
+        if self._frame_frozen:
+            return
         pixmap = QPixmap()
         if not isinstance(data, (bytes, bytearray)) or not pixmap.loadFromData(bytes(data)):
             return
@@ -842,8 +849,32 @@ class VisionCanvas(QWidget):
         self.update()
 
     def set_overlays(self, overlays: list[dict[str, Any]]) -> None:
+        if self._frame_frozen:
+            return
         self._overlays = [dict(item) for item in overlays[-64:] if isinstance(item, Mapping)]
         self.update()
+
+    def set_frozen(self, frozen: bool) -> None:
+        """Freeze the currently rendered frame/overlays for visual teaching."""
+        frozen = bool(frozen)
+        if frozen == self._frame_frozen:
+            return
+        self._frame_frozen = frozen
+        self._freeze_generation += 1
+        if frozen:
+            self._frozen_label = self._label
+        else:
+            self._frozen_label = ""
+        self.update()
+
+    def snapshot_context(self) -> dict[str, Any]:
+        return {
+            "frame_label": self._frozen_label or self._label,
+            "source_width": int(self._source_size[0] or 0),
+            "source_height": int(self._source_size[1] or 0),
+            "frozen": bool(self._frame_frozen),
+            "freeze_generation": int(self._freeze_generation),
+        }
 
     def set_display_options(
         self,
@@ -921,6 +952,9 @@ class VisionCanvas(QWidget):
         x0 = (self.width() - scaled.width()) // 2
         y0 = (self.height() - scaled.height()) // 2
         painter.drawPixmap(x0, y0, scaled)
+        if self._frame_frozen:
+            painter.setPen(QPen(QColor(VISION_COLOR_SELECTED), 2))
+            painter.drawText(x0 + 8, y0 + 20, "FROZEN FRAME")
         sw, sh = self._source_size
         if sw <= 0 or sh <= 0:
             return
@@ -1020,10 +1054,10 @@ class VisionInspectorWidget(QWidget):
             checkbox.toggled.connect(self._apply_options)
             layout.addWidget(checkbox)
 
-        self.freeze = QPushButton("Freeze tracks")
+        self.freeze = QPushButton("Freeze frame")
         self.freeze.setCheckable(True)
-        self.freeze.setToolTip("Hold the current object map while the camera feed continues.")
-        self.freeze.toggled.connect(lambda on: self.freeze.setText("Tracks frozen" if on else "Freeze tracks"))
+        self.freeze.setToolTip("Hold the current frame and object map for visual labeling/teaching.")
+        self.freeze.toggled.connect(self._freeze_toggled)
         layout.addWidget(self.freeze)
 
         self.tree = QTreeWidget()
@@ -1039,6 +1073,15 @@ class VisionInspectorWidget(QWidget):
     @property
     def frozen(self) -> bool:
         return self.freeze.isChecked()
+
+    def _freeze_toggled(self, on: bool) -> None:
+        self.freeze.setText("Frame frozen" if on else "Freeze frame")
+        self.canvas.set_frozen(bool(on))
+        self.detail.setText(
+            "Frozen visual teaching frame. Select an object/region, then type a label such as: this is an eye."
+            if on else
+            (f"{len(self._objects)} current object{'s' if len(self._objects) != 1 else ''}" if self._objects else "No current objects")
+        )
 
     def _apply_options(self, *_args) -> None:
         self.canvas.set_display_options(
@@ -1075,9 +1118,12 @@ class VisionInspectorWidget(QWidget):
         if not track_id:
             return
         self.canvas.flash_object(track_id)
-        if callable(self._on_attention_select):
-            self._on_attention_select(track_id)
         obj = next((row for row in self._objects if str(row.get("track_id") or "") == track_id), None)
+        if callable(self._on_attention_select):
+            snapshot = dict(obj) if isinstance(obj, Mapping) else {"track_id": track_id}
+            snapshot["ui_frozen"] = bool(self.frozen)
+            snapshot["ui_snapshot"] = self.canvas.snapshot_context()
+            self._on_attention_select(track_id, snapshot)
         if not isinstance(obj, Mapping):
             return
         label = str(obj.get("label") or "unknown")
@@ -1421,7 +1467,7 @@ class EngineeringWindow(QMainWindow):
                 item = QTableWidgetItem(str(value)); item.setFlags(item.flags() & ~Qt.ItemIsEditable); self.catalog_table.setItem(row, col, item)
 
     def update_snapshot(self, payload: Mapping[str, Any]) -> None:
-        self.organs.setPlainText(_pretty({k: payload.get(k) for k in ("queue_depth", "body_queue_depth", "dashboard_queue_depth", "dashboard_dropped_events", "neurons", "bus", "body_bus", "heartbeat", "adrenaline", "organs", "hypothesis_tuning", "release_tuning")}))
+        self.organs.setPlainText(_pretty({k: payload.get(k) for k in ("queue_depth", "body_queue_depth", "dashboard_queue_depth", "dashboard_dropped_events", "neurons", "bus", "body_bus", "heartbeat", "adrenaline", "organs", "hypothesis_tuning", "release_tuning", "probe_runtime")}))
         heartbeat = payload.get("heartbeat", {}) if isinstance(payload.get("heartbeat"), Mapping) else {}
         adrenaline = payload.get("adrenaline", {}) if isinstance(payload.get("adrenaline"), Mapping) else {}
         self.heartbeat_strip.update_payloads(heartbeat, adrenaline)
@@ -1565,12 +1611,12 @@ class DashboardController:
             QApplication.instance().quit(); return
         asyncio.create_task(self.bridge.send_text(text))
 
-    def select_visual_object(self, track_id: str) -> None:
+    def select_visual_object(self, track_id: str, object_snapshot: Mapping[str, Any] | None = None) -> None:
         """Treat an inspector click as pointing, not as labeling."""
         track_id = str(track_id or "").strip()
         if not track_id:
             return
-        asyncio.create_task(self.bridge.select_visual_object(track_id))
+        asyncio.create_task(self.bridge.select_visual_object(track_id, object_snapshot=object_snapshot))
 
     async def apply_runtime_tuning(self, key: str, value: str) -> None:
         try:
@@ -1608,7 +1654,16 @@ class DashboardController:
         if not text:
             return None
         if msg.topic == "act/speech" and channel == "thought":
-            return f"thought/probe> {text}"
+            origin = ""
+            meta = msg.meta or {}
+            payload = msg.payload if isinstance(msg.payload, Mapping) else {}
+            origin = str(meta.get("origin") or payload.get("origin") or "").strip()
+            return f"thought/probe[{origin}]> {text}" if origin else f"thought/probe> {text}"
+        if msg.topic == "thought/probe":
+            meta = msg.meta or {}
+            payload = msg.payload if isinstance(msg.payload, Mapping) else {}
+            origin = str(meta.get("origin") or payload.get("origin") or "").strip()
+            return f"thought/probe[{origin}]> {text}" if origin else f"thought/probe> {text}"
         return f"{msg.topic}> {text}"
 
     def _poll(self) -> None:

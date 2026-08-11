@@ -40,6 +40,8 @@ class ParsedText:
     role_candidates: list[dict[str, Any]] = field(default_factory=list)
     clause_candidates: list[dict[str, Any]] = field(default_factory=list)
     best_clause: dict[str, Any] = field(default_factory=dict)
+    # Language v3: definition/designation frames are learning evidence, not canned answers.
+    learning_frames: list[dict[str, Any]] = field(default_factory=list)
 
 
 _nlp = None
@@ -58,7 +60,7 @@ THIRD_PRONOUNS = {
 PRONOUNS = SELF_PRONOUNS | LISTENER_PRONOUNS | GROUP_PRONOUNS | THIRD_PRONOUNS
 POSSESSIVE_PRONOUNS = {"my", "your", "his", "her", "its", "our", "their", "whose"}
 OBJECT_PRONOUNS = {"me", "you", "him", "her", "it", "us", "them"}
-DETERMINERS = {"a", "an", "the", "this", "that", "these", "those", "some", "any", "each", "every"}
+DETERMINERS = {"a", "an", "the", "this", "that", "these", "those", "some", "any", "each", "every", "another", "other"}
 COPULAS = {"am", "is", "are", "was", "were", "be", "being", "been"}
 AUXILIARIES = COPULAS | {"have", "has", "had", "do", "does", "did"}
 MODALS = {"can", "could", "would", "will", "should", "may", "might", "must", "shall"}
@@ -75,6 +77,9 @@ TIME_MODIFIERS = {
 INTENSIFIERS = {"very", "really", "quite", "too", "so", "extremely", "super", "highly", "more", "less"}
 NEED_WORDS = {"need", "needs", "needed", "require", "requires", "required", "want", "wants", "wanted"}
 PREFERENCE_WORDS = {"like", "likes", "liked", "love", "loves", "prefer", "prefers", "enjoy", "enjoys"}
+DEFINITION_VERBS = {"mean", "means", "refer", "refers", "define", "defines"}
+NAMING_VERBS = {"call", "called", "name", "named"}
+TYPE_WORDS = {"type", "kind", "sort", "form", "class", "category"}
 DISCOURSE_MARKERS = {"well", "oh", "ah", "hey", "hello", "hi", "please", "thanks", "thank", "okay", "ok"}
 ATTRIBUTE_WORDS = {
     "old", "new", "good", "bad", "fast", "slow", "low", "high", "stable", "rough", "strong", "weak", "safe",
@@ -632,6 +637,228 @@ def _prepositional_adjuncts(tokens: Sequence[TokenAtom], role_map: dict[int, dic
     return out
 
 
+
+def _strip_leading_determiner_words(words: Sequence[str]) -> list[str]:
+    out = [str(w or "").strip() for w in words if str(w or "").strip()]
+    while out and _norm_token(out[0]) in DETERMINERS:
+        out.pop(0)
+    return out
+
+
+def _content_words(indices: Sequence[int], tokens: Sequence[TokenAtom]) -> list[str]:
+    words: list[str] = []
+    for idx in indices:
+        if idx < 0 or idx >= len(tokens):
+            continue
+        raw = str(tokens[idx].text or "").strip()
+        norm = _norm_token(raw)
+        if raw and _is_word(raw) and norm not in {"please"}:
+            words.append(raw)
+    return words
+
+
+def _first_category_from_complement(indices: Sequence[int], tokens: Sequence[TokenAtom], role_map: dict[int, dict[str, Any]]) -> str:
+    """Return the first noun-like category in a definition complement.
+
+    For "a place where rule breakers..." this yields "place" rather than the
+    last noun "punishment". This keeps definition/designation learning from
+    treating every late object in a relative clause as the category.
+    """
+
+    seen_det = False
+    for idx in indices:
+        if idx < 0 or idx >= len(tokens) or not _is_word(tokens[idx].text):
+            continue
+        norm = _norm_token(tokens[idx].text)
+        if norm in DETERMINERS:
+            seen_det = True
+            continue
+        if norm in {"kind", "type", "sort", "form", "class", "category"}:
+            continue
+        if norm in PREPOSITIONS | CONNECTORS | COPULAS | AUXILIARIES | MODALS:
+            if seen_det:
+                break
+            continue
+        role = _best_role(role_map, idx)
+        if role in {"noun", "proper_noun", "pronoun"}:
+            return _simple_lemma(tokens[idx].text)
+        if seen_det and role == "adjective":
+            # Allow "a small machine": the next noun will normally be category.
+            continue
+        if seen_det:
+            break
+    return _head_of(indices, tokens, role_map)
+
+
+def _learning_gap_for_terms(terms: Sequence[str], *, relation: str = "needs_grounding") -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for term in terms:
+        clean = _norm_token(term)
+        if not clean or clean in seen or clean in CLOSED_CLASS_WORDS:
+            continue
+        seen.add(clean)
+        out.append({"term": clean, "gap_type": relation})
+    return out
+
+
+def _build_learning_frames(text: str, tokens: Sequence[TokenAtom], role_candidates: Sequence[dict[str, Any]], clause_candidates: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Extract teaching/definition/designation frames from sentence shape.
+
+    These are soft evidence frames. They do not assert final truth; they give
+    memory something revisable to attach to concepts, visual refs, and later
+    questions. Language v3 treats "X is a Y" as classification/designation and
+    marks unknown terms as understanding gaps.
+    """
+
+    role_map = _candidate_map(role_candidates)
+    word_idxs = _word_indices(tokens)
+    if not word_idxs:
+        return []
+    norms = [_norm_token(tok.text) for tok in tokens]
+    first_idx = word_idxs[0]
+    first = norms[first_idx]
+    frames: list[dict[str, Any]] = []
+    used: set[tuple[Any, ...]] = set()
+
+    def add(frame: dict[str, Any]) -> None:
+        key = (
+            str(frame.get("frame_type", "") or ""),
+            str(frame.get("subject", "") or ""),
+            str(frame.get("designation", "") or ""),
+            str(frame.get("definition", "") or "")[:80],
+            str(frame.get("query_target", "") or ""),
+        )
+        if key in used:
+            return
+        used.add(key)
+        frame.setdefault("surface", str(text or "").strip())
+        frame.setdefault("source", "language")
+        frame.setdefault("epistemic_status", "soft_learning_evidence")
+        frame.setdefault("confidence", 0.62)
+        frames.append(frame)
+
+    # "What is prison?" / "What are laws?" must keep the query target.
+    if first == "what" and len(word_idxs) >= 3:
+        cop_idx = next((i for i in word_idxs[1:3] if norms[i] in COPULAS), -1)
+        if cop_idx > first_idx:
+            target_np = _noun_phrase_starting_at(cop_idx + 1, tokens, role_map)
+            if not target_np:
+                target_np = [i for i in word_idxs if i > cop_idx]
+            target_text = _surface(target_np, tokens, drop_determiners=True)
+            target = _head_of(target_np, tokens, role_map)
+            if target_text or target:
+                add({
+                    "frame_type": "definition_question",
+                    "act": "ask_definition",
+                    "query_target": target or _norm_token(target_text),
+                    "target_text": target_text,
+                    "subject": target or _norm_token(target_text),
+                    "question_word": "what",
+                    "needed_evidence": ["definition", "designation", "category"],
+                    "understanding_gaps": _learning_gap_for_terms([target or target_text], relation="definition_missing"),
+                    "confidence": 0.90,
+                    "evidence_token_indices": [first_idx, cop_idx] + target_np,
+                })
+
+    # "X means Y" / "X refers to Y" / "X defines Y".
+    for frame in clause_candidates:
+        if not isinstance(frame, dict):
+            continue
+        action = _norm_token(str(frame.get("action", "") or ""))
+        subject = _norm_token(str(frame.get("subject", "") or frame.get("agent", "") or ""))
+        if not subject or action not in DEFINITION_VERBS:
+            continue
+        verb_surface = _norm_token(str(frame.get("action_surface", "") or action))
+        verb_idx = next((i for i in word_idxs if norms[i] == verb_surface or _simple_lemma(norms[i]) == action), -1)
+        if verb_idx < 0:
+            continue
+        body_indices = [i for i in word_idxs if i > verb_idx]
+        definition = _surface(body_indices, tokens)
+        category_np = _next_np_after(verb_idx + 1, tokens, role_map)
+        category = _first_category_from_complement(category_np or body_indices, tokens, role_map)
+        if definition:
+            add({
+                "frame_type": "definition_claim",
+                "act": "learn_definition",
+                "subject": subject,
+                "subject_text": str(frame.get("subject_text", "") or subject),
+                "definition": definition,
+                "designation": category,
+                "designation_type": "meaning",
+                "category": category,
+                "relation": "means",
+                "understanding_gaps": _learning_gap_for_terms([subject, category], relation="needs_grounding"),
+                "confidence": min(0.94, 0.78 + float(frame.get("confidence", 0.0) or 0.0) * 0.12),
+                "evidence_token_indices": list(frame.get("evidence_token_indices", []) or []),
+            })
+
+    # Copular designation/definition/classification: "Glorp is a flib", "Prison is a place where...".
+    for frame in clause_candidates:
+        if not isinstance(frame, dict) or str(frame.get("clause_type", "") or "") != "copular":
+            continue
+        subject = _norm_token(str(frame.get("subject", "") or ""))
+        if not subject:
+            continue
+        evidence = [int(i) for i in list(frame.get("evidence_token_indices", []) or []) if isinstance(i, int) or str(i).isdigit()]
+        cop_idx = next((i for i in evidence if 0 <= i < len(tokens) and norms[i] in COPULAS), -1)
+        complement_indices = [i for i in evidence if cop_idx >= 0 and i > cop_idx]
+        if not complement_indices:
+            complement_indices = [i for i in word_idxs if cop_idx >= 0 and i > cop_idx]
+        complement = _surface(complement_indices, tokens)
+        if not complement:
+            continue
+        designation = _first_category_from_complement(complement_indices, tokens, role_map)
+        complement_norms = [_norm_token(tokens[i].text) for i in complement_indices if 0 <= i < len(tokens)]
+        has_definition_tail = any(n in {"where", "that", "who", "which", "used", "for", "when"} for n in complement_norms) or len(complement_norms) >= 4
+        subject_is_deictic = subject in {"this", "that", "these", "those", "it"}
+        subtype_of = ""
+        for idx, norm in enumerate(complement_norms):
+            if norm in TYPE_WORDS and idx + 2 < len(complement_norms) and complement_norms[idx + 1] == "of":
+                subtype_of = complement_norms[idx + 2]
+                break
+        frame_type = "designation_claim" if subject_is_deictic else ("definition_claim" if has_definition_tail else "classification_claim")
+        relation = "designated_as" if subject_is_deictic else ("defined_as" if has_definition_tail else "classified_as")
+        add({
+            "frame_type": frame_type,
+            "act": "learn_designation" if subject_is_deictic else "learn_definition" if has_definition_tail else "learn_classification",
+            "subject": subject,
+            "subject_text": str(frame.get("subject_text", "") or subject),
+            "definition": complement,
+            "designation": designation,
+            "designation_type": "deictic_reference" if subject_is_deictic else "category_or_type",
+            "category": designation,
+            "relation": relation,
+            "subtype_of": subtype_of,
+            "deictic": subject_is_deictic,
+            "negated": bool(frame.get("negated", False)),
+            "understanding_gaps": _learning_gap_for_terms([subject, designation], relation="needs_grounding"),
+            "confidence": min(0.94, 0.74 + float(frame.get("confidence", 0.0) or 0.0) * 0.14),
+            "evidence_token_indices": evidence,
+        })
+
+    # "X is not Y" is still useful: a contrast boundary, not a definition.
+    for frame in clause_candidates:
+        if not isinstance(frame, dict) or not bool(frame.get("negated", False)):
+            continue
+        subject = _norm_token(str(frame.get("subject", "") or ""))
+        complement = str(frame.get("complement", "") or frame.get("object_text", "") or frame.get("object", "") or "").strip()
+        if subject and complement:
+            add({
+                "frame_type": "contrast_claim",
+                "act": "learn_contrast",
+                "subject": subject,
+                "designation": _norm_token(complement),
+                "definition": complement,
+                "relation": "not_designated_as",
+                "negated": True,
+                "confidence": 0.72,
+                "evidence_token_indices": list(frame.get("evidence_token_indices", []) or []),
+            })
+
+    return frames[:8]
+
+
 def _clause_base(text: str, clause_type: str, confidence: float) -> dict[str, Any]:
     return {
         "clause_type": clause_type,
@@ -721,6 +948,33 @@ def _build_clause_candidates(text: str, tokens: Sequence[TokenAtom], role_candid
                     }
                 )
                 out.append(finalize(frame, evidence=patient_np + [aux_idx, verb_idx, by_idx] + agent_np))
+
+    # Language v3: definition/designation WH-copular questions keep their target.
+    # "What is prison?" should not degrade into the fragment "what".
+    if first == "what" and len(word_idxs) >= 3:
+        cop_idx = next((i for i in word_idxs[1:3] if norms[i] in COPULAS), -1)
+        if cop_idx > first_idx:
+            target_np = _noun_phrase_starting_at(cop_idx + 1, tokens, role_map)
+            if not target_np:
+                target_np = [i for i in word_idxs if i > cop_idx]
+            target = _head_of(target_np, tokens, role_map)
+            target_text = _surface(target_np, tokens, drop_determiners=True)
+            if target or target_text:
+                frame = _clause_base(text, "question", 0.90)
+                frame.update(
+                    {
+                        "subject": target or _norm_token(target_text),
+                        "subject_text": target_text,
+                        "action": "be",
+                        "action_surface": tokens[cop_idx].text,
+                        "object": target or _norm_token(target_text),
+                        "object_text": target_text,
+                        "query_target": "definition",
+                        "question_word": first,
+                        "definition_target": target or _norm_token(target_text),
+                    }
+                )
+                out.append(finalize(frame, evidence=[first_idx, cop_idx] + target_np))
 
     # WH question normalization.
     if first in QUESTION_WORDS:
@@ -1069,6 +1323,7 @@ def _fallback_parse(text: str) -> ParsedText:
     clause_candidates = _build_clause_candidates(text, token_atoms, role_candidates)
     best_clause = dict(clause_candidates[0]) if clause_candidates else {}
     _apply_best_clause_dependencies(token_atoms, best_clause)
+    learning_frames = _build_learning_frames(text, token_atoms, role_candidates, clause_candidates)
     noun_chunks = [str(p.get("text", "") or "") for p in phrase_chunks if p.get("kind") == "noun_phrase" and p.get("text")]
     return ParsedText(
         text=str(text or ""),
@@ -1080,6 +1335,7 @@ def _fallback_parse(text: str) -> ParsedText:
         role_candidates=role_candidates,
         clause_candidates=clause_candidates,
         best_clause=best_clause,
+        learning_frames=learning_frames,
     )
 
 
@@ -1126,6 +1382,7 @@ def parse_text(text: str) -> ParsedText:
 
     entities = [{"text": ent.text, "label": ent.label_} for ent in doc.ents]
     sentences = [sent.text.strip() for sent in doc.sents]
+    learning_frames = _build_learning_frames(text, tokens, role_candidates, clause_candidates)
 
     return ParsedText(
         text=text,
@@ -1137,6 +1394,7 @@ def parse_text(text: str) -> ParsedText:
         role_candidates=role_candidates,
         clause_candidates=clause_candidates,
         best_clause=best_clause,
+        learning_frames=learning_frames,
     )
 
 
@@ -1162,6 +1420,7 @@ def analyze_english_structure(text: str) -> dict[str, Any]:
                 "role_candidates": [dict(x) for x in parsed.role_candidates],
                 "clause_candidates": [dict(x) for x in parsed.clause_candidates],
                 "best_clause": dict(parsed.best_clause),
+                "learning_frames": [dict(x) for x in parsed.learning_frames],
             }
         )
     else:
@@ -1175,6 +1434,7 @@ def analyze_english_structure(text: str) -> dict[str, Any]:
                     "role_candidates": [dict(x) for x in sub.role_candidates],
                     "clause_candidates": [dict(x) for x in sub.clause_candidates],
                     "best_clause": dict(sub.best_clause),
+                    "learning_frames": [dict(x) for x in sub.learning_frames],
                 }
             )
 
@@ -1182,6 +1442,12 @@ def analyze_english_structure(text: str) -> dict[str, Any]:
         dict(frame)
         for sentence in sentence_structures
         for frame in list(sentence.get("clause_candidates", []) or [])
+        if isinstance(frame, dict)
+    ]
+    all_learning_frames = [
+        dict(frame)
+        for sentence in sentence_structures
+        for frame in list(sentence.get("learning_frames", []) or [])
         if isinstance(frame, dict)
     ]
     best_clause = dict(sentence_structures[0].get("best_clause", {}) or {}) if sentence_structures else {}
@@ -1193,6 +1459,7 @@ def analyze_english_structure(text: str) -> dict[str, Any]:
         "role_candidates": [dict(x) for x in parsed.role_candidates],
         "clause_candidates": all_clauses or [dict(x) for x in parsed.clause_candidates],
         "best_clause": best_clause or dict(parsed.best_clause),
+        "learning_frames": all_learning_frames or [dict(x) for x in parsed.learning_frames],
         "sentence_structures": sentence_structures,
     }
 

@@ -222,25 +222,33 @@ class DashboardBridge:
                     )
             await asyncio.sleep(VISION_SAMPLE_INTERVAL_S)
 
-    async def select_visual_object(self, track_id: str) -> None:
-        """Point MB's short-lived attention at one current visual object.
+    async def select_visual_object(self, track_id: str, *, object_snapshot: Mapping[str, Any] | None = None) -> None:
+        """Point MB's short-lived attention at one current or frozen visual object.
 
         This is deliberately a control/context event, not a label or identity
         assertion. The vision-attention organ decides whether the track is still
-        current and binds it to the next relevant user input.
+        current and binds it to the next relevant user input. When the dashboard
+        is frozen, object_snapshot carries the selected visual evidence so the
+        later language claim can bind to the frozen frame rather than a moving
+        live track.
         """
         track_id = str(track_id or "").strip()
         if not track_id:
             return
+        payload: dict[str, Any] = {"action": "select", "track_id": track_id}
+        if isinstance(object_snapshot, Mapping):
+            payload["object_snapshot"] = safe_json(dict(object_snapshot))
+            payload["frozen"] = bool(object_snapshot.get("ui_frozen", False))
         await self.orch.push_event(
             "control/vision_attention",
-            {"action": "select", "track_id": track_id},
+            payload,
             meta={
                 "source": "ui",
                 "channel": "dashboard",
                 "store_in_memory": False,
                 "cognitive_visible": False,
                 "user_pointing": True,
+                "visual_teaching_selection": bool(isinstance(object_snapshot, Mapping)),
             },
             source="dashboard",
         )
@@ -350,6 +358,7 @@ class DashboardBridge:
             "hypothesis": safe_json(kv.get("hypothesis:last", {})),
             "hypothesis_tuning": safe_json(kv.get("hypothesis:last_tuning", {})),
             "release_tuning": safe_json(kv.get("hypothesis:release_tuning", {})),
+            "probe_runtime": safe_json(kv.get("probe:runtime_state", {})),
             "scene": safe_json(kv.get("scene:current", {})),
             "scene_exp": safe_json(kv.get("scene:expectation:last_exp", {})),
             "scene_delta": safe_json(kv.get("scene:expectation:last_delta", {})),

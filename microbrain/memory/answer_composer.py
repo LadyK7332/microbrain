@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 import time
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from microbrain.memory.builder_forge import build_forge_workspace, forge_from_workspace
 from microbrain.memory.mem_cell_store import MemCellStore
@@ -49,6 +49,37 @@ def _extract_body(hit: Dict[str, Any]) -> str:
     return ''
 
 
+
+def _render_learning_frame(hit: Mapping[str, Any]) -> str:
+    meta = dict(hit.get('meta', {}) or {})
+    slots = dict(meta.get('slots', {}) or {})
+    pattern_type = str(meta.get('pattern_type', '') or '').strip()
+    subject = str(slots.get('subject', '') or slots.get('query_target', '') or '').strip()
+    designation = str(slots.get('designation', '') or slots.get('category', '') or '').strip()
+    definition = str(slots.get('definition', '') or '').strip()
+    subtype_of = str(slots.get('subtype_of', '') or '').strip()
+    if pattern_type == 'definition_question':
+        target = str(slots.get('query_target', '') or subject).strip()
+        return f'I need a definition for {target}'.strip() if target else 'I need a definition'
+    if pattern_type == 'contrast_claim' and subject and definition:
+        return f'{subject} is not {definition}'.strip()
+    if pattern_type == 'classification_claim' and subject and designation:
+        return f'{subject} is a {designation}'.strip()
+    if pattern_type == 'designation_claim' and subject:
+        if definition:
+            return f'{subject} is {definition}'.strip()
+        if designation:
+            return f'{subject} is a {designation}'.strip()
+        if subtype_of:
+            return f'{subject} is a kind of {subtype_of}'.strip()
+    if pattern_type == 'definition_claim' and subject:
+        if definition:
+            return f'{subject} is {definition}'.strip()
+        if designation:
+            return f'{subject} is a {designation}'.strip()
+    return str(hit.get('anchor_text', '') or '').strip()
+
+
 def _render_pattern(hit: Dict[str, Any]) -> str:
     meta = dict(hit.get('meta', {}) or {})
     slots = dict(meta.get('slots', {}) or {})
@@ -92,6 +123,10 @@ def _render_pattern(hit: Dict[str, Any]) -> str:
         obj = str(slots.get('object', '') or '').strip()
         if subject and action:
             return ' '.join([subject, action, obj]).strip()
+    if str(hit.get('kind', '') or '') in {'learning_frame', 'understanding_gap'}:
+        rendered = _render_learning_frame(hit)
+        if rendered:
+            return rendered
     if str(hit.get('kind', '') or '') == 'clause_frame':
         clause_type = str(meta.get('clause_type', '') or '')
         subject = str(slots.get('subject', '') or '').strip()
