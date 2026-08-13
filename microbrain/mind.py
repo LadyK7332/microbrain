@@ -402,7 +402,7 @@ async def main_async(cfg: AppConfig):
             "self_need": 0.60,
             "social": 0.56,
             "novelty": 0.44,
-            "expression": 0.34,
+            "expression": 0.64, #edit from .34
             "idle_thought": 0.18,
         },
     )
@@ -418,7 +418,7 @@ async def main_async(cfg: AppConfig):
             "self_need": 600.0,
             "social": 420.0,
             "novelty": 240.0,
-            "expression": 180.0,
+            "expression": 360.0,
             "idle_thought": 120.0,
         },
     )
