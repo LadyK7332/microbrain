@@ -1,63 +1,87 @@
 from __future__ import annotations
 
 from microbrain.affect_curves import (
-    apply_curve_pulse,
-    curve_spec,
-    decay_curve_map,
-    signed_feedback_curve,
+    AffectCurveConfig,
+    apply_affect_pulse,
+    decay_curve_state,
+    summarize_curve_bucket,
 )
 
 
-def test_flow_threshold_limits_immediate_repeat_input():
-    curves = {}
-    now = 1000.0
-    curves, first = apply_curve_pulse(curves, name="user_approval", signed_amount=0.8, now=now, target_key="same")
-    curves, second = apply_curve_pulse(curves, name="user_approval", signed_amount=0.8, now=now + 0.1, target_key="same")
+def test_repeated_same_target_gets_dampened():
+    cfg = AffectCurveConfig(
+        name="user_approval",
+        flow_threshold=10.0,
+        curve_capacity=10.0,
+        decay_half_life_s=1000.0,
+        repeat_window_s=10.0,
+        repeat_dampening=0.20,
+    )
+    first = apply_affect_pulse({}, cfg, now=100.0, incoming_strength=0.5, target_key="same")
+    second = apply_affect_pulse(first.state, cfg, now=101.0, incoming_strength=0.5, target_key="same")
 
-    assert first.effective > 0.0
-    assert second.effective < first.effective
-    assert second.flow_available < first.flow_available
-    assert second.saturation >= first.saturation
-
-
-def test_curve_capacity_saturates_repeated_same_target():
-    curves = {}
-    now = 2000.0
-    effects = []
-    for i in range(8):
-        curves, result = signed_feedback_curve(curves, signed_strength=5.0, now=now + i, target_key="last_visible_action")
-        effects.append(result["reward_delta"])
-
-    assert effects[0] > effects[-1]
-    assert curves["user_approval"]["saturation"] > 0.4
-    assert curves["user_approval"]["repeat_count"] >= 3
+    assert first.effective_strength > second.effective_strength
+    assert second.reason == "repeat_dampened"
+    assert second.state["repeat_count"] == 1
 
 
-def test_decay_reopens_capacity_and_flow_over_time():
-    curves = {}
-    now = 3000.0
-    curves, _ = apply_curve_pulse(curves, name="user_approval", signed_amount=1.0, now=now, target_key="x")
-    saturated = curves["user_approval"]
-    decayed = decay_curve_map(curves, now=now + 60.0)
+def test_flow_threshold_creates_overload_and_limits_effective_strength():
+    cfg = AffectCurveConfig(
+        name="approval",
+        flow_threshold=0.5,
+        flow_window_s=10.0,
+        curve_capacity=10.0,
+        decay_half_life_s=1000.0,
+    )
+    first = apply_affect_pulse({}, cfg, now=1.0, incoming_strength=0.5, target_key="a")
+    second = apply_affect_pulse(first.state, cfg, now=2.0, incoming_strength=0.5, target_key="b")
 
-    assert decayed["user_approval"]["level"] < saturated["level"]
-    assert decayed["user_approval"]["flow"] < saturated["flow"]
-    assert decayed["user_approval"]["saturation"] < saturated["saturation"]
-
-
-def test_negative_feedback_uses_correction_curve_not_approval_curve():
-    curves, effect = signed_feedback_curve({}, signed_strength=-7.0, now=4000.0, target_key="bad_guess")
-
-    assert "user_correction" in curves
-    assert "user_approval" not in curves
-    assert effect["reward_delta"] < 0.0
-    assert effect["valence_delta"] < 0.0
-    assert effect["salience_delta"] > 0.0
+    assert first.flow_available > second.flow_available
+    assert second.effective_strength == 0.0
+    assert second.state["overload"] > 0.0
+    assert second.reason in {"flow_limited", "overload_limited"}
 
 
-def test_curve_spec_override_keeps_positive_safety_bounds():
-    spec = curve_spec("custom", {"flow_threshold": -1, "curve_capacity": 0, "decay_half_life_s": -2})
+def test_capacity_saturation_limits_future_pulses():
+    cfg = AffectCurveConfig(
+        name="small_capacity",
+        flow_threshold=10.0,
+        curve_capacity=0.5,
+        decay_half_life_s=1000.0,
+    )
+    first = apply_affect_pulse({}, cfg, now=1.0, incoming_strength=0.5, target_key="a")
+    second = apply_affect_pulse(first.state, cfg, now=2.0, incoming_strength=0.5, target_key="b")
 
-    assert spec.flow_threshold > 0.0
-    assert spec.curve_capacity > 0.0
-    assert spec.decay_half_life_s > 0.0
+    assert first.state["saturation"] == 1.0
+    assert second.effective_strength == 0.0
+    assert second.reason == "capacity_saturated"
+
+
+def test_decay_restores_some_capacity():
+    cfg = AffectCurveConfig(
+        name="approval",
+        flow_threshold=10.0,
+        curve_capacity=1.0,
+        decay_half_life_s=10.0,
+    )
+    first = apply_affect_pulse({}, cfg, now=0.0, incoming_strength=1.0, target_key="a")
+    decayed = decay_curve_state(first.state, cfg, now=10.0)
+
+    assert 0.45 <= decayed["level"] <= 0.55
+    assert decayed["saturation"] < 1.0
+
+
+def test_summary_is_small_and_stable():
+    cfg = AffectCurveConfig(name="approval")
+    first = apply_affect_pulse({}, cfg, now=5.0, incoming_strength=0.3, target_key="target-x")
+    summary = summarize_curve_bucket({"approval": first.state})
+
+    assert set(summary["approval"]) == {
+        "level",
+        "saturation",
+        "overload",
+        "flow_used",
+        "repeat_count",
+        "last_target",
+    }
+    assert summary["approval"]["last_target"] == "target-x"

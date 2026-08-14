@@ -5,6 +5,12 @@ import time
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from microbrain.affect_curves import (
+    AffectCurveConfig,
+    apply_affect_pulse,
+    decay_curve_bucket,
+    summarize_curve_bucket,
+)
 from microbrain.hormone import derive_ddna_modulators
 from microbrain.orchestrator.neuron_base import BaseNeuron, Event, NeuronConfig
 from microbrain.orchestrator.orchestrator import Orchestrator
@@ -80,6 +86,59 @@ def _fingerprint(text: str) -> str:
     return " ".join(re.findall(r"[a-z0-9']+", (text or "").lower()))[:160]
 
 
+def _event_payload_dict(event: Event) -> dict[str, Any]:
+    return event.payload if isinstance(event.payload, dict) else {}
+
+
+def _motion_strength_from_event(event: Event, raw: Mapping[str, Any]) -> float:
+    payload = _event_payload_dict(event)
+    candidates = (
+        payload.get("motion_salience"),
+        payload.get("motion_score"),
+        payload.get("motion_intensity"),
+        payload.get("motion"),
+        payload.get("salience"),
+        raw.get("motion_salience"),
+        raw.get("motion_score"),
+        raw.get("motion_intensity"),
+        raw.get("salience"),
+    )
+    return _clamp01(max((_safe_float(v, 0.0) for v in candidates), default=0.0))
+
+
+def _target_key_from_event(
+    event: Event,
+    raw: Mapping[str, Any],
+    state: Mapping[str, Any],
+    *,
+    fallback_text: str = "",
+) -> str:
+    payload = _event_payload_dict(event)
+    for key in (
+        "target_id",
+        "target",
+        "trace_id",
+        "selected_vobj_id",
+        "vobj_id",
+        "object_id",
+        "source_id",
+    ):
+        value = payload.get(key, raw.get(key))
+        if value:
+            return str(value)[:160]
+
+    # /acc feedback should usually point at what MB just did, not the literal
+    # words "great job".  Until the rolling-index target binder is richer, use
+    # recent MB output/vision fingerprints before falling back to user text.
+    for key in ("last_output_fp", "last_vision_fp"):
+        value = state.get(key)
+        if value:
+            return str(value)[:160]
+
+    fp = _fingerprint(fallback_text or event.topic)
+    return fp or event.topic
+
+
 class RewardNoveltyPulseNeuron(BaseNeuron):
     """
     Maintains fast reward/novelty/valence pulses for the UI pressure band and drives.
@@ -87,6 +146,11 @@ class RewardNoveltyPulseNeuron(BaseNeuron):
     DDNA v2 wiring: the active PDNA/DDNA profile mutates gain, decay,
     salience, boredom relief, and trainer reward sensitivity. This stays an
     affect organ only; it does not write responses or command actions.
+
+    Hormone Curve Field v1.1: curve math augments this existing organ instead
+    of replacing it.  The curve layer shapes incoming pulses through flow,
+    capacity, saturation, overload, and repeat dampening, then this neuron keeps
+    publishing the authoritative affect/reward and affect/salience events.
     """
 
     REWARD_DECAY_PER_S = 0.20
@@ -127,6 +191,77 @@ class RewardNoveltyPulseNeuron(BaseNeuron):
             "satisfaction": max(0.001, _safe_float(profile_path(pdna, "affect_model", "decay.satisfaction_decay_per_second", self.SATISFACTION_DECAY_PER_S), self.SATISFACTION_DECAY_PER_S) / resistance),
         }
 
+    def _curve_configs(self, pdna: Any, mods: Mapping[str, Any]) -> dict[str, AffectCurveConfig]:
+        reward_gain = _clamp(_safe_float(mods.get("reward_gain"), 1.0), 0.25, 2.00)
+        salience_gain = _clamp(_safe_float(mods.get("salience_gain"), 1.0), 0.25, 2.20)
+        trainer_gain = _clamp(_safe_float(mods.get("trainer_alignment_gain"), 1.0), 0.25, 2.00)
+        decay_resistance = _clamp(_safe_float(mods.get("decay_resistance"), 1.0), 0.35, 2.00)
+
+        return {
+            "user_approval": AffectCurveConfig(
+                name="user_approval",
+                flow_threshold=_safe_float(profile_path(pdna, "affect_model", "curves.user_approval.flow_threshold", 1.15), 1.15) * trainer_gain,
+                flow_window_s=_safe_float(profile_path(pdna, "affect_model", "curves.user_approval.flow_window_s", 10.0), 10.0),
+                curve_capacity=_safe_float(profile_path(pdna, "affect_model", "curves.user_approval.curve_capacity", 1.0), 1.0) * reward_gain,
+                decay_half_life_s=_safe_float(profile_path(pdna, "affect_model", "curves.user_approval.decay_half_life_s", 20.0), 20.0) * decay_resistance,
+                overload_half_life_s=_safe_float(profile_path(pdna, "affect_model", "curves.user_approval.overload_half_life_s", 12.0), 12.0) * decay_resistance,
+                repeat_window_s=6.0,
+                repeat_dampening=0.18,
+            ),
+            "user_correction": AffectCurveConfig(
+                name="user_correction",
+                flow_threshold=_safe_float(profile_path(pdna, "affect_model", "curves.user_correction.flow_threshold", 1.05), 1.05),
+                flow_window_s=_safe_float(profile_path(pdna, "affect_model", "curves.user_correction.flow_window_s", 12.0), 12.0),
+                curve_capacity=_safe_float(profile_path(pdna, "affect_model", "curves.user_correction.curve_capacity", 0.95), 0.95),
+                decay_half_life_s=_safe_float(profile_path(pdna, "affect_model", "curves.user_correction.decay_half_life_s", 24.0), 24.0) * decay_resistance,
+                overload_half_life_s=_safe_float(profile_path(pdna, "affect_model", "curves.user_correction.overload_half_life_s", 14.0), 14.0) * decay_resistance,
+                repeat_window_s=7.0,
+                repeat_dampening=0.14,
+            ),
+            "arousal": AffectCurveConfig(
+                name="arousal",
+                flow_threshold=_safe_float(profile_path(pdna, "affect_model", "curves.arousal.flow_threshold", 1.35), 1.35) * salience_gain,
+                flow_window_s=_safe_float(profile_path(pdna, "affect_model", "curves.arousal.flow_window_s", 6.0), 6.0),
+                curve_capacity=_safe_float(profile_path(pdna, "affect_model", "curves.arousal.curve_capacity", 1.15), 1.15),
+                decay_half_life_s=_safe_float(profile_path(pdna, "affect_model", "curves.arousal.decay_half_life_s", 8.0), 8.0) * decay_resistance,
+                overload_half_life_s=_safe_float(profile_path(pdna, "affect_model", "curves.arousal.overload_half_life_s", 6.0), 6.0) * decay_resistance,
+                repeat_window_s=3.0,
+                repeat_dampening=0.10,
+            ),
+        }
+
+    def _shape_curve(
+        self,
+        state: dict[str, Any],
+        pdna: Any,
+        mods: Mapping[str, Any],
+        curve_name: str,
+        *,
+        now: float,
+        incoming_strength: float,
+        target_key: str,
+        target_confidence: float = 1.0,
+        novelty: float = 1.0,
+        ddna_gain: float = 1.0,
+    ):
+        configs = self._curve_configs(pdna, mods)
+        cfg = configs[curve_name]
+        curves = _as_dict(state.get("curves"))
+        result = apply_affect_pulse(
+            curves.get(curve_name),
+            cfg,
+            now=now,
+            incoming_strength=incoming_strength,
+            target_key=target_key,
+            target_confidence=target_confidence,
+            novelty=novelty,
+            ddna_gain=ddna_gain,
+        )
+        curves[curve_name] = result.state
+        state["curves"] = curves
+        state["last_curve_result"] = result.to_dict()
+        return result
+
     async def _load_state(self, ctx, now: float) -> dict[str, Any]:
         state = await self.load_state(
             ctx,
@@ -138,8 +273,11 @@ class RewardNoveltyPulseNeuron(BaseNeuron):
                 "salience": 0.0,
                 "valence": 0.0,
                 "satisfaction": 0.0,
+                "curves": {},
+                "last_curve_result": {},
                 "last_ts": now,
                 "last_user_fp": "",
+                "last_vision_fp": "",
                 "last_output_fp": "",
                 "last_reason": "idle",
                 "last_delta": 0.0,
@@ -149,7 +287,7 @@ class RewardNoveltyPulseNeuron(BaseNeuron):
         )
         return dict(state or {})
 
-    def _decay_state(self, state: dict[str, Any], now: float, decays: Mapping[str, float]) -> dict[str, Any]:
+    def _decay_state(self, state: dict[str, Any], now: float, decays: Mapping[str, float], curve_configs: Mapping[str, AffectCurveConfig]) -> dict[str, Any]:
         last_ts = _safe_float(state.get("last_ts"), now)
         dt = max(0.0, now - last_ts)
         state["reward"] = _clamp01(_safe_float(state.get("reward"), 0.0) - (_safe_float(decays.get("reward"), self.REWARD_DECAY_PER_S) * dt))
@@ -164,6 +302,7 @@ class RewardNoveltyPulseNeuron(BaseNeuron):
             val = min(0.0, val + val_decay)
         state["valence"] = _clamp_signed(val)
         state["satisfaction"] = _clamp01(_safe_float(state.get("satisfaction"), 0.0) - (_safe_float(decays.get("satisfaction"), self.SATISFACTION_DECAY_PER_S) * dt))
+        state["curves"] = decay_curve_bucket(_as_dict(state.get("curves")), curve_configs, now=now)
         state["last_ts"] = now
         return state
 
@@ -182,8 +321,9 @@ class RewardNoveltyPulseNeuron(BaseNeuron):
         satisfaction = min(0.28, 0.02 + (acc * 0.025)) * trainer_gain
         valence = min(0.62, 0.04 + (acc * 0.045)) * reward_gain
 
-        # Anti-button-mashing governor: repeated praise with no intervening new
-        # percept/result still works, but gets diminishing returns.
+        # Legacy anti-button-mashing remains as a secondary guard.  The curve
+        # layer does the richer flow/capacity/repeat math before this method is
+        # called, but this prevents old direct reinforce paths from spiking too hard.
         last_reward_ts = _safe_float(state.get("last_reward_ts"), 0.0)
         same_reward_count = int(state.get("same_reward_count", 0) or 0)
         if last_reward_ts > 0.0 and (now - last_reward_ts) < 4.0:
@@ -206,6 +346,8 @@ class RewardNoveltyPulseNeuron(BaseNeuron):
         salience_level = _clamp01(_safe_float(state.get("salience"), 0.0))
         valence_level = _clamp_signed(_safe_float(state.get("valence"), 0.0))
         satisfaction_level = _clamp01(_safe_float(state.get("satisfaction"), 0.0))
+        curve_summary = summarize_curve_bucket(_as_dict(state.get("curves")))
+        curve_last = _as_dict(state.get("last_curve_result"))
 
         await ctx.set_kv(
             "affect:reward_state",
@@ -217,6 +359,7 @@ class RewardNoveltyPulseNeuron(BaseNeuron):
                 "last_delta": round(delta, 4),
                 "reason": reason,
                 "source_topic": source_topic,
+                "curve_last": curve_last,
                 "ts": now,
             },
         )
@@ -234,6 +377,17 @@ class RewardNoveltyPulseNeuron(BaseNeuron):
             "affect:salience_state",
             {
                 "level": round(salience_level, 4),
+                "reason": reason,
+                "source_topic": source_topic,
+                "curve_last": curve_last,
+                "ts": now,
+            },
+        )
+        await ctx.set_kv(
+            "affect:curve_state",
+            {
+                "curves": curve_summary,
+                "last": curve_last,
                 "reason": reason,
                 "source_topic": source_topic,
                 "ts": now,
@@ -262,7 +416,8 @@ class RewardNoveltyPulseNeuron(BaseNeuron):
 
         now = time.time()
         pdna, mods = await self._profile_math(ctx)
-        state = self._decay_state(await self._load_state(ctx, now), now, self._decays(pdna, mods))
+        curve_configs = self._curve_configs(pdna, mods)
+        state = self._decay_state(await self._load_state(ctx, now), now, self._decays(pdna, mods), curve_configs)
 
         reward_delta = 0.0
         novelty_delta = 0.0
@@ -285,33 +440,76 @@ class RewardNoveltyPulseNeuron(BaseNeuron):
         if event.topic == "control/reinforce":
             payload = _as_dict(event.payload)
             weight = _safe_float(payload.get("weight", payload.get("score", payload.get("acc"))), 0.0)
+            target_key = _target_key_from_event(event, payload, state, fallback_text=payload.get("text", event.topic))
             if weight > 0.0:
-                reward_delta, salience_delta, relief_delta, satisfaction_delta, valence_delta = self._positive_reinforcement_gains(pdna, mods, weight, now, state)
-                novelty_delta += (0.06 + (0.018 * min(weight, 10.0))) * novelty_gain
+                raw_strength = _clamp01(weight / 10.0)
+                curve = self._shape_curve(
+                    state,
+                    pdna,
+                    mods,
+                    "user_approval",
+                    now=now,
+                    incoming_strength=raw_strength,
+                    target_key=target_key,
+                    target_confidence=_clamp01(_safe_float(payload.get("target_confidence"), 1.0)),
+                    novelty=1.0,
+                    ddna_gain=reward_gain * trainer_gain,
+                )
+                shaped_weight = min(10.0, weight * curve.multiplier)
+                reward_delta, salience_delta, relief_delta, satisfaction_delta, valence_delta = self._positive_reinforcement_gains(pdna, mods, shaped_weight, now, state)
+                novelty_delta += (0.06 + (0.018 * min(shaped_weight, 10.0))) * novelty_gain
                 state["last_reward_ts"] = now
                 state["same_reward_count"] = int(state.get("same_reward_count", 0) or 0) + 1
-                reason = "positive_reinforcement"
+                reason = f"positive_reinforcement:{curve.reason}"
             elif weight < 0.0:
-                scaled = max(-1.0, min(0.0, weight / 10.0))
+                raw_strength = _clamp01(abs(weight) / 10.0)
+                curve = self._shape_curve(
+                    state,
+                    pdna,
+                    mods,
+                    "user_correction",
+                    now=now,
+                    incoming_strength=raw_strength,
+                    target_key=target_key,
+                    target_confidence=_clamp01(_safe_float(payload.get("target_confidence"), 1.0)),
+                    novelty=1.0,
+                    ddna_gain=trainer_gain,
+                )
+                scaled = -curve.effective_strength
                 reward_delta += 0.45 * scaled
                 valence_delta += 0.52 * scaled
-                salience_delta += 0.10 * salience_gain
+                salience_delta += (0.10 + (0.12 * curve.effective_strength)) * salience_gain
                 novelty_delta += 0.06 * novelty_gain
                 state["same_reward_count"] = 0
-                reason = "negative_reinforcement"
+                reason = f"negative_reinforcement:{curve.reason}"
 
         elif event.topic == "control/trainer_correction":
-            reward_delta += 0.30 * reward_gain * trainer_gain
-            salience_delta += 0.22 * salience_gain
-            novelty_delta += 0.18 * novelty_gain
-            relief_delta += 0.22 * relief_gain
-            satisfaction_delta += 0.08 * trainer_gain
-            valence_delta += 0.18 * reward_gain
+            target_key = _target_key_from_event(event, _as_dict(event.payload), state, fallback_text="trainer_correction")
+            curve = self._shape_curve(
+                state,
+                pdna,
+                mods,
+                "user_correction",
+                now=now,
+                incoming_strength=0.55,
+                target_key=target_key,
+                target_confidence=1.0,
+                novelty=1.0,
+                ddna_gain=trainer_gain,
+            )
+            strength = curve.effective_strength
+            reward_delta += (0.12 + (0.18 * strength)) * reward_gain * trainer_gain
+            salience_delta += (0.10 + (0.16 * strength)) * salience_gain
+            novelty_delta += (0.08 + (0.10 * strength)) * novelty_gain
+            relief_delta += (0.10 + (0.12 * strength)) * relief_gain
+            satisfaction_delta += 0.08 * strength * trainer_gain
+            valence_delta += 0.18 * strength * reward_gain
             state["same_reward_count"] = 0
-            reason = "trainer_correction"
+            reason = f"trainer_correction:{curve.reason}"
 
         elif event.topic in {"percept/text", "percept/vision"} and not _is_internal_or_control(event):
             raw = _raw_meta(event)
+            payload = _event_payload_dict(event)
             accent_positive = max(0.0, _safe_float(raw.get("accent_positive", event.meta.get("accent_positive") if event.meta else 0.0), 0.0))
             accent_negative = max(0.0, _safe_float(raw.get("accent_negative_severity", event.meta.get("accent_negative_severity") if event.meta else 0.0), 0.0))
             text = _text_from_event(event)
@@ -332,22 +530,72 @@ class RewardNoveltyPulseNeuron(BaseNeuron):
                 novelty_delta += 0.02 * novelty_gain
                 salience_delta += 0.03 * salience_gain
                 reason = "repeated_interaction"
+
+            if event.topic == "percept/vision":
+                motion_strength = _motion_strength_from_event(event, raw)
+                if motion_strength > 0.0:
+                    target_key = _target_key_from_event(event, raw, state, fallback_text=payload.get("label", "vision_motion"))
+                    curve = self._shape_curve(
+                        state,
+                        pdna,
+                        mods,
+                        "arousal",
+                        now=now,
+                        incoming_strength=motion_strength,
+                        target_key=target_key,
+                        target_confidence=_clamp01(_safe_float(payload.get("confidence", raw.get("confidence", 0.75)), 0.75)),
+                        novelty=1.0 if was_new else 0.70,
+                        ddna_gain=salience_gain,
+                    )
+                    salience_delta += (0.06 + (0.20 * curve.effective_strength)) * salience_gain
+                    novelty_delta += (0.02 + (0.08 * curve.effective_strength)) * novelty_gain
+                    valence_delta += 0.01 * curve.effective_strength
+                    reason = f"motion_arousal:{curve.reason}"
+
             if accent_positive > 0.0:
-                strength = max(0.0, min(1.0, accent_positive / 10.0))
+                raw_strength = _clamp01(accent_positive / 10.0)
+                target_key = _target_key_from_event(event, raw, state, fallback_text=text)
+                curve = self._shape_curve(
+                    state,
+                    pdna,
+                    mods,
+                    "user_approval",
+                    now=now,
+                    incoming_strength=raw_strength,
+                    target_key=target_key,
+                    target_confidence=_clamp01(_safe_float(raw.get("target_confidence", 1.0), 1.0)),
+                    novelty=1.0 if was_new else 0.65,
+                    ddna_gain=reward_gain * trainer_gain,
+                )
+                strength = curve.effective_strength
                 reward_delta += (0.18 + (0.62 * strength)) * reward_gain
                 salience_delta += (0.10 + (0.24 * strength)) * salience_gain
                 novelty_delta += (0.08 + (0.10 * strength)) * novelty_gain
                 relief_delta += (0.12 + (0.18 * strength)) * relief_gain
                 valence_delta += (0.12 + (0.40 * strength)) * reward_gain
                 satisfaction_delta += 0.08 * strength * trainer_gain
-                reason = "positive_accent"
+                reason = f"positive_accent:{curve.reason}"
             elif accent_negative > 0.0:
-                strength = max(0.0, min(1.0, accent_negative / 10.0))
+                raw_strength = _clamp01(accent_negative / 10.0)
+                target_key = _target_key_from_event(event, raw, state, fallback_text=text)
+                curve = self._shape_curve(
+                    state,
+                    pdna,
+                    mods,
+                    "user_correction",
+                    now=now,
+                    incoming_strength=raw_strength,
+                    target_key=target_key,
+                    target_confidence=_clamp01(_safe_float(raw.get("target_confidence", 1.0), 1.0)),
+                    novelty=1.0 if was_new else 0.70,
+                    ddna_gain=trainer_gain,
+                )
+                strength = curve.effective_strength
                 reward_delta -= (0.10 + (0.28 * strength)) * reward_gain
                 valence_delta -= (0.14 + (0.36 * strength))
                 salience_delta += (0.12 + (0.16 * strength)) * salience_gain
                 novelty_delta += 0.05 * novelty_gain
-                reason = "negative_accent"
+                reason = f"negative_accent:{curve.reason}"
 
         elif event.topic == "act/speech" and not _is_internal_or_control(event):
             fp = _fingerprint(_text_from_event(event))
@@ -375,6 +623,8 @@ class RewardNoveltyPulseNeuron(BaseNeuron):
         await self._persist(ctx, state, reason=reason, delta=reward_delta, source_topic=event.topic)
 
         meta = {"ui_visible": False, "store_in_memory": False, "cognitive_visible": False}
+        curve_summary = summarize_curve_bucket(_as_dict(state.get("curves")))
+        curve_last = _as_dict(state.get("last_curve_result"))
         events = [
             Event(
                 topic="affect/reward",
@@ -389,6 +639,8 @@ class RewardNoveltyPulseNeuron(BaseNeuron):
                     "novelty_delta": round(novelty_delta, 4),
                     "salience_delta": round(salience_delta, 4),
                     "reason": reason,
+                    "curves": curve_summary,
+                    "curve_last": curve_last,
                     "ts": now,
                 },
                 source=self.name,
@@ -405,6 +657,7 @@ class RewardNoveltyPulseNeuron(BaseNeuron):
                         "salience": round(_clamp01(_safe_float(state.get("salience"), 0.0)), 4),
                         "source_topic": event.topic,
                         "reason": reason,
+                        "curve_last": curve_last,
                     },
                     source=self.name,
                     correlation_id=event.correlation_id,
