@@ -11,6 +11,105 @@ import json
 from typing import Any, Mapping
 
 
+UNKNOWN_VISUAL_LABELS = {"", "unknown", "thing", "that thing", "object"}
+MOTION_STATUS_MARKERS = {
+    "move",
+    "moved",
+    "moving",
+    "motion",
+    "motion_onset",
+    "changed",
+    "salient",
+    "appeared",
+    "reacquired",
+    "searching",
+}
+
+
+def visual_object_uncertain(item: Mapping[str, Any], *, confidence_threshold: float = 0.75) -> bool:
+    """Return True when a visual object should be referenced with a ``?`` marker.
+
+    This is a communication affordance, not a new perception organ. It exposes
+    identity / boundary / relation uncertainty already present in the visual
+    object record so humans can answer with the exact vobj handle.
+    """
+
+    status = str(item.get("status") or "").strip().lower()
+    label = str(
+        item.get("label")
+        or item.get("resolved_label")
+        or item.get("fallback_ref")
+        or item.get("name")
+        or item.get("class")
+        or item.get("type")
+        or ""
+    ).strip().lower()
+    if status in {"unknown", "candidate", "proto", "searching", "isolated", "uncertain"}:
+        return True
+    if label in UNKNOWN_VISUAL_LABELS:
+        return True
+    try:
+        confidence = float(item.get("confidence", item.get("conf", 0.0)) or 0.0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    if confidence and confidence < float(confidence_threshold):
+        return True
+    for key in ("boundary_confidence", "relation_confidence", "identity_confidence"):
+        if key in item:
+            try:
+                if float(item.get(key) or 0.0) < float(confidence_threshold):
+                    return True
+            except (TypeError, ValueError):
+                return True
+    return False
+
+
+def visual_ref_text(
+    item: Mapping[str, Any] | str,
+    *,
+    fallback_index: int = 0,
+    confidence_threshold: float = 0.75,
+) -> str:
+    """Return MB's visual pointing handle, appending ``?`` when uncertain."""
+
+    if isinstance(item, str):
+        value = item.strip()
+        return value
+    track_id = visual_object_id(item, fallback_index=fallback_index)
+    suffix = "?" if visual_object_uncertain(item, confidence_threshold=confidence_threshold) else ""
+    return f"{track_id}{suffix}"
+
+
+def has_visual_motion_salience(item: Mapping[str, Any], *, min_motion: float = 0.01) -> bool:
+    """Return True when a visual object reports recent motion/change salience."""
+
+    for key in ("motion_salient", "salient_motion", "recent_motion", "motion_onset", "moved", "changed"):
+        if bool(item.get(key, False)):
+            return True
+    status_text = " ".join(
+        str(item.get(key) or "").strip().lower()
+        for key in ("status", "motion_state", "state", "event")
+        if item.get(key) is not None
+    )
+    if any(marker in status_text for marker in MOTION_STATUS_MARKERS):
+        return True
+    motion = item.get("motion") or item.get("velocity") or item.get("delta_xy")
+    dx = dy = 0.0
+    if isinstance(motion, Mapping):
+        try:
+            dx = float(motion.get("dx", motion.get("x", 0.0)) or 0.0)
+            dy = float(motion.get("dy", motion.get("y", 0.0)) or 0.0)
+        except (TypeError, ValueError):
+            dx = dy = 0.0
+    elif isinstance(motion, (list, tuple)) and len(motion) >= 2:
+        try:
+            dx = float(motion[0])
+            dy = float(motion[1])
+        except (TypeError, ValueError):
+            dx = dy = 0.0
+    return (abs(dx) + abs(dy)) > float(min_motion)
+
+
 def _float(value: Any, default: float = 0.0) -> float:
     try:
         return float(value)

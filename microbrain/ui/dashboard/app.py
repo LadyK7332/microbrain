@@ -47,7 +47,12 @@ from microbrain.ui.frontend_common import (
     should_show_in_conversation,
 )
 from microbrain.ui.dashboard.config_catalog import scan_repo
-from microbrain.vision_state import bbox_xywh
+from microbrain.vision_state import (
+    bbox_xywh,
+    has_visual_motion_salience,
+    visual_object_uncertain,
+    visual_ref_text,
+)
 from microbrain.ui.dashboard.status_signals import (
     capability_counts,
     capability_short_label,
@@ -66,13 +71,19 @@ MAX_EVIDENCE_ROWS = 400
 VISION_OVERLAY_LINE_WIDTH = 2
 VISION_OVERLAY_SELECTED_LINE_WIDTH = 4
 VISION_SELECTION_FLASH_MS = 850
+VISION_MOTION_HIGHLIGHT_MS = 1200
 VISION_CONFIDENT_THRESHOLD = 0.75
-VISION_COLOR_IDENTIFIED = "#35c759"
-VISION_COLOR_UNCERTAIN = "#ffd60a"
-VISION_COLOR_UNKNOWN = "#0a84ff"
+# Attentional overlay colors: focus, noticed/peripheral, recent motion.
+VISION_COLOR_FOCUSED = "#35c759"
+VISION_COLOR_NOTICED = "#0a84ff"
+VISION_COLOR_MOTION = "#ffd60a"
 VISION_COLOR_HAZARD = "#ff453a"
 VISION_COLOR_LOST = "#8e8e93"
 VISION_COLOR_SELECTED = "#ffffff"
+# Backward-compatible aliases for older dashboard/tests/imports.
+VISION_COLOR_IDENTIFIED = VISION_COLOR_FOCUSED
+VISION_COLOR_UNCERTAIN = VISION_COLOR_MOTION
+VISION_COLOR_UNKNOWN = VISION_COLOR_NOTICED
 LOG_TAIL_POLL_MS = 500
 LOG_TAIL_INITIAL_BYTES = 65536
 DEFAULT_SCREEN_MARGIN_PX = 20
@@ -818,10 +829,12 @@ class VisionCanvas(QWidget):
         self._show_boxes = True
         self._show_labels = True
         self._show_confidence = True
-        self._show_track_ids = False
+        self._show_track_ids = True
         self._show_motion = False
         self._highlight_track_id = ""
+        self._focus_track_id = ""
         self._highlight_generation = 0
+        self._motion_seen: dict[str, float] = {}
         self._frame_frozen = False
         self._frozen_label = ""
         self._freeze_generation = 0
@@ -851,8 +864,48 @@ class VisionCanvas(QWidget):
     def set_overlays(self, overlays: list[dict[str, Any]]) -> None:
         if self._frame_frozen:
             return
-        self._overlays = [dict(item) for item in overlays[-64:] if isinstance(item, Mapping)]
+        self._overlays = self.decorate_objects(overlays[-64:])
         self.update()
+
+    def decorate_objects(self, objects: list[dict[str, Any]] | list[Mapping[str, Any]]) -> list[dict[str, Any]]:
+        """Add UI-only attention markers without changing vision truth.
+
+        Green/blue/yellow are dashboard exposure states, not identity claims:
+        focused, noticed/peripheral, and recent motion. Uncertainty stays in
+        the reference text as a ``?`` suffix, e.g. ``vobj:07?``.
+        """
+
+        now = time.monotonic()
+        expire_after = max(0.1, VISION_MOTION_HIGHLIGHT_MS / 1000.0)
+        decorated: list[dict[str, Any]] = []
+        active_ids: set[str] = set()
+        for index, raw in enumerate(objects):
+            if not isinstance(raw, Mapping):
+                continue
+            item = dict(raw)
+            track_id = str(item.get("track_id") or item.get("object_id") or item.get("proto_id") or "").strip()
+            if track_id:
+                active_ids.add(track_id)
+                if has_visual_motion_salience(item):
+                    self._motion_seen[track_id] = now
+            last_motion = self._motion_seen.get(track_id, 0.0) if track_id else 0.0
+            motion_recent = bool(track_id and last_motion and (now - last_motion) <= expire_after)
+            focused = bool(track_id and track_id == self._focus_track_id)
+            if focused:
+                attention_state = "focused"
+            elif motion_recent:
+                attention_state = "motion"
+            else:
+                attention_state = "noticed"
+            item["_ui_attention_state"] = attention_state
+            item["_ui_motion_recent"] = motion_recent
+            item["_ui_uncertain_ref"] = visual_object_uncertain(item, confidence_threshold=VISION_CONFIDENT_THRESHOLD)
+            item["_ui_ref"] = visual_ref_text(item, fallback_index=index, confidence_threshold=VISION_CONFIDENT_THRESHOLD)
+            decorated.append(item)
+        stale_ids = [track_id for track_id, ts in self._motion_seen.items() if track_id not in active_ids or now - ts > expire_after]
+        for track_id in stale_ids:
+            self._motion_seen.pop(track_id, None)
+        return decorated
 
     def set_frozen(self, frozen: bool) -> None:
         """Freeze the currently rendered frame/overlays for visual teaching."""
@@ -899,6 +952,8 @@ class VisionCanvas(QWidget):
 
     def flash_object(self, track_id: str) -> None:
         self._highlight_track_id = str(track_id or "")
+        self._focus_track_id = self._highlight_track_id
+        self._overlays = self.decorate_objects(self._overlays)
         self._highlight_generation += 1
         generation = self._highlight_generation
         self.update()
@@ -914,30 +969,31 @@ class VisionCanvas(QWidget):
     @staticmethod
     def _state_key(item: Mapping[str, Any]) -> str:
         status = str(item.get("status") or "").strip().lower()
-        label = str(item.get("label") or "").strip().lower()
         if bool(item.get("hazard", False)) or status in {"hazard", "danger", "emergency"}:
             return "hazard"
         if status in {"lost", "missing", "stale"}:
             return "lost"
-        if status in {"unknown", "candidate", "proto"} or label in {"", "unknown", "thing", "that thing"}:
-            return "unknown"
-        try:
-            confidence = float(item.get("confidence", 0.0) or 0.0)
-        except Exception:
-            confidence = 0.0
-        return "identified" if confidence >= VISION_CONFIDENT_THRESHOLD else "uncertain"
+        attention_state = str(item.get("_ui_attention_state") or "").strip().lower()
+        if attention_state in {"focused", "focus", "selected"}:
+            return "focused"
+        if attention_state in {"motion", "moving", "changed"} or bool(item.get("_ui_motion_recent", False)):
+            return "motion"
+        return "noticed"
 
     @staticmethod
     def _state_color(item: Mapping[str, Any]) -> QColor:
         key = VisionCanvas._state_key(item)
         return QColor(
             {
-                "identified": VISION_COLOR_IDENTIFIED,
-                "uncertain": VISION_COLOR_UNCERTAIN,
-                "unknown": VISION_COLOR_UNKNOWN,
+                "focused": VISION_COLOR_FOCUSED,
+                "noticed": VISION_COLOR_NOTICED,
+                "motion": VISION_COLOR_MOTION,
+                "identified": VISION_COLOR_FOCUSED,
+                "uncertain": VISION_COLOR_NOTICED,
+                "unknown": VISION_COLOR_NOTICED,
                 "hazard": VISION_COLOR_HAZARD,
                 "lost": VISION_COLOR_LOST,
-            }.get(key, VISION_COLOR_UNKNOWN)
+            }.get(key, VISION_COLOR_NOTICED)
         )
 
     def paintEvent(self, event) -> None:  # noqa: N802
@@ -967,9 +1023,10 @@ class VisionCanvas(QWidget):
             bx, by, bw, bh = coords
             rx, ry, rw, rh = x0 + bx * sx, y0 + by * sy, bw * sx, bh * sy
             track_id = str(item.get("track_id") or item.get("object_id") or item.get("proto_id") or "")
-            selected = bool(track_id and track_id == self._highlight_track_id)
-            color = QColor(VISION_COLOR_SELECTED) if selected else self._state_color(item)
-            width = VISION_OVERLAY_SELECTED_LINE_WIDTH if selected else VISION_OVERLAY_LINE_WIDTH
+            flash_selected = bool(track_id and track_id == self._highlight_track_id)
+            focused = bool(track_id and track_id == self._focus_track_id)
+            color = self._state_color(item)
+            width = VISION_OVERLAY_SELECTED_LINE_WIDTH if (focused or flash_selected) else VISION_OVERLAY_LINE_WIDTH
             pen = QPen(color, width)
             if str(item.get("status") or "").lower() in {"lost", "missing", "searching"}:
                 pen.setStyle(Qt.DashLine)
@@ -993,6 +1050,8 @@ class VisionCanvas(QWidget):
                     painter.drawRect(int(rx), int(ry), int(rw), int(rh))
 
             parts: list[str] = []
+            if self._show_track_ids and track_id:
+                parts.append(str(item.get("_ui_ref") or visual_ref_text(item, confidence_threshold=VISION_CONFIDENT_THRESHOLD))[:24])
             if self._show_labels:
                 parts.append(str(item.get("label") or "object"))
             if self._show_confidence and item.get("confidence") is not None:
@@ -1000,8 +1059,6 @@ class VisionCanvas(QWidget):
                     parts.append(f"{float(item.get('confidence')):.2f}")
                 except Exception:
                     pass
-            if self._show_track_ids and track_id:
-                parts.append(track_id[:18])
             if parts:
                 painter.drawText(int(rx) + 3, max(14, int(ry) + 14), "  ".join(parts))
 
@@ -1028,7 +1085,7 @@ class VisionCanvas(QWidget):
 
             # Clicking an object in the left inspector produces a short, explicit
             # cue from the camera's left edge to the corresponding object.
-            if selected:
+            if flash_selected:
                 cx, cy = rx + rw / 2.0, ry + rh / 2.0
                 painter.drawLine(int(x0), int(cy), int(cx), int(cy))
 
@@ -1049,10 +1106,20 @@ class VisionInspectorWidget(QWidget):
         self.labels = QCheckBox("Labels"); self.labels.setChecked(True)
         self.confidence = QCheckBox("Confidence"); self.confidence.setChecked(True)
         self.track_ids = QCheckBox("Track IDs")
+        self.track_ids.setChecked(True)
         self.motion = QCheckBox("Motion")
         for checkbox in (self.boxes, self.labels, self.confidence, self.track_ids, self.motion):
             checkbox.toggled.connect(self._apply_options)
             layout.addWidget(checkbox)
+
+        self.legend = QLabel(
+            f'<span style="color:{VISION_COLOR_FOCUSED}">● focus</span> · '
+            f'<span style="color:{VISION_COLOR_NOTICED}">● noticed</span> · '
+            f'<span style="color:{VISION_COLOR_MOTION}">● motion</span> · ? uncertain'
+        )
+        self.legend.setTextFormat(Qt.RichText)
+        self.legend.setWordWrap(True)
+        layout.addWidget(self.legend)
 
         self.freeze = QPushButton("Freeze frame")
         self.freeze.setCheckable(True)
@@ -1095,7 +1162,7 @@ class VisionInspectorWidget(QWidget):
     def set_objects(self, objects: list[dict[str, Any]]) -> None:
         if self.frozen:
             return
-        self._objects = [dict(item) for item in objects if isinstance(item, Mapping)]
+        self._objects = self.canvas.decorate_objects([dict(item) for item in objects if isinstance(item, Mapping)])
         self.tree.clear()
         for obj in self._objects:
             label = str(obj.get("label") or "unknown")
@@ -1105,7 +1172,8 @@ class VisionInspectorWidget(QWidget):
             except Exception:
                 conf_text = "—"
             track_id = str(obj.get("track_id") or "")
-            item = QTreeWidgetItem([f"● {label}", conf_text, track_id[:16]])
+            ref_text = str(obj.get("_ui_ref") or visual_ref_text(obj, confidence_threshold=VISION_CONFIDENT_THRESHOLD))
+            item = QTreeWidgetItem([f"● {ref_text} {label}", conf_text, track_id[:16]])
             item.setData(0, Qt.UserRole, track_id)
             color = VisionCanvas._state_color(obj)
             item.setForeground(0, QBrush(color))
@@ -1118,7 +1186,16 @@ class VisionInspectorWidget(QWidget):
         if not track_id:
             return
         self.canvas.flash_object(track_id)
+        self._objects = self.canvas.decorate_objects(self._objects)
         obj = next((row for row in self._objects if str(row.get("track_id") or "") == track_id), None)
+        for row in range(self.tree.topLevelItemCount()):
+            node = self.tree.topLevelItem(row)
+            row_track = str(node.data(0, Qt.UserRole) or "")
+            row_obj = next((entry for entry in self._objects if str(entry.get("track_id") or "") == row_track), None)
+            if isinstance(row_obj, Mapping):
+                color = VisionCanvas._state_color(row_obj)
+                node.setForeground(0, QBrush(color))
+                node.setForeground(1, QBrush(color))
         if callable(self._on_attention_select):
             snapshot = dict(obj) if isinstance(obj, Mapping) else {"track_id": track_id}
             snapshot["ui_frozen"] = bool(self.frozen)
@@ -1132,7 +1209,9 @@ class VisionInspectorWidget(QWidget):
             confidence = f"{float(obj.get('confidence', 0.0) or 0.0):.2f}"
         except Exception:
             confidence = "—"
-        self.detail.setText(f"{label} · {status} · confidence {confidence}\n{track_id}")
+        ref_text = str(obj.get("_ui_ref") or visual_ref_text(obj, confidence_threshold=VISION_CONFIDENT_THRESHOLD))
+        state = str(obj.get("_ui_attention_state") or "noticed")
+        self.detail.setText(f"{ref_text} · {label} · {state} · {status} · confidence {confidence}\n{track_id}")
 
 
 class BodyMapWidget(QWidget):
