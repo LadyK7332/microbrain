@@ -26,7 +26,9 @@ EVIDENCE_NEED_PRIORITY = 0.54
 MAX_SURFACE_CHARS = 160
 MAX_TEXT_CHARS = 240
 MAX_MISSING_ITEMS = 8
-AUTO_CLARIFY_SILENT_USER_GAPS = True
+# The surface-realization path now consumes explicit obligations.  Keeping the
+# old direct-to-mouth bridge enabled would race that path and double responses.
+AUTO_CLARIFY_SILENT_USER_GAPS = False
 
 # Silence is still valid when speech would be harmful/noisy/stale.
 STALE_REPEAT_LIMIT = 2
@@ -38,7 +40,7 @@ STALE_REPEAT_LIMIT = 2
 GAP_IDENTIFIED_SCHEMA = "cognition.gap_identified.v1"
 CLARIFICATION_NEED_SCHEMA = "cognition.clarification_need.v1"
 EVIDENCE_NEED_SCHEMA = "cognition.evidence_need.v1"
-SPEECH_OBLIGATION_SCHEMA = "speech.response_obligation.v1"
+SPEECH_OBLIGATION_SCHEMA = "speech.response_obligation.v2"
 GAP_SPEECH_PAYLOAD_SCHEMA = "speech.gap_clarification.v1"
 TOKEN_RE = re.compile(r"[a-z0-9']+", re.IGNORECASE)
 
@@ -465,6 +467,7 @@ def identify_gap(
     *,
     source: Any = "",
     event_meta: Mapping[str, Any] | None = None,
+    event_correlation_id: Any = "",
     now: float | None = None,
 ) -> dict[str, Any]:
     """Build a gap frame for a stimulus, or return ``identified=False``.
@@ -485,6 +488,19 @@ def identify_gap(
     statement_kind = extract_statement_kind(payload)
     selected_action = extract_selected_action(payload, event_meta)
     response_demand = extract_response_demand(payload)
+    hypothesis_id = _clean_text(_get_path(payload, "hypothesis", "hypothesis_id", default=""), limit=96)
+    input_packet = _input_packet(payload)
+    turn_id = _clean_text(
+        input_packet.get("correlation_id") if isinstance(input_packet, Mapping) else "",
+        limit=96,
+    ) or _clean_text(event_correlation_id, limit=96)
+    visual_ref = _get_path(context, "attention", "visual_ref", default={})
+    if not isinstance(visual_ref, Mapping):
+        visual_ref = {}
+    target_ref = _clean_text(
+        visual_ref.get("track_id") or visual_ref.get("selected_track_id") or "",
+        limit=90,
+    )
     user_origin = is_user_originated_text(payload, source=source)
     paralinguistic = is_paralinguistic_signal(text, tokens)
     deliberate_silence = _bool(event_meta.get("deliberate_silence"), default=False)
@@ -558,10 +574,13 @@ def identify_gap(
         # social answer.  The gap still exists, but no question may be owed.
         silence_allowed = False
 
+    gap_scope = turn_id or f"{topic_s}:{int(now_f // 5)}"
     gap = {
         "schema": GAP_IDENTIFIED_SCHEMA,
         "identified": True,
-        "gap_id": f"gap:{_stable_id([topic_s, text, gap_kind, selected_action, now_f // 5])}",
+        "gap_id": f"gap:{_stable_id([gap_scope, text, gap_kind, selected_action])}",
+        "turn_id": turn_id,
+        "hypothesis_id": hypothesis_id,
         "created_at": now_f,
         "source_topic": topic_s,
         "source": _clean_text(source, limit=80),
@@ -585,6 +604,9 @@ def identify_gap(
             "response_demand_recommended": response_demand_recommended,
         },
         "missing": missing[:MAX_MISSING_ITEMS],
+        "target_ref": target_ref,
+        "target_surface": "that" if target_ref.lower().startswith("vobj:") else target_ref,
+        "visual_attention_ref": dict(visual_ref),
         "evidence_need": evidence_need or {"needed": False},
         "closure_options": closure_options,
         "human_uplift_gate": gate,
@@ -648,15 +670,27 @@ def build_speech_obligation(gap: Mapping[str, Any]) -> dict[str, Any] | None:
     need = build_clarification_need(gap)
     if not need:
         return None
+    turn_id = _clean_text(gap.get("turn_id"), limit=96)
+    hypothesis_id = _clean_text(gap.get("hypothesis_id"), limit=96)
+    obligation_id = f"obligation:{_stable_id([turn_id, hypothesis_id, 'clarify'])}"
     return {
         "schema": SPEECH_OBLIGATION_SCHEMA,
+        "obligation_id": obligation_id,
+        "turn_id": turn_id,
+        "hypothesis_id": hypothesis_id,
         "gap_id": gap.get("gap_id", ""),
+        "gap_kind": gap.get("gap_kind", ""),
+        "required": True,
+        "required_act": "clarify",
         "obligation_kind": "clarification_question",
         "what_to_say": "ask_missing_intent_or_desired_response",
         "how_to_say": "short_safe_clarification_surface",
         "surface_options": [need.get("question_surface", "")],
         "minimum_surface_complete": True,
         "silence_allowed": bool(gap.get("silence_allowed")),
+        "target_ref": gap.get("target_ref", ""),
+        "target_surface": gap.get("target_surface", ""),
+        "visual_attention_ref": gap.get("visual_attention_ref", {}),
         "human_uplift_gate": gap.get("human_uplift_gate", {}),
         "priority": need.get("priority", CLARIFICATION_PRIORITY),
         "reason": need.get("reason", "gap_needs_clarification"),

@@ -7,12 +7,14 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
-from microbrain.memory.mem_cell_store import MemCellStore
+from microbrain.memory.mem_cell_store import MemCellStore, mem_cell_v1_enabled
+from microbrain.memory.segmented_language_memory import SegmentedLanguageMemory
 from microbrain.orchestrator.neuron_base import BaseNeuron, Event, NeuronConfig
 from microbrain.orchestrator.orchestrator import Orchestrator
 from microbrain.utils.memdir import resolve_memdir_ctx
 
 NEURON_NAME = Path(__file__).stem
+V2_STORE_KV_KEY = "memory:v2_language_store"
 
 CONTROL_WORDS = {"IF", "USER", "THEN", "ELSE", "CLASSIFY", "REPLY", "NOT", "AND", "SUPPRESS"}
 DDNA_TARGETS = {
@@ -184,12 +186,17 @@ class SyntaxLearningNeuron(BaseNeuron):
         parsed["source_line"] = event.payload.get("source_line")
         parsed["ts"] = time.time()
 
-        store = await self._mem_cell_store(ctx)
-        if store is None:
-            return [self._status("Teaching note parsed, but mem-cell store is unavailable.", event)]
+        v2_store = await self._language_v2_store(ctx)
+        v1_store = await self._mem_cell_store(ctx) if mem_cell_v1_enabled() else None
+        if v2_store is None and v1_store is None:
+            return [self._status("Teaching note parsed, but no memory store is available.", event)]
 
         try:
-            saved = self._store_rule(store, parsed)
+            saved = 0
+            if v2_store is not None:
+                saved += int(v2_store.apply_slearn_rules([parsed]).get("saved_rows", 0) or 0)
+            if v1_store is not None:
+                saved += self._store_rule(v1_store, parsed)
             await ctx.set_kv("syntax:last_rule", parsed)
             if parsed.get("source_mode") == "slearn":
                 await self._record_slearn_apply(ctx, parsed, saved)
@@ -233,7 +240,21 @@ class SyntaxLearningNeuron(BaseNeuron):
             # audit file is locked or the memdir is temporarily unavailable.
             pass
 
+    async def _language_v2_store(self, ctx) -> Optional[SegmentedLanguageMemory]:
+        raw = await ctx.get_kv(V2_STORE_KV_KEY, None)
+        if isinstance(raw, SegmentedLanguageMemory):
+            return raw
+        try:
+            memdir = await resolve_memdir_ctx(ctx, fallback=r"Z:\memory")
+            store = SegmentedLanguageMemory(memdir)
+            await ctx.set_kv(V2_STORE_KV_KEY, store)
+            return store
+        except Exception:
+            return None
+
     async def _mem_cell_store(self, ctx) -> Optional[MemCellStore]:
+        if not mem_cell_v1_enabled():
+            return None
         raw = await ctx.get_kv("memory:mem_cell_store", None)
         if isinstance(raw, MemCellStore):
             return raw
@@ -384,24 +405,26 @@ class SyntaxLearningNeuron(BaseNeuron):
 
     def apply_slearn_batch(
         self,
-        store: MemCellStore,
+        store: MemCellStore | None,
         items: Sequence[Dict[str, Any]],
         *,
         weight: int = 3,
+        v2_store: SegmentedLanguageMemory | None = None,
     ) -> Dict[str, Any]:
         """Parse/store a SLEARN batch without emitting one event per rule.
 
-        The read sidecar runs this method in a worker thread.  Pure classifier
-        rules are built as deterministic cells and staged in one composer file;
-        reply-bearing rules keep the richer trainer-alignment path but defer its
-        flush until the end of the batch.
+        The read sidecar runs this method in a worker thread. Memory v2 owns the
+        current SLEARN shelves; mem-cell v1 is only mirrored when explicitly
+        enabled for archive comparison.
         """
         bounded_weight = max(1, min(5, int(weight or 3)))
         accepted = 0
         rejected = 0
         saved_cells = 0
         direct_cells: List[Dict[str, Any]] = []
+        parsed_rules: List[Dict[str, Any]] = []
         errors: List[str] = []
+        mirror_v1 = mem_cell_v1_enabled() and isinstance(store, MemCellStore) and not bool(getattr(store, "disabled", False))
 
         for item in items or []:
             note = str(item.get("teaching_note", "") or item.get("rule", "") or "").strip()
@@ -426,26 +449,37 @@ class SyntaxLearningNeuron(BaseNeuron):
             parsed["ts"] = time.time()
 
             try:
-                if str(parsed.get("reply_text", "") or "").strip():
-                    saved_cells += self._store_rule(store, parsed, flush=False)
-                else:
-                    direct_cells.append(self._build_rule_cell(parsed))
-                    saved_cells += 1
+                parsed_rules.append(parsed)
+                if mirror_v1:
+                    if str(parsed.get("reply_text", "") or "").strip():
+                        saved_cells += self._store_rule(store, parsed, flush=False)
+                    else:
+                        direct_cells.append(self._build_rule_cell(parsed))
+                        saved_cells += 1
                 accepted += 1
             except Exception as exc:
                 rejected += 1
                 errors.append(repr(exc))
 
-        if direct_cells:
+        if v2_store is not None and parsed_rules:
+            try:
+                v2_result = v2_store.apply_slearn_rules(parsed_rules)
+                saved_cells += int(v2_result.get("saved_rows", 0) or 0)
+            except Exception as exc:
+                errors.append(repr(exc))
+                rejected += len(parsed_rules)
+                accepted = max(0, accepted - len(parsed_rules))
+
+        if mirror_v1 and direct_cells and store is not None:
             store.stage_cells(direct_cells, tier="learned", touch=True)
-        if store.dirty_count("learned"):
+        if mirror_v1 and store is not None and store.dirty_count("learned"):
             store.flush_tier("learned")
 
         return {
             "accepted": accepted,
             "rejected": rejected,
             "saved_cells": saved_cells,
-            "staged_paths": store.take_staged_paths("learned"),
+            "staged_paths": store.take_staged_paths("learned") if mirror_v1 and store is not None else [],
             "errors": errors[:8],
         }
 

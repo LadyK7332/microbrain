@@ -6,10 +6,14 @@ import time
 from typing import Any, Dict, Iterable, List, Mapping
 
 from microbrain.hormone import derive_rosehip_state
+from microbrain.language.language_build_checker import check_language_candidate, clear_language_failures
+from microbrain.memory.answer_composer import compose_answer_from_memory
 from microbrain.memory.cross_modal_answer import gather_support, compose_answer
-from microbrain.memory.mem_cell_store import MemCellStore
+from microbrain.memory.mem_cell_store import MemCellStore, mem_cell_v1_enabled
+from microbrain.memory.memory_v2_lookup import merge_syntax_guidance, syntax_guidance_from_memory_v2
 from microbrain.orchestrator.neuron_base import BaseNeuron, Event, NeuronConfig
 from microbrain.orchestrator.orchestrator import Orchestrator
+from microbrain.response_obligation_guard import guard_native_response
 
 NEURON_NAME = Path(__file__).stem
 SLEARN_SLOT_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -519,6 +523,8 @@ class NativeResponderNeuron(BaseNeuron):
         return False
 
     async def _mem_store(self, ctx) -> MemCellStore | None:
+        if not mem_cell_v1_enabled():
+            return None
         store = await ctx.get_kv("memory:mem_cell_store", None)
         if isinstance(store, MemCellStore):
             return store
@@ -554,7 +560,9 @@ class NativeResponderNeuron(BaseNeuron):
         source = str(payload.get("source", "user") or "user")
         raw_meta = payload.get("raw_meta", {}) if isinstance(payload.get("raw_meta", {}), dict) else {}
         hypothesis = payload.get("hypothesis", {}) if isinstance(payload.get("hypothesis", {}), Mapping) else {}
+        context = payload.get("context", {}) if isinstance(payload.get("context", {}), Mapping) else {}
         selected_action = str(payload.get("selected_action", "") or raw_meta.get("selected_action", "") or hypothesis.get("recommended_action", "") or "")
+        response_obligation = payload.get("response_obligation", {}) if isinstance(payload.get("response_obligation", {}), Mapping) else {}
         transport_source = str(raw_meta.get("transport_source", source) or source)
 
         if not text:
@@ -565,7 +573,10 @@ class NativeResponderNeuron(BaseNeuron):
             return []
 
         mem_store = await self._mem_store(ctx)
-        syntax_guidance = self._syntax_guidance(mem_store, text)
+        syntax_guidance = merge_syntax_guidance(
+            await syntax_guidance_from_memory_v2(ctx, text),
+            self._syntax_guidance(mem_store, text),
+        )
         learned_direct_reply = bool(list(syntax_guidance.get("preferred_replies", []) or []))
 
         shape = await self._shape_reply(
@@ -584,6 +595,16 @@ class NativeResponderNeuron(BaseNeuron):
                 reason=str(shape.get("reason", "withhold")),
                 text_preview=text[:100],
             )
+            if response_obligation:
+                await ctx.set_kv(
+                    "response_obligation:last_unrealized",
+                    {
+                        "obligation_id": response_obligation.get("obligation_id", ""),
+                        "reason": str(shape.get("reason", "native_suppressed")),
+                        "stage": "native_shape",
+                        "ts": time.time(),
+                    },
+                )
             return []
 
         reply = await self._build_response(
@@ -594,8 +615,57 @@ class NativeResponderNeuron(BaseNeuron):
             mem_store=mem_store,
             syntax_guidance=syntax_guidance,
         )
-        if not reply:
+        build_check = await check_language_candidate(
+            ctx,
+            reply,
+            strict=bool(await ctx.get_kv("language_build:strict_native", True)),
+            source=self.name,
+            lookup_text=text,
+        )
+        if bool(build_check.get("blocked", False)):
+            await ctx.set_kv(
+                "native_responder:last_language_build_block",
+                {
+                    "ts": time.time(),
+                    "text": text,
+                    "reply": reply,
+                    "build_check": build_check,
+                },
+            )
+            if response_obligation:
+                await ctx.set_kv(
+                    "response_obligation:last_unrealized",
+                    {
+                        "obligation_id": response_obligation.get("obligation_id", ""),
+                        "reason": str(build_check.get("why", "language_build_blocked")),
+                        "stage": "language_build_check",
+                        "ts": time.time(),
+                    },
+                )
             return []
+        guarded = guard_native_response(
+            user_text=text,
+            proposed_reply=reply,
+            shape=shape,
+            payload=payload,
+            raw_meta=raw_meta,
+            syntax_guidance=syntax_guidance,
+            response_obligation=response_obligation,
+        )
+        if not guarded.text:
+            if response_obligation:
+                await ctx.set_kv(
+                    "response_obligation:last_unrealized",
+                    {
+                        "obligation_id": response_obligation.get("obligation_id", ""),
+                        "reason": guarded.reason,
+                        "stage": "native_guard",
+                        "ts": time.time(),
+                    },
+                )
+            return []
+        reply = guarded.text
+        await clear_language_failures(ctx, lookup_text=text)
 
         memory_cell_ids: List[str] = []
         answer_bundle = await ctx.get_kv("composer:last_answer_bundle", {})
@@ -603,8 +673,9 @@ class NativeResponderNeuron(BaseNeuron):
             bundle_query = str(answer_bundle.get("query_text", "") or "")
             bundle_answer = str(answer_bundle.get("answer", "") or "")
             bundle_ts = _safe_float(answer_bundle.get("ts", 0.0), 0.0)
+            effective_query_text = self._effective_question_query_text(text, context)
             if (
-                _norm(bundle_query) == _norm(text)
+                _norm(bundle_query) in {_norm(text), _norm(effective_query_text)}
                 and _norm(bundle_answer) == _norm(reply)
                 and bundle_ts > 0.0
                 and (time.time() - bundle_ts) <= 15.0
@@ -635,6 +706,8 @@ class NativeResponderNeuron(BaseNeuron):
                     "channel": channel,
                     "style": "assistant",
                     "memory_cell_ids": memory_cell_ids,
+                    "obligation_id": response_obligation.get("obligation_id", ""),
+                    "required_act": response_obligation.get("required_act", ""),
                 },
                 source=self.name,
                 correlation_id=event.correlation_id,
@@ -643,6 +716,9 @@ class NativeResponderNeuron(BaseNeuron):
                     "transport_source": transport_source,
                     "shape": shape,
                     "memory_cell_ids": memory_cell_ids,
+                    "response_obligation_guard": guarded.to_dict(),
+                    "obligation_id": response_obligation.get("obligation_id", ""),
+                    "required_act": response_obligation.get("required_act", ""),
                 },
             )
         ]
@@ -913,11 +989,16 @@ class NativeResponderNeuron(BaseNeuron):
         associations = list(context.get("associations", []) or []) if isinstance(context, Mapping) else []
         association_meta = dict(context.get("association_meta", {}) or {}) if isinstance(context, Mapping) else {}
         conversation_summary = dict(context.get("conversation_summary", {}) or {}) if isinstance(context, Mapping) and isinstance(context.get("conversation_summary", {}), Mapping) else {}
+        query_text = self._effective_question_query_text(text, context)
+        query_norm = _norm(query_text) or norm
 
         warm = _safe_float(shape.get("warm", 0.0))
         mode = str(shape.get("mode", "direct") or "direct")
         if not isinstance(syntax_guidance, Mapping):
-            syntax_guidance = self._syntax_guidance(mem_store, text)
+            syntax_guidance = merge_syntax_guidance(
+                await syntax_guidance_from_memory_v2(ctx, text),
+                self._syntax_guidance(mem_store, text),
+            )
         syntax_reply = self._preferred_rule_reply(dict(syntax_guidance), warm=warm)
         avoid_norms = {_norm(t) for t in list(syntax_guidance.get("avoid_replies", []) or []) if _norm(str(t or ""))}
 
@@ -938,9 +1019,10 @@ class NativeResponderNeuron(BaseNeuron):
                     if (
                         not candidate_norm
                         or candidate_norm == norm
+                        or candidate_norm == query_norm
                         or candidate_norm in avoid_norms
                         or _looks_stock_reply(candidate)
-                        or self._context_breaks_scene(candidate, norm, conversation_summary)
+                        or self._context_breaks_scene(candidate, query_norm, conversation_summary)
                     ):
                         continue
                     if candidate.startswith("/") or len(candidate.split()) > 18:
@@ -952,7 +1034,7 @@ class NativeResponderNeuron(BaseNeuron):
 
             if isinstance(mem_store, MemCellStore):
                 try:
-                    hits = mem_store.search_text_cells(text, limit=10)
+                    hits = mem_store.search_text_cells(query_text, limit=10)
                 except Exception:
                     hits = []
                 for hit in hits:
@@ -968,9 +1050,10 @@ class NativeResponderNeuron(BaseNeuron):
                     if (
                         not candidate_norm
                         or candidate_norm == norm
+                        or candidate_norm == query_norm
                         or candidate_norm in avoid_norms
                         or _looks_stock_reply(candidate)
-                        or self._context_breaks_scene(candidate, norm, conversation_summary)
+                        or self._context_breaks_scene(candidate, query_norm, conversation_summary)
                     ):
                         continue
                     if candidate.startswith("/") or len(candidate.split()) > 18:
@@ -1014,8 +1097,32 @@ class NativeResponderNeuron(BaseNeuron):
             return ""
 
         if text.strip().endswith("?"):
+            v2_answer = await compose_answer_from_memory(ctx, query_text)
+            if bool(v2_answer.get("ok", False)):
+                answer = str(v2_answer.get("text", "") or "").strip()
+                bundle = dict(v2_answer.get("bundle", {}) or {})
+                selected_cell_ids = [
+                    str(cell_id or "")
+                    for cell_id in list(bundle.get("selected_cell_ids", []) or [])
+                    if str(cell_id or "")
+                ]
+                await ctx.set_kv(
+                    "composer:last_answer_bundle",
+                    {
+                        "query_text": query_text,
+                        "bundle": bundle,
+                        "answer": answer,
+                        "confidence": 0.80,
+                        "meta": {"source": "memory_v2_answer", "selected_cell_ids": selected_cell_ids},
+                        "selected_cell_ids": selected_cell_ids,
+                        "ts": time.time(),
+                    },
+                )
+                if answer and not self._is_low_value_answer(answer, query_text=query_text, conversation_summary=conversation_summary):
+                    return answer
+
             bundle = gather_support(
-                query_text=text,
+                query_text=query_text,
                 mem_cell_store=mem_store if isinstance(mem_store, MemCellStore) else None,
                 power_state=power_state if isinstance(power_state, Mapping) else {},
                 needs=needs if isinstance(needs, Mapping) else {},
@@ -1031,7 +1138,7 @@ class NativeResponderNeuron(BaseNeuron):
                 await ctx.set_kv(
                     "composer:last_answer_bundle",
                     {
-                        "query_text": text,
+                        "query_text": query_text,
                         "bundle": bundle,
                         "answer": answer,
                         "confidence": confidence,
@@ -1040,11 +1147,26 @@ class NativeResponderNeuron(BaseNeuron):
                         "ts": time.time(),
                     },
                 )
-                if not self._is_low_value_answer(answer, query_text=text, conversation_summary=conversation_summary):
+                if not self._is_low_value_answer(answer, query_text=query_text, conversation_summary=conversation_summary):
                     return answer
             return best_recalled_phrase()
 
         return best_recalled_phrase()
+
+    def _effective_question_query_text(self, text: str, context: Mapping[str, Any]) -> str:
+        if not isinstance(context, Mapping):
+            return text
+        followup = context.get("followup_question", {}) if isinstance(context.get("followup_question", {}), Mapping) else {}
+        if not bool(followup.get("active")):
+            return text
+        target = str(followup.get("target_text", "") or "").strip()
+        if not target:
+            return text
+        marker = str(text or "").strip().lower()
+        target_as_question = re.sub(r"[.!?]+$", "", target).strip()
+        if marker in {"why?", "how?", "what?", "explain?", "more?"}:
+            return f"{marker} {target_as_question}".strip()
+        return f"{target_as_question}?"
 
     def _conversation_continuity_reply(self, summary: Mapping[str, Any], *, text: str, terse: float = 0.0) -> str:
         """Canned continuity speech removed; continuity stays as scene state."""

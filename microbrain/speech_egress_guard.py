@@ -24,6 +24,9 @@ from microbrain.orchestrator.neuron_base import Event
 _CONTEXT_KEY = "speech_egress:context"
 _LAST_DECISION_KEY = "speech_egress:last_decision"
 _FAULTS_KEY = "speech_egress:faults"
+_OBLIGATION_CLAIMS_KEY = "speech_egress:obligation_claims"
+_SLOT_RE = re.compile(r"\{[A-Za-z_][A-Za-z0-9_]*\}")
+_VOBJ_RE = re.compile(r"\bvobj:[a-z0-9_.:-]+\b", re.IGNORECASE)
 
 _CONNECTOR_FRAGMENTS = {
     "with",
@@ -315,6 +318,67 @@ def guard_speech_event(event: Event, store: MutableMapping[str, Any]) -> Optiona
     ctx = _context(store)
     text = _text_from_payload(event.payload)
     last_user = str(ctx.get("last_user_text", "") or "")
+    payload = event.payload if isinstance(event.payload, Mapping) else {}
+    meta = event.meta if isinstance(event.meta, Mapping) else {}
+    obligation_id = str(payload.get("obligation_id") or meta.get("obligation_id") or "").strip()
+
+    # v2 candidates carry an explicit obligation.  At this boundary we may
+    # validate, reject, and deduplicate, but never invent an answer.
+    if obligation_id or bool(meta.get("language_surface_v2", False)):
+        structural_reason = ""
+        if not text:
+            structural_reason = "empty_speech"
+        elif _SLOT_RE.search(text):
+            structural_reason = "unresolved_surface_slot"
+        elif _VOBJ_RE.search(text):
+            structural_reason = "internal_visual_handle_leak"
+        elif "??" in text:
+            structural_reason = "double_question_placeholder"
+        else:
+            classified = classify_speech_fault(text, last_user_text=last_user)
+            if classified.get("status") != "allow":
+                structural_reason = str(classified.get("reason") or "incomplete_surface")
+
+        claims = store.get(_OBLIGATION_CLAIMS_KEY)
+        claims = dict(claims) if isinstance(claims, Mapping) else {}
+        now_ts = time.time()
+        claims = {
+            str(key): dict(value)
+            for key, value in claims.items()
+            if isinstance(value, Mapping) and (now_ts - float(value.get("ts", 0.0) or 0.0)) <= 900.0
+        }
+        if len(claims) > 512:
+            claims = dict(
+                sorted(claims.items(), key=lambda item: float(item[1].get("ts", 0.0) or 0.0), reverse=True)[:512]
+            )
+        if not structural_reason and obligation_id and obligation_id in claims:
+            structural_reason = "duplicate_obligation_response"
+
+        decision_record = {
+            "ts": now_ts,
+            "source": event.source,
+            "original_text": text,
+            "last_user_text": last_user,
+            "obligation_id": obligation_id,
+            "status": "drop" if structural_reason else "allow",
+            "reason": structural_reason or "explicit_obligation_surface_complete",
+        }
+        store[_LAST_DECISION_KEY] = decision_record
+        if structural_reason:
+            faults = list(store.get(_FAULTS_KEY, []) or [])
+            faults.append(decision_record)
+            store[_FAULTS_KEY] = faults[-64:]
+            return None
+        if obligation_id:
+            claims[obligation_id] = {
+                "ts": decision_record["ts"],
+                "source": event.source,
+                "text": text,
+                "correlation_id": event.correlation_id,
+            }
+            store[_OBLIGATION_CLAIMS_KEY] = claims
+        return event
+
     decision = classify_speech_fault(text, last_user_text=last_user)
     decision_record = {
         "ts": time.time(),

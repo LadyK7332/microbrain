@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
-from typing import Iterable, Any, Dict, List
+from typing import Iterable, Any, Dict, List, Mapping
 
 from microbrain.orchestrator.neuron_base import BaseNeuron, NeuronConfig, Event
 from microbrain.orchestrator.orchestrator import Orchestrator
@@ -17,6 +18,25 @@ TRIVIAL_TOKENS = {
 }
 
 DIRECT_NAMES = {"demi", "hazard", "microbrain", "mb"}
+
+DIALOGUE_WINDOW_TURNS = 10
+FOLLOWUP_TARGET_TTL_S = 20 * 60.0
+FOLLOWUP_QUESTION_FORMS = {
+    "?",
+    "??",
+    "???",
+    "that?",
+    "this?",
+    "it?",
+    "and?",
+    "so?",
+    "why?",
+    "how?",
+    "what?",
+    "huh?",
+    "explain?",
+    "more?",
+}
 
 
 class ContextBuilderNeuron(BaseNeuron):
@@ -53,6 +73,7 @@ class ContextBuilderNeuron(BaseNeuron):
         channel = str(payload.get("channel", "default") or "default")
         raw_meta = dict(payload.get("raw_meta", {}) or {})
         visual_attention_ref = raw_meta.get("visual_attention_ref") if isinstance(raw_meta.get("visual_attention_ref"), dict) else {}
+        now = float(event.timestamp or time.time())
 
         lowered = text.lower()
         tokens = [tok for tok in lowered.replace("?", " ").replace("!", " ").replace(",", " ").replace(".", " ").split() if tok]
@@ -61,6 +82,19 @@ class ContextBuilderNeuron(BaseNeuron):
             if tok in DIRECT_NAMES or (len(tok) >= 4 and tok not in TRIVIAL_TOKENS)
         ]
         greeting_words = {"hi", "hello", "hey", "yo", "morning", "afternoon", "evening"}
+
+        conversation_scene = await ctx.get_kv("conversation:scene", {})
+        conversation_summary = await ctx.get_kv("conversation:summary", {})
+        dialogue_window = self._dialogue_window(
+            conversation_scene,
+            current_text=text,
+            correlation_id=str(event.correlation_id or ""),
+            now=now,
+        )
+        followup_question = self._resolve_followup_question(text, dialogue_window, now=now)
+        semantic_meaningful_tokens = list(meaningful_tokens)
+        if followup_question.get("active") and not semantic_meaningful_tokens:
+            semantic_meaningful_tokens = self._meaningful_tokens(str(followup_question.get("target_text", "") or ""))
 
         memory = await ctx.get_kv("memory:store", None)
         recent: List[Dict[str, Any]] = []
@@ -72,10 +106,10 @@ class ContextBuilderNeuron(BaseNeuron):
             except Exception as exc:
                 self.debug("recent_lookup_failed", error=repr(exc))
             try:
-                semantic_query = " ".join(meaningful_tokens).strip()
+                semantic_query = " ".join(semantic_meaningful_tokens).strip()
                 if semantic_query and hasattr(memory, "search_semantic"):
                     raw_assoc = list(memory.search_semantic(semantic_query, k=5) or [])
-                    associations = self._filter_associations(raw_assoc, meaningful_tokens)
+                    associations = self._filter_associations(raw_assoc, semantic_meaningful_tokens)
             except Exception as exc:
                 self.debug("semantic_lookup_failed", error=repr(exc))
 
@@ -86,8 +120,6 @@ class ContextBuilderNeuron(BaseNeuron):
         scene_expectation_delta = await ctx.get_kv("scene:expectation:last_delta", {})
         scene_expectation = await ctx.get_kv("scene:expectation:last_exp", {})
         unresolved_questions = await ctx.get_kv("question:unresolved:recent", [])
-        conversation_scene = await ctx.get_kv("conversation:scene", {})
-        conversation_summary = await ctx.get_kv("conversation:summary", {})
         affect = await ctx.get_kv("affect:last", {})
         relation = await ctx.get_kv("relation:last", {})
         goals_crisis = bool(await ctx.get_kv("goals:crisis_mode", False))
@@ -102,7 +134,10 @@ class ContextBuilderNeuron(BaseNeuron):
             "direct_address": any(tok in DIRECT_NAMES for tok in tokens),
             "well_wish": any(phrase in lowered for phrase in ("hope your", "hope you're", "doing well", "good morning", "good evening")),
             "needs_social_reply": any(phrase in lowered for phrase in ("how are you", "are you there", "respond maybe", "you there", "good morning", "good evening")),
-            "has_meaningful_tokens": bool(meaningful_tokens),
+            "has_meaningful_tokens": bool(semantic_meaningful_tokens),
+            "has_literal_meaningful_tokens": bool(meaningful_tokens),
+            "contextual_followup_question": bool(followup_question.get("active")),
+            "question_has_context_target": bool(followup_question.get("target_text")),
         }
 
         top_assoc_score = 0.0
@@ -119,16 +154,20 @@ class ContextBuilderNeuron(BaseNeuron):
                 "channel": channel,
                 "raw_meta": raw_meta,
                 "tokens": tokens,
-                "meaningful_tokens": meaningful_tokens,
+                "meaningful_tokens": semantic_meaningful_tokens,
+                "literal_meaningful_tokens": meaningful_tokens,
                 "correlation_id": event.correlation_id,
                 "timestamp": float(event.timestamp or 0.0),
             },
+            "dialogue_window": dialogue_window,
+            "followup_question": followup_question,
             "recent": recent,
             "associations": associations,
             "association_meta": {
                 "count": len(associations),
                 "top_score": top_assoc_score,
-                "query": " ".join(meaningful_tokens),
+                "query": " ".join(semantic_meaningful_tokens),
+                "literal_query": " ".join(meaningful_tokens),
             },
             "drives": {
                 "boredom": boredom,
@@ -167,7 +206,9 @@ class ContextBuilderNeuron(BaseNeuron):
             recent_n=len(recent),
             assoc_n=len(associations),
             assoc_top=round(top_assoc_score, 3),
-            meaningful_tokens=meaningful_tokens,
+            meaningful_tokens=semantic_meaningful_tokens,
+            literal_meaningful_tokens=meaningful_tokens,
+            followup_question=followup_question,
             boredom=(boredom or {}).get("level", 0.0),
             social=(social_interaction or {}).get("level", 0.0) if isinstance(social_interaction, dict) else 0.0,
             social_experiment=(social_experimentation or {}).get("pressure", 0.0) if isinstance(social_experimentation, dict) else 0.0,
@@ -233,6 +274,109 @@ class ContextBuilderNeuron(BaseNeuron):
 
         filtered.sort(key=lambda x: (float(x.get("score", 0.0) or 0.0), int(x.get("token_overlap", 0) or 0)), reverse=True)
         return filtered[:3]
+
+    def _dialogue_window(
+        self,
+        scene: Any,
+        *,
+        current_text: str,
+        correlation_id: str,
+        now: float,
+    ) -> List[Dict[str, Any]]:
+        if not isinstance(scene, Mapping):
+            return []
+        current_norm = self._normalize_text(current_text)
+        window: List[Dict[str, Any]] = []
+        for raw_turn in list(scene.get("turns", []) or []):
+            if not isinstance(raw_turn, Mapping):
+                continue
+            role = str(raw_turn.get("role", "") or "")
+            text = str(raw_turn.get("text", "") or "").strip()
+            if role not in {"user", "assistant"} or not text or text.startswith("/"):
+                continue
+            same_corr = bool(correlation_id) and str(raw_turn.get("correlation_id", "") or "") == correlation_id
+            same_text = current_norm and self._normalize_text(text) == current_norm
+            if role == "user" and (same_corr or same_text):
+                continue
+            ts = self._safe_float(raw_turn.get("ts", 0.0), 0.0)
+            if ts and now and ts > now + 5.0:
+                continue
+            window.append(
+                {
+                    "role": role,
+                    "text": text[:700],
+                    "tokens": [str(tok) for tok in list(raw_turn.get("tokens", []) or [])][:24],
+                    "correlation_id": str(raw_turn.get("correlation_id", "") or ""),
+                    "ts": ts,
+                }
+            )
+        return window[-DIALOGUE_WINDOW_TURNS:]
+
+    def _resolve_followup_question(self, text: str, dialogue_window: List[Dict[str, Any]], *, now: float) -> Dict[str, Any]:
+        if not self._is_followup_question_form(text):
+            return {
+                "active": False,
+                "resolution": "not_followup_question",
+                "window_turn_count": len(dialogue_window),
+            }
+        for distance, turn in enumerate(reversed(dialogue_window), start=1):
+            target_text = str(turn.get("text", "") or "").strip()
+            if not self._valid_followup_target(target_text):
+                continue
+            ts = self._safe_float(turn.get("ts", 0.0), 0.0)
+            if ts and now and now - ts > FOLLOWUP_TARGET_TTL_S:
+                continue
+            return {
+                "active": True,
+                "resolution": "bare_question_uses_recent_dialogue_turn",
+                "input_text": text,
+                "target_text": target_text[:700],
+                "target_role": str(turn.get("role", "") or ""),
+                "target_correlation_id": str(turn.get("correlation_id", "") or ""),
+                "target_distance": distance,
+                "window_turn_count": len(dialogue_window),
+            }
+        return {
+            "active": False,
+            "resolution": "followup_question_without_valid_target",
+            "input_text": text,
+            "window_turn_count": len(dialogue_window),
+        }
+
+    def _is_followup_question_form(self, text: str) -> bool:
+        stripped = str(text or "").strip().lower()
+        compact = "".join(stripped.split())
+        if compact and set(compact) <= {"?"}:
+            return True
+        return compact in FOLLOWUP_QUESTION_FORMS
+
+    def _valid_followup_target(self, text: str) -> bool:
+        raw = str(text or "").strip()
+        if not raw or raw.startswith("/") or set(raw) <= {"?", "!", ".", ",", ";", ":"}:
+            return False
+        return bool(self._meaningful_tokens(raw)) or len(raw) >= 12
+
+    def _meaningful_tokens(self, text: str) -> List[str]:
+        lowered = str(text or "").lower()
+        tokens = [
+            tok
+            for tok in lowered.replace("?", " ").replace("!", " ").replace(",", " ").replace(".", " ").split()
+            if tok
+        ]
+        return [
+            tok
+            for tok in tokens
+            if tok in DIRECT_NAMES or (len(tok) >= 4 and tok not in TRIVIAL_TOKENS)
+        ]
+
+    def _normalize_text(self, text: str) -> str:
+        return " ".join(str(text or "").strip().lower().split())
+
+    def _safe_float(self, value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
 
 
 

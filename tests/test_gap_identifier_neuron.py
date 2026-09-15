@@ -46,7 +46,7 @@ def _event():
 
 
 @pytest.mark.asyncio
-async def test_neuron_emits_gap_obligation_and_clarification_speech():
+async def test_neuron_emits_gap_obligation_without_bypassing_realizer():
     neuron = GapIdentifierNeuron(
         NeuronConfig(
             name="gap_identifier_neuron",
@@ -59,11 +59,10 @@ async def test_neuron_emits_gap_obligation_and_clarification_speech():
     assert "cognition/gap_identified" in topics
     assert "cognition/clarification_need" in topics
     assert "speech/response_obligation" in topics
-    assert "act/speech" in topics
-    speech = next(event for event in outputs if event.topic == "act/speech")
-    assert speech.payload["text"] == "Something catch your attention?"
-    assert speech.payload["surface_complete"] is True
-    assert speech.meta["kind"] == "gap_clarification"
+    assert "act/speech" not in topics
+    obligation = next(event for event in outputs if event.topic == "speech/response_obligation")
+    assert obligation.payload["required_act"] == "clarify"
+    assert obligation.payload["surface_options"] == ["Something catch your attention?"]
 
 
 @pytest.mark.asyncio

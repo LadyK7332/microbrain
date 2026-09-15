@@ -72,3 +72,23 @@ def test_guard_records_faults():
 def test_non_speech_passes_through():
     event = Event(topic="thought/internal", payload={"text": "with"}, source="test")
     assert guard_speech_event(event, {}) is event
+
+
+def test_explicit_obligation_drops_malformed_surface_without_repair():
+    event = Event(
+        topic="act/speech",
+        payload={"text": "What is {target}?", "obligation_id": "obligation:bad"},
+        source="test",
+    )
+    store = {}
+    assert guard_speech_event(event, store) is None
+    assert store["speech_egress:last_decision"]["reason"] == "unresolved_surface_slot"
+
+
+def test_explicit_obligation_allows_only_one_complete_response():
+    store = {}
+    first = Event(topic="act/speech", payload={"text": "I follow.", "obligation_id": "obligation:one"}, source="native")
+    second = Event(topic="act/speech", payload={"text": "Understood.", "obligation_id": "obligation:one"}, source="surface")
+    assert guard_speech_event(first, store) is first
+    assert guard_speech_event(second, store) is None
+    assert store["speech_egress:last_decision"]["reason"] == "duplicate_obligation_response"

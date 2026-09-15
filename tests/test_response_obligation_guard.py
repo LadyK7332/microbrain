@@ -91,3 +91,19 @@ def test_accepts_existing_question_handle():
     )
     assert result.action == "accept"
     assert result.text == "vobj:00007?"
+
+
+def test_explicit_obligation_defers_instead_of_inventing_repair():
+    result = guard_native_response(
+        user_text="I am halfway done.",
+        proposed_reply="with",
+        response_obligation={
+            "schema": "speech.response_obligation.v2",
+            "obligation_id": "obligation:1",
+            "required": True,
+            "required_act": "acknowledge",
+            "silence_allowed": False,
+        },
+    )
+    assert result.action == "defer"
+    assert result.text == ""

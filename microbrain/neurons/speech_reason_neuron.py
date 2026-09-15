@@ -5,7 +5,9 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
+from microbrain.language.language_build_checker import check_language_candidate, clear_language_failures
 from microbrain.memory.mem_cell_store import MemCellStore
+from microbrain.memory.memory_v2_lookup import merge_syntax_guidance, syntax_guidance_from_memory_v2
 from microbrain.memory.memory_store import MemoryStore
 from microbrain.orchestrator.neuron_base import BaseNeuron, Event, NeuronConfig
 from microbrain.orchestrator.orchestrator import Orchestrator
@@ -240,7 +242,10 @@ class SpeechReasonNeuron(BaseNeuron):
         recent = await self._recent_speech_state(ctx)
         mem_cell_store = await ctx.get_kv("memory:mem_cell_store", None)
         lookup_text = self._syntax_lookup_text(payload)
-        guidance = self._syntax_guidance(mem_cell_store if isinstance(mem_cell_store, MemCellStore) else None, lookup_text)
+        guidance = merge_syntax_guidance(
+            await syntax_guidance_from_memory_v2(ctx, lookup_text),
+            self._syntax_guidance(mem_cell_store if isinstance(mem_cell_store, MemCellStore) else None, lookup_text),
+        )
         avoid_norms = {self._norm(text) for text in list(guidance.get("avoid_replies", []) or []) if self._norm(str(text or ""))}
         need = str(payload.get("need", "") or "")
         style = str(payload.get("style", "direct_simple") or "direct_simple")
@@ -254,6 +259,20 @@ class SpeechReasonNeuron(BaseNeuron):
                 item["score"] = 0.0
                 scored.append(item)
                 continue
+            build_check = await check_language_candidate(
+                ctx,
+                str(item.get("text", "") or ""),
+                strict=bool(await ctx.get_kv("language_build:strict_speech", True)),
+                source=str(item.get("source", "") or ""),
+                lookup_text=lookup_text,
+            )
+            item["language_build_check"] = build_check
+            if bool(build_check.get("blocked", False)):
+                item["language_build_blocked"] = True
+                item["score"] = 0.0
+                scored.append(item)
+                continue
+            score += min(0.08, self._safe_float(build_check.get("score", 0.0), 0.0) * 0.08)
             penalty = self._repeat_penalty(payload, item, recent)
             if penalty > 0.0:
                 score = max(0.0, score - penalty)
@@ -485,6 +504,23 @@ class SpeechReasonNeuron(BaseNeuron):
             except Exception as exc:
                 await ctx.log_debug(f"[{self.name}] semantic candidate search failed", error=repr(exc))
 
+        v2_guidance = await syntax_guidance_from_memory_v2(ctx, self._syntax_lookup_text(payload))
+        for reply in list(v2_guidance.get("preferred_replies", []) or [])[:4]:
+            if not isinstance(reply, dict):
+                continue
+            reply_text = self._clean_text(str(reply.get("text", "") or ""))
+            if not reply_text or self._is_bad_candidate(reply_text):
+                continue
+            meta = reply.get("meta", {}) if isinstance(reply.get("meta", {}), dict) else {}
+            candidates.append({
+                "text": reply_text,
+                "source": "memory_v2_trainer",
+                "role": "assistant",
+                "score": round(0.74 + min(0.20, self._safe_float(reply.get("score", 0.0), 0.0)), 4),
+                "kind": "memory_v2_trainer_reply",
+                "meta": meta,
+            })
+
         mem_cell_store = await ctx.get_kv("memory:mem_cell_store", None)
         if isinstance(mem_cell_store, MemCellStore):
             try:
@@ -631,6 +667,7 @@ class SpeechReasonNeuron(BaseNeuron):
                 ))
             return []
 
+        await clear_language_failures(ctx, lookup_text=self._syntax_lookup_text(payload))
         await self._update_pending_request(ctx, event, chosen)
         await ctx.set_kv(
             "speech_reason:last",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import os
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
@@ -10,6 +11,13 @@ from microbrain.orchestrator.orchestrator import Orchestrator
 from microbrain.utils.memdir import resolve_memdir_ctx
 
 NEURON_NAME = Path(__file__).stem
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
 class TrainerAlignmentNeuron(BaseNeuron):
@@ -83,14 +91,22 @@ class TrainerAlignmentNeuron(BaseNeuron):
             context_query = bad_utterance or message or correction_text
 
         mem_store = await ctx.get_kv("memory:store", None)
-        mem_cell_store = await ctx.get_kv("memory:mem_cell_store", None)
-        if mem_cell_store is None:
-            try:
-                memdir = await resolve_memdir_ctx(ctx, fallback=r"Z:\memory")
-                mem_cell_store = MemCellStore(memdir)
-                await ctx.set_kv("memory:mem_cell_store", mem_cell_store)
-            except Exception:
-                mem_cell_store = None
+        legacy_trainer_memcells = bool(
+            await ctx.get_kv(
+                "memory:legacy_trainer_memcells_enabled",
+                _env_bool("MB_LEGACY_TRAINER_MEMCELLS", False),
+            )
+        )
+        mem_cell_store = None
+        if legacy_trainer_memcells:
+            mem_cell_store = await ctx.get_kv("memory:mem_cell_store", None)
+            if mem_cell_store is None:
+                try:
+                    memdir = await resolve_memdir_ctx(ctx, fallback=r"Z:\memory")
+                    mem_cell_store = MemCellStore(memdir)
+                    await ctx.set_kv("memory:mem_cell_store", mem_cell_store)
+                except Exception:
+                    mem_cell_store = None
 
         alternatives = self._split_alternatives(correction_text)
         if not alternatives:
@@ -128,7 +144,7 @@ class TrainerAlignmentNeuron(BaseNeuron):
                     pass
 
             alignment_id = ""
-            if isinstance(mem_cell_store, MemCellStore):
+            if legacy_trainer_memcells and isinstance(mem_cell_store, MemCellStore):
                 try:
                     result = mem_cell_store.ingest_trainer_alignment(
                         desired_text=desired,

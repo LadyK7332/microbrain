@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import os
 from pathlib import Path
 from typing import Iterable, Any, Dict
 
@@ -12,6 +13,13 @@ from microbrain.memory.filters import classify_event_for_memory
 
 
 NEURON_NAME = Path(__file__).stem
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
 class MemoryLoggerNeuron(BaseNeuron):
@@ -35,8 +43,14 @@ class MemoryLoggerNeuron(BaseNeuron):
         # Grab the memory objects injected by mind.py
         mem_store = await ctx.get_kv("memory:store", None)
         ejournal = await ctx.get_kv("memory:emotion_journal", None)
-        mem_cell_store = await ctx.get_kv("memory:mem_cell_store", None)
-        if mem_cell_store is None:
+        legacy_language_memcells = bool(
+            await ctx.get_kv(
+                "memory:legacy_language_memcells_enabled",
+                _env_bool("MB_LEGACY_LANGUAGE_MEMCELLS", False),
+            )
+        )
+        mem_cell_store = await ctx.get_kv("memory:mem_cell_store", None) if legacy_language_memcells else None
+        if legacy_language_memcells and mem_cell_store is None:
             try:
                 memdir = await resolve_memdir_ctx(ctx, fallback=r"Z:\memory")
                 mem_cell_store = MemCellStore(memdir)
@@ -46,7 +60,7 @@ class MemoryLoggerNeuron(BaseNeuron):
                 mem_cell_store = None
 
         # If nothing is wired, bail out quietly
-        if mem_store is None and ejournal is None and mem_cell_store is None:
+        if mem_store is None and ejournal is None and (not legacy_language_memcells or mem_cell_store is None):
             return []
 
         topic = event.topic
@@ -202,9 +216,11 @@ class MemoryLoggerNeuron(BaseNeuron):
             # Keep logging failures from killing the brain
             self.debug("mem_store_error", error=str(e))
 
-        # --- Write to mem_cell/hot -----------------------------------------------
+        # --- Legacy text -> mem_cell/hot -----------------------------------------
+        # Pass2 segmented language memory is now the default language write path.
+        # Keep this old broad memcell decomposition opt-in for rollback only.
         try:
-            if mem_cell_store is not None and role in ("user", "assistant"):
+            if legacy_language_memcells and mem_cell_store is not None and role in ("user", "assistant"):
                 cell_meta = dict(event.meta or {})
                 if topic == "percept/text" and percept_raw_meta:
                     # The normalized percept payload carries the useful semantic

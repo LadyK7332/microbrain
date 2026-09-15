@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 from microbrain.config import AppConfig
 from microbrain.memory.emotional_journal import EmotionJournal
 from microbrain.memory.memory_store import MemoryStore
-from microbrain.memory.mem_cell_store import MemCellStore
+from microbrain.memory.mem_cell_store import MemCellStore, mem_cell_v1_enabled
 from microbrain.hrm.core import HRMCore
 from microbrain.pdna.core import PDNAStore
 from microbrain.pdna.access import profile_sections_for_kv
@@ -476,6 +476,16 @@ async def main_async(cfg: AppConfig):
     orch.kv_store["memory:store"] = mem_store
 
     mem_root = cfg.memdir
+    orch.kv_store["memory:v1_memcells_enabled"] = mem_cell_v1_enabled()
+    # Memory v1 is archive-only by default.  A shared v1 memcell store is only
+    # injected for deliberate rollback or migration runs.
+    if mem_cell_v1_enabled():
+        try:
+            orch.kv_store["memory:mem_cell_store"] = MemCellStore(str(mem_root))
+        except Exception as exc:
+            logger.warning("Shared MemCellStore initialization deferred: %s", exc)
+    orch.kv_store["cfg:memdir"] = str(mem_root)
+    orch.kv_store["memdir"] = str(mem_root)
     ej_path = Path(mem_root) / "emotion_journal.jsonl"
     ejournal = EmotionJournal(str(ej_path))
     orch.kv_store["memory:emotion_journal"] = ejournal

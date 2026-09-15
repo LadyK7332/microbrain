@@ -10,7 +10,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from microbrain.memory.mem_cell_store import MemCellStore
+from microbrain.language.surface_structure_memory_v2 import structure_candidates_from_text
+from microbrain.memory.mem_cell_store import MemCellStore, mem_cell_v1_enabled
+from microbrain.memory.segmented_language_memory import SegmentedLanguageMemory
 from microbrain.neurons.syntax_learning_neuron import SyntaxLearningNeuron, strip_slearn_inline_comment
 from microbrain.orchestrator.event_bus import Event
 from microbrain.orchestrator.neuron_base import NeuronConfig
@@ -62,6 +64,9 @@ class ReadSidecar:
         self._stop = False
         self._slearn_store: MemCellStore | None = None
         self._slearn_store_job_id = ""
+        self._slearn_v2_store: SegmentedLanguageMemory | None = None
+        self._slearn_v2_store_job_id = ""
+        self._read_v2_store: SegmentedLanguageMemory | None = None
         self._slearn_seen_rule_hashes: set[str] = set()
         self._slearn_seen_job_id = ""
         self._slearn_processor = SyntaxLearningNeuron(
@@ -255,10 +260,21 @@ class ReadSidecar:
                 self.orch.kv_store["read:force_once"] = 0.0
             return
 
-        mem_cell_store = self._mem_cell_store()
-        ingested = 0
-        if mem_cell_store is not None:
-            ingested = await asyncio.to_thread(self._ingest_piece, mem_cell_store, chunk.text, path.name)
+        ingest_result = await asyncio.to_thread(self._ingest_piece, chunk.text, path.name)
+        ingested = int(ingest_result.get("count", 0) or 0)
+        for candidate in list(ingest_result.get("structure_candidates", []) or []):
+            if not isinstance(candidate, dict):
+                continue
+            await self.orch.push_event(
+                "language/structure_candidate",
+                candidate,
+                meta={
+                    "kind": "reading_surface_structure_candidate",
+                    "store_in_memory": False,
+                    "truth_status": "structure_shape_not_answer_truth",
+                },
+                source="read_sidecar",
+            )
 
         next_index = chunk.chunk_index + 1
         result = {
@@ -356,8 +372,8 @@ class ReadSidecar:
 
         # A previously blocked job can become runnable once the composer returns.
         if str(state.get("phase", "") or "") == "blocked":
-            store = self._slearn_store_for_job(job_id)
-            if store.composer_enabled and not bool(self.orch.kv_store.get("mem_cell:composer:started", False)):
+            store = self._slearn_store_for_job(job_id) if mem_cell_v1_enabled() else None
+            if store is not None and store.composer_enabled and not bool(self.orch.kv_store.get("mem_cell:composer:started", False)):
                 self.orch.kv_store["slearn:status"] = "blocked"
                 return True
             workspace = await asyncio.to_thread(
@@ -506,13 +522,15 @@ class ReadSidecar:
 
         weight = int(self.orch.kv_store.get("slearn:default_weight", 3) or 3)
         weight = max(1, min(5, weight))
-        store = self._slearn_store_for_job(job_id)
+        store = self._slearn_store_for_job(job_id) if mem_cell_v1_enabled() else None
+        v2_store = self._slearn_v2_store_for_job(job_id)
         try:
             applied = await asyncio.to_thread(
                 self._slearn_processor.apply_slearn_batch,
                 store,
                 rule_items,
                 weight=weight,
+                v2_store=v2_store,
             )
         except Exception as exc:
             await self._fail_slearn_job(path, slearn_dir, state, exc, now=now)
@@ -594,7 +612,8 @@ class ReadSidecar:
         )
         preflight = preflight_obj.to_dict()
         job_id = stable_job_id(path)
-        store = self._slearn_store_for_job(job_id)
+        store = self._slearn_store_for_job(job_id) if mem_cell_v1_enabled() else None
+        self._slearn_v2_store_for_job(job_id)
 
         state: Dict[str, Any] = {
             "schema": "slearn.job.v2",
@@ -620,7 +639,7 @@ class ReadSidecar:
             "workspace": {},
         }
 
-        if store.composer_enabled and not bool(self.orch.kv_store.get("mem_cell:composer:started", False)):
+        if store is not None and store.composer_enabled and not bool(self.orch.kv_store.get("mem_cell:composer:started", False)):
             state["phase"] = "blocked"
             state["status"] = "blocked"
             state["blocked_reason"] = "memory_composer_not_running"
@@ -705,10 +724,10 @@ class ReadSidecar:
         now: float,
     ) -> bool:
         job_id = str(state.get("job_id", "") or stable_job_id(path))
-        store = self._slearn_store_for_job(job_id)
+        store = self._slearn_store_for_job(job_id) if mem_cell_v1_enabled() else None
 
         # Sweep any deferred rows before declaring the memory desk clean.
-        if store.dirty_count("learned"):
+        if store is not None and store.dirty_count("learned"):
             await asyncio.to_thread(store.flush_tier, "learned")
             state["receipts"] = list(state.get("receipts", []) or []) + store.take_staged_paths("learned")
 
@@ -803,6 +822,8 @@ class ReadSidecar:
         # so a 50k-line lexical file does not linger in the process after commit.
         self._slearn_store = None
         self._slearn_store_job_id = ""
+        self._slearn_v2_store = None
+        self._slearn_v2_store_job_id = ""
         self._slearn_seen_rule_hashes.clear()
         self._slearn_seen_job_id = ""
         return True
@@ -826,6 +847,20 @@ class ReadSidecar:
             self._slearn_store = MemCellStore(str(self.memdir), writer_id=f"slearn-sidecar-{resolved}")
             self._slearn_store_job_id = resolved
         return self._slearn_store
+
+    def _slearn_v2_store_for_job(self, job_id: str) -> SegmentedLanguageMemory:
+        resolved = str(job_id or "slearn-job")
+        if self._slearn_v2_store is None or self._slearn_v2_store_job_id != resolved:
+            self._slearn_v2_store = SegmentedLanguageMemory(str(self.memdir))
+            self._slearn_v2_store_job_id = resolved
+            self.orch.kv_store["memory:v2_language_store"] = self._slearn_v2_store
+        return self._slearn_v2_store
+
+    def _read_language_v2_store(self) -> SegmentedLanguageMemory:
+        if self._read_v2_store is None:
+            self._read_v2_store = SegmentedLanguageMemory(str(self.memdir))
+            self.orch.kv_store["memory:v2_language_store"] = self._read_v2_store
+        return self._read_v2_store
 
     def _receipt_pending_paths(self, receipt: str) -> List[Path]:
         """Return live pending/processing paths for one composer receipt."""
@@ -1288,6 +1323,8 @@ class ReadSidecar:
         return None
 
     def _mem_cell_store(self) -> Optional[MemCellStore]:
+        if not mem_cell_v1_enabled():
+            return None
         store = self.orch.kv_store.get("memory:mem_cell_store")
         if isinstance(store, MemCellStore):
             return store
@@ -1299,56 +1336,90 @@ class ReadSidecar:
             logger.exception("Read sidecar could not initialize MemCellStore")
             return None
 
-    def _ingest_piece(self, mem_cell_store: MemCellStore, text: str, source_name: str) -> int:
+    def _ingest_piece(self, text: str, source_name: str) -> Dict[str, Any]:
         pieces = [p.strip() for p in text.split("\n\n") if p.strip()]
         if not pieces:
             pieces = [text.strip()]
         count = 0
+        structure_candidates: List[Dict[str, Any]] = []
+        mem_cell_store = self._mem_cell_store()
+        v2_store = self._read_language_v2_store()
+        v2_items: List[Dict[str, Any]] = []
         for piece in pieces[:4]:
             if len(piece) > 900:
                 piece = piece[:900].rsplit(" ", 1)[0].strip() or piece[:900]
-            result = mem_cell_store.ingest_text(
-                text=piece,
-                topic="percept/reading",
-                role="assistant",
-                transport_source="reading",
-                source=source_name,
-                meta={
+            v2_items.append({
+                "text": piece,
+                "role": "assistant",
+                "source": source_name,
+                "strength": "observed",
+                "meta": {
                     "channel": "reading",
                     "ingest_mode": "sensory",
-                    "social_pressure": False,
                     "route": "eyes",
                     "source_kind": "document",
                     "source_name": source_name,
                 },
-                tier="now",
+            })
+            result: Dict[str, Any] = {}
+            if mem_cell_store is not None:
+                result = mem_cell_store.ingest_text(
+                    text=piece,
+                    topic="percept/reading",
+                    role="assistant",
+                    transport_source="reading",
+                    source=source_name,
+                    meta={
+                        "channel": "reading",
+                        "ingest_mode": "sensory",
+                        "social_pressure": False,
+                        "route": "eyes",
+                        "source_kind": "document",
+                        "source_name": source_name,
+                    },
+                    tier="now",
+                )
+                rows = (
+                    [result.get("utterance")]
+                    + list(result.get("tokens", []))
+                    + list(result.get("patterns", []))
+                    + list(result.get("word_roles", []))
+                    + list(result.get("thought_templates", []))
+                    + list(result.get("clause_frames", []))
+                    + list(result.get("general_patterns", []))
+                    + list(result.get("linkers", []))
+                )
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    kind = str(row.get("kind", "") or "")
+                    if kind == "utterance_anchor":
+                        row["activation"] = min(float(row.get("activation", 0.14) or 0.14), 0.14)
+                        row["promotion"] = min(float(row.get("promotion", 0.0) or 0.0), 0.0)
+                        row["trust"] = min(float(row.get("trust", 0.22) or 0.22), 0.22)
+                    elif kind in {"general_pattern", "thought_template", "clause_frame", "pattern_linker"}:
+                        row["activation"] = min(float(row.get("activation", 0.28) or 0.28), 0.28)
+                        row["promotion"] = min(float(row.get("promotion", 0.02) or 0.02), 0.02)
+                        row["trust"] = min(float(row.get("trust", 0.42) or 0.42), 0.42)
+                    else:
+                        row["activation"] = min(float(row.get("activation", 0.18) or 0.18), 0.18)
+                        row["promotion"] = min(float(row.get("promotion", 0.0) or 0.0), 0.0)
+                        row["trust"] = min(float(row.get("trust", 0.30) or 0.30), 0.30)
+                    mem_cell_store.upsert_cell(row, tier=str(row.get("tier", "now") or "now"))
+            structure_candidates.extend(
+                structure_candidates_from_text(
+                    piece,
+                    source=f"reading:{source_name}",
+                    evidence_ref=str((result.get("utterance") or {}).get("id", "")),
+                    confidence=0.46,
+                )
             )
-            rows = (
-                [result.get("utterance")]
-                + list(result.get("tokens", []))
-                + list(result.get("patterns", []))
-                + list(result.get("word_roles", []))
-                + list(result.get("thought_templates", []))
-                + list(result.get("clause_frames", []))
-                + list(result.get("general_patterns", []))
-                + list(result.get("linkers", []))
-            )
-            for row in rows:
-                if not isinstance(row, dict):
-                    continue
-                kind = str(row.get("kind", "") or "")
-                if kind == "utterance_anchor":
-                    row["activation"] = min(float(row.get("activation", 0.14) or 0.14), 0.14)
-                    row["promotion"] = min(float(row.get("promotion", 0.0) or 0.0), 0.0)
-                    row["trust"] = min(float(row.get("trust", 0.22) or 0.22), 0.22)
-                elif kind in {"general_pattern", "thought_template", "clause_frame", "pattern_linker"}:
-                    row["activation"] = min(float(row.get("activation", 0.28) or 0.28), 0.28)
-                    row["promotion"] = min(float(row.get("promotion", 0.02) or 0.02), 0.02)
-                    row["trust"] = min(float(row.get("trust", 0.42) or 0.42), 0.42)
-                else:
-                    row["activation"] = min(float(row.get("activation", 0.18) or 0.18), 0.18)
-                    row["promotion"] = min(float(row.get("promotion", 0.0) or 0.0), 0.0)
-                    row["trust"] = min(float(row.get("trust", 0.30) or 0.30), 0.30)
-                mem_cell_store.upsert_cell(row, tier=str(row.get("tier", "now") or "now"))
             count += 1
-        return count
+        if v2_items:
+            v2_store.observe_text_batch(v2_items, default_role="assistant", default_source=source_name)
+        unique: Dict[str, Dict[str, Any]] = {}
+        for candidate in structure_candidates:
+            sid = str(candidate.get("structure_id") or "")
+            if sid:
+                unique[sid] = candidate
+        return {"count": count, "structure_candidates": list(unique.values())[:8]}

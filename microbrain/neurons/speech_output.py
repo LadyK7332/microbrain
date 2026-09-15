@@ -32,6 +32,30 @@ class SpeechOutputNeuron(BaseNeuron):
         self._mouth_writer: IPCFileWriter | None = None
         self._mouth_memdir: Path | None = None
 
+    def _delivered_event(self, event: Event, *, text: str, channel: str, style: str, transport: str) -> Event:
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        meta = event.meta if isinstance(event.meta, dict) else {}
+        return Event(
+            topic="speech/delivered",
+            payload={
+                "text": text,
+                "channel": channel,
+                "style": style,
+                "transport": transport,
+                "obligation_id": payload.get("obligation_id") or meta.get("obligation_id", ""),
+                "plan_id": payload.get("plan_id") or meta.get("plan_id", ""),
+                "selected_structure_id": payload.get("selected_structure_id") or meta.get("selected_structure_id", ""),
+                "required_act": payload.get("required_act") or meta.get("required_act", ""),
+            },
+            source=self.name,
+            correlation_id=event.correlation_id,
+            meta={
+                "kind": "speech_delivery_receipt",
+                "store_in_memory": False,
+                "reinforcement_eligible": True,
+            },
+        )
+
     async def _choose_transport(self, ctx, channel: str) -> list[str]:
         mode = str(await ctx.get_kv("speech:transport_mode", "auto") or "auto").lower()
         default_transport = str(await ctx.get_kv("speech:default_transport", "local") or "local").lower()
@@ -242,7 +266,7 @@ class SpeechOutputNeuron(BaseNeuron):
                             "speech:last_transport_choice",
                             {"ts": time.time(), "text": text, "channel": channel, "transport": "none"},
                         )
-                        return []
+                        return [self._delivered_event(event, text=text, channel=channel, style=style, transport="display")]
                     if transport == "ipc":
                         ok = await self._publish_ipc(ctx, event, text, channel, style, voice, rate, volume, sha_text)
                         await ctx.set_kv(
@@ -250,7 +274,7 @@ class SpeechOutputNeuron(BaseNeuron):
                             {"ts": time.time(), "text": text, "channel": channel, "transport": "ipc", "ok": bool(ok)},
                         )
                         if ok:
-                            return []
+                            return [self._delivered_event(event, text=text, channel=channel, style=style, transport="ipc")]
                         continue
                     if transport == "local":
                         ok = await self._speak_local(ctx, text, voice, rate, volume)
@@ -259,7 +283,7 @@ class SpeechOutputNeuron(BaseNeuron):
                             {"ts": time.time(), "text": text, "channel": channel, "transport": "local", "ok": bool(ok)},
                         )
                         if ok:
-                            return []
+                            return [self._delivered_event(event, text=text, channel=channel, style=style, transport="local")]
         except Exception as exc:
             try:
                 await ctx.set_kv("tts:last_error", {"ts": time.time(), "error": repr(exc), "text": text})
@@ -269,8 +293,7 @@ class SpeechOutputNeuron(BaseNeuron):
             if is_debug_enabled():
                 print(f"[SPEECH:TTS_ERROR] {exc!r}")
 
-        # This is a sink: no further events
-        return []
+        return [self._delivered_event(event, text=text, channel=channel, style=style, transport="display")]
 
 
 def build_neurons(orchestrator: Orchestrator):
@@ -283,7 +306,7 @@ def build_neurons(orchestrator: Orchestrator):
     cfg = NeuronConfig(
         name="speech_output",
         subscribed_topics=["act/speech"],
-        output_topics=[],  # terminal sink
+        output_topics=["speech/delivered"],
         priority=-10,      # usually runs after "thinking" neurons
     )
     yield SpeechOutputNeuron(cfg)

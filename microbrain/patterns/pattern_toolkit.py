@@ -233,9 +233,16 @@ class PatternToolkit:
     ) -> Dict[str, Any]:
         input_block = context.get("input", {}) if isinstance(context.get("input", {}), Mapping) else {}
         text = str(input_block.get("text", "") or "").strip()
+        followup = context.get("followup_question", {}) if isinstance(context.get("followup_question", {}), Mapping) else {}
+        followup_active = bool(followup.get("active"))
+        followup_target = str(followup.get("target_text", "") or "").strip()
+        literal_meaningful_tokens = tokenize(text, meaningful=True)
+        semantic_text = followup_target if followup_active and followup_target and not literal_meaningful_tokens else text
         normalized = normalize_text(text)
         tokens = tokenize(text)
-        meaningful_tokens = tokenize(text, meaningful=True)
+        meaningful_tokens = tokenize(semantic_text, meaningful=True)
+        if not meaningful_tokens:
+            meaningful_tokens = literal_meaningful_tokens
         cues = context.get("cues", {}) if isinstance(context.get("cues", {}), Mapping) else {}
         scene = context.get("conversation_scene", {}) if isinstance(context.get("conversation_scene", {}), Mapping) else {}
         summary = context.get("conversation_summary", {}) if isinstance(context.get("conversation_summary", {}), Mapping) else {}
@@ -339,13 +346,30 @@ class PatternToolkit:
                     {"risk_terms": self._risk_terms(meaningful_tokens)},
                 )
             )
+        if followup_active and followup_target:
+            patterns.append(
+                self._pattern(
+                    "contextual_followup_question",
+                    0.88,
+                    ["bare_question_marker", "resolved_recent_dialogue_target"],
+                    {
+                        "target_role": str(followup.get("target_role", "") or ""),
+                        "target_distance": int(followup.get("target_distance", 0) or 0),
+                    },
+                )
+            )
 
         return {
             "schema_ver": "pattern.analysis.v1",
             "text": text,
+            "semantic_text": semantic_text,
             "normalized": normalized,
             "tokens": tokens[:48],
             "meaningful_tokens": meaningful_tokens[:24],
+            "literal_meaningful_tokens": literal_meaningful_tokens[:24],
+            "contextual_followup": followup_active,
+            "question_target_text": followup_target[:700] if followup_active else "",
+            "question_target_role": str(followup.get("target_role", "") or "") if followup_active else "",
             "statement_kind": kind,
             "statement_kind_confidence": round(kind_confidence, 4),
             "continuity": round(continuity, 4),

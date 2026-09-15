@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping
 
+from microbrain.language.response_obligation import build_response_obligation
 from microbrain.orchestrator.neuron_base import BaseNeuron, Event, NeuronConfig
 from microbrain.orchestrator.orchestrator import Orchestrator
 
@@ -86,6 +87,7 @@ NEURON_NAME = Path(__file__).stem
 HYPOTHESIS_READY_TOPIC = "hypothesis/ready"
 HYPOTHESIS_ACTION_COMMITTED_TOPIC = "hypothesis/action_committed"
 RELEASE_REQUEST_TOPIC = "release/request"
+RESPONSE_OBLIGATION_TOPIC = "speech/response_obligation"
 ACTION_COMMITTED_KIND = "hypothesis.action_committed"
 
 _SOCIAL_STATEMENT_KINDS = {"agreement", "greeting", "personal_state", "status_update", "closure"}
@@ -339,18 +341,43 @@ class DesireTriggerNeuron(BaseNeuron):
         if not should_release:
             return [action_event]
 
-        return [
-            action_event,
+        obligation = build_response_obligation(
+            context=context,
+            hypothesis=hypothesis,
+            trigger=trigger,
+            correlation_id=event.correlation_id,
+        )
+        release_payload = {
+            "context": dict(context),
+            "hypothesis": dict(hypothesis),
+            "trigger": trigger,
+            "source": source,
+            "channel": channel,
+            "raw_meta": raw_meta,
+            "response_obligation": dict(obligation or {}),
+        }
+
+        outputs = [action_event]
+        if obligation:
+            outputs.append(
+                Event(
+                    topic=RESPONSE_OBLIGATION_TOPIC,
+                    payload=obligation,
+                    source=self.name,
+                    correlation_id=event.correlation_id,
+                    meta={
+                        "kind": "released_response_obligation",
+                        "obligation_id": obligation.get("obligation_id", ""),
+                        "required_act": obligation.get("required_act", ""),
+                        "store_in_memory": False,
+                        "ephemeral": True,
+                    },
+                )
+            )
+        outputs.append(
             Event(
                 topic=RELEASE_REQUEST_TOPIC,
-                payload={
-                    "context": dict(context),
-                    "hypothesis": dict(hypothesis),
-                    "trigger": trigger,
-                    "source": source,
-                    "channel": channel,
-                    "raw_meta": raw_meta,
-                },
+                payload=release_payload,
                 source=self.name,
                 correlation_id=event.correlation_id,
                 meta={
@@ -358,9 +385,11 @@ class DesireTriggerNeuron(BaseNeuron):
                     "stage": "triggered",
                     "kind": trigger["kind"],
                     "hypothesis_id": trigger["hypothesis_id"],
+                    "obligation_id": (obligation or {}).get("obligation_id", ""),
                 },
             )
-        ]
+        )
+        return outputs
 
     def _classify_trigger(self, *, statement_kind: str, recommended_action: str, crisis_mode: bool) -> str:
         if crisis_mode:
@@ -374,7 +403,7 @@ def build_neurons(orchestrator: Orchestrator):
     cfg = NeuronConfig(
         name=NEURON_NAME,
         subscribed_topics=[HYPOTHESIS_READY_TOPIC],
-        output_topics=[HYPOTHESIS_ACTION_COMMITTED_TOPIC, RELEASE_REQUEST_TOPIC],
+        output_topics=[HYPOTHESIS_ACTION_COMMITTED_TOPIC, RESPONSE_OBLIGATION_TOPIC, RELEASE_REQUEST_TOPIC],
         priority=12,
     )
     yield DesireTriggerNeuron(cfg)

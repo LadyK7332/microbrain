@@ -4,6 +4,8 @@ import asyncio
 from pathlib import Path
 
 from microbrain.memory.mem_cell_store import MemCellStore
+from microbrain.memory.memory_v2_lookup import MemoryV2Lookup
+from microbrain.memory.segmented_language_memory import SegmentedLanguageMemory
 from microbrain.neurons.syntax_learning_neuron import SyntaxLearningNeuron
 from microbrain.orchestrator.neuron_base import NeuronConfig
 from microbrain.orchestrator.orchestrator import Orchestrator
@@ -52,7 +54,7 @@ def test_streaming_line_batch_resumes_from_byte_cursor(tmp_path: Path):
 
 def test_bulk_rule_batch_stages_one_file_and_uses_stable_rule_ids(tmp_path: Path):
     memdir = tmp_path / "mem"
-    store = MemCellStore(memdir, composer_enabled=True, writer_id="bucket-test")
+    v2_store = SegmentedLanguageMemory(memdir)
     processor = _processor()
     items = [
         {
@@ -64,12 +66,11 @@ def test_bulk_rule_batch_stages_one_file_and_uses_stable_rule_ids(tmp_path: Path
         for i in range(32)
     ]
 
-    result = processor.apply_slearn_batch(store, items, weight=3)
+    result = processor.apply_slearn_batch(None, items, weight=3, v2_store=v2_store)
     assert result["accepted"] == 32
     assert result["rejected"] == 0
-    assert len(result["staged_paths"]) == 1
-    # Pure classifier bulk staging should not need to load the canonical tier.
-    assert "learned" not in store._tier_loaded
+    assert result["staged_paths"] == []
+    assert (memdir / "memory_v2" / "pattern_memory" / "slearn_rules.jsonl").exists()
 
     # Restart-stable identity: the exact rule gets the same cell id even though
     # source line/time metadata differ.
@@ -129,17 +130,16 @@ def test_read_sidecar_bucket_path_does_not_emit_one_control_event_per_rule(tmp_p
         topics: list[str] = []
         while not orch.event_queue.empty():
             topics.append(orch.event_queue.get_nowait().topic)
-        return topics
+        return topics, memdir
 
-    topics = asyncio.run(run())
+    topics, memdir = asyncio.run(run())
     assert "slearn/preflight" in topics
     assert "slearn/progress" in topics
     assert "control/slearn" not in topics
+    assert (memdir / "memory_v2" / "pattern_memory" / "slearn_rules.jsonl").exists()
 
 
-def test_bucket_job_waits_for_durable_composer_commit_before_completion(tmp_path: Path):
-    from microbrain.memory.mem_cell_composer import MemCellComposer
-
+def test_bucket_job_completes_without_v1_composer_when_memory_v2_is_default(tmp_path: Path):
     async def run() -> tuple[bool, list[str], dict]:
         memdir = tmp_path / "mem"
         slearn_dir = memdir / "slearn_dir"
@@ -166,12 +166,7 @@ def test_bucket_job_waits_for_durable_composer_commit_before_completion(tmp_path
         sidecar = ReadSidecar(orch, memdir=str(memdir))
 
         await sidecar._run_slearn_once()  # preflight
-        await sidecar._run_slearn_once()  # stage + EOF, must wait for receipt
-        assert sheet.exists()
-        assert orch.kv_store.get("slearn:status") == "waiting_commit"
-
-        MemCellComposer(memdir).compose_once()
-        await sidecar._run_slearn_once()  # commit observed -> cleanup + move + completion
+        await sidecar._run_slearn_once()  # v2 writes directly and can complete at EOF
 
         topics: list[str] = []
         while not orch.event_queue.empty():
@@ -188,7 +183,10 @@ def test_bucket_job_waits_for_durable_composer_commit_before_completion(tmp_path
 
 
 def test_slearn_crash_recovery_detaches_foreign_and_prior_attempt_receipts(tmp_path: Path):
+    import os
+
     async def run() -> tuple[dict, str, str, list[str]]:
+        os.environ["MB_ENABLE_MEM_CELL_V1"] = "1"
         memdir = tmp_path / "mem"
         slearn_dir = memdir / "slearn_dir"
         slearn_dir.mkdir(parents=True)
@@ -255,7 +253,10 @@ def test_slearn_crash_recovery_detaches_foreign_and_prior_attempt_receipts(tmp_p
             topics.append(orch.event_queue.get_nowait().topic)
         return recovered, foreign_receipt, old_attempt_receipt, topics
 
-    state, foreign_receipt, old_attempt_receipt, topics = asyncio.run(run())
+    try:
+        state, foreign_receipt, old_attempt_receipt, topics = asyncio.run(run())
+    finally:
+        os.environ.pop("MB_ENABLE_MEM_CELL_V1", None)
     receipts = list(state.get("receipts", []) or [])
     assert foreign_receipt not in receipts
     assert old_attempt_receipt not in receipts

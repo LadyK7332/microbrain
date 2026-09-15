@@ -43,6 +43,7 @@ class GapIdentifierNeuron(BaseNeuron):
             event.payload,
             source=event.source,
             event_meta=event.meta,
+            event_correlation_id=event.correlation_id,
             now=event.timestamp,
         )
         if not gap.get("identified"):
@@ -117,10 +118,9 @@ class GapIdentifierNeuron(BaseNeuron):
                 )
             )
 
-        # Operational bridge: current mouth pipeline may not consume
-        # speech/response_obligation yet.  For safe user-originated ambiguity,
-        # emit a tiny clarification surface directly to act/speech so the gap is
-        # actually asked instead of recorded and ignored.
+        # Legacy bridge retained behind an OFF-by-default compatibility flag.
+        # The language surface realizer now owns this route so one obligation
+        # cannot race two independent mouth events.
         speech_payload = build_gap_speech_payload(gap) if AUTO_CLARIFY_SILENT_USER_GAPS else None
         if speech_payload:
             outputs.append(

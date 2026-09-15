@@ -60,6 +60,13 @@ _PROCESS_SHARD_LOCKS: Dict[str, threading.RLock] = {}
 _PROCESS_SHARD_LOCKS_GUARD = threading.Lock()
 
 
+def mem_cell_v1_enabled() -> bool:
+    """Archived v1 memcells are off unless explicitly re-enabled."""
+
+    raw = os.getenv("MB_ENABLE_MEM_CELL_V1", os.getenv("MB_MEMORY_V1_ENABLED", "0"))
+    return str(raw or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 DEIXIS_TOKENS = {"this", "that", "these", "those"}
 DETERMINERS = {"a", "an", "the", "another", "other"} | DEIXIS_TOKENS
 COPULA_TOKENS = {"is", "are", "was", "were", "be"}
@@ -108,6 +115,7 @@ class MemCellStore:
             raw_mode = os.getenv("MB_MEM_CELL_COMPOSER", "1").strip().lower()
             composer_enabled = raw_mode not in {"0", "false", "no", "off", "direct"}
         self.composer_enabled = bool(composer_enabled)
+        self.disabled = not mem_cell_v1_enabled()
         self.writer_id = str(writer_id or f"pid{os.getpid()}-thr{threading.get_ident()}-{uuid.uuid4().hex[:8]}")
         self.mem_cell_dir = self.base_dir / "mem_cell"
         self.derived_dir = self.base_dir / "mem_cell_derived"
@@ -120,6 +128,10 @@ class MemCellStore:
         self._dirty_tier_rows: Dict[str, Dict[str, Dict[str, Any]]] = {}
         self._dirty_seq: int = 0
         self._last_staged_paths: Dict[str, List[str]] = {}
+        self._tier_load_audit: Dict[str, Dict[str, Any]] = {}
+        self._last_search_audit: Dict[str, Any] = {}
+        if self.disabled:
+            return
         for tier in TIERS:
             (self.mem_cell_dir / tier).mkdir(parents=True, exist_ok=True)
         self.derived_dir.mkdir(parents=True, exist_ok=True)
@@ -287,6 +299,8 @@ class MemCellStore:
         merely to enqueue deterministic cells.  Direct-memory mode still applies
         the same rows and performs one final tier flush.
         """
+        if self.disabled:
+            return 0
         tier = self._coerce_tier(tier)
         clean_rows = [dict(row) for row in (rows or []) if isinstance(row, dict)]
         if not clean_rows:
@@ -352,6 +366,8 @@ class MemCellStore:
 
     def find_cell(self, cell_id: str, *, tier_hint: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """Return a copy of a cell plus its resolved tier without mutating it."""
+        if self.disabled:
+            return None
         target = str(cell_id or "").strip()
         if not target:
             return None
@@ -390,6 +406,8 @@ class MemCellStore:
         own atomically rewritten shard because the current composer owns only the
         four canonical tiers.
         """
+        if self.disabled:
+            return 0
         grouped: Dict[str, List[Dict[str, Any]]] = {tier: [] for tier in TIERS}
         derived: List[Dict[str, Any]] = []
         for raw in updates or []:
@@ -657,10 +675,24 @@ class MemCellStore:
             except Exception:
                 continue
 
-    def _load_tier_rows(self, tier: str) -> List[Dict[str, Any]]:
+    def _load_tier_rows(self, tier: str, *, reason: str = "tier_access") -> List[Dict[str, Any]]:
         tier = self._coerce_tier(tier)
+        if self.disabled:
+            self._tier_load_audit[tier] = {
+                "schema": "memory.mem_cell_tier_load.v1",
+                "tier": tier,
+                "source": "MemCellStore._load_tier_rows",
+                "load_reason": str(reason or "tier_access"),
+                "disabled": True,
+                "rows_loaded": 0,
+                "ts": time.time(),
+            }
+            return []
         with self._tier_lock(tier):
             if tier in self._tier_loaded:
+                audit = self._tier_load_audit.setdefault(tier, {})
+                audit["last_access_reason"] = str(reason or "tier_access")
+                audit["last_access_ts"] = time.time()
                 return self._tier_rows.setdefault(tier, [])
 
             path = self._shard_path(tier)
@@ -685,6 +717,19 @@ class MemCellStore:
             self._tier_rows[tier] = rows
             self._rebuild_tier_index(tier)
             self._tier_loaded.add(tier)
+            self._tier_load_audit[tier] = {
+                "schema": "memory.mem_cell_tier_load.v1",
+                "tier": tier,
+                "source": "MemCellStore._load_tier_rows",
+                "load_reason": str(reason or "tier_access"),
+                "canonical_path": str(path),
+                "canonical_rows_read": canonical_count,
+                "legacy_shard_count": len(legacy_paths),
+                "rows_loaded": len(rows),
+                "rows_compacted": max(0, canonical_count - len(rows)),
+                "text_bytes_est": self._rows_text_bytes(rows),
+                "ts": time.time(),
+            }
 
             # If direct writer mode is active, collapse legacy daily shards into
             # the canonical file.  In composer mode, readers/writers never rewrite
@@ -700,7 +745,72 @@ class MemCellStore:
     def _read_shard(self, tier: str) -> List[Dict[str, Any]]:
         return [dict(row) for row in self._load_tier_rows(tier)]
 
+    @staticmethod
+    def _rows_text_bytes(rows: Sequence[Mapping[str, Any]]) -> int:
+        total = 0
+        for row in rows or []:
+            if not isinstance(row, Mapping):
+                continue
+            anchor = row.get("anchor", {}) if isinstance(row.get("anchor", {}), Mapping) else {}
+            pieces = [row.get("text", ""), anchor.get("ref", "")]
+            refs = row.get("refs", []) if isinstance(row.get("refs", []), list) else []
+            for ref in refs:
+                if isinstance(ref, Mapping):
+                    pieces.append(ref.get("value", ""))
+            total += len(" ".join(str(piece or "") for piece in pieces).encode("utf-8", errors="ignore"))
+        return total
+
+    def memory_load_summary(self) -> Dict[str, Any]:
+        """Return RAM-only mem-cell load/search state for dashboard inspection."""
+
+        loaded = {
+            tier: {
+                "rows_loaded": len(self._tier_rows.get(tier, []) or []),
+                "audit": dict(self._tier_load_audit.get(tier, {}) or {}),
+            }
+            for tier in TIERS
+            if tier in self._tier_loaded
+        }
+        return {
+            "schema": "memory.mem_cell_load_summary.v1",
+            "source": "MemCellStore.memory_load_summary",
+            "memdir": str(self.base_dir),
+            "composer_enabled": bool(self.composer_enabled),
+            "disabled": bool(self.disabled),
+            "writer_id": self.writer_id,
+            "available_tiers": list(TIERS),
+            "loaded_tiers": loaded,
+            "unloaded_tiers": [tier for tier in TIERS if tier not in self._tier_loaded],
+            "loaded_row_total": sum(len(self._tier_rows.get(tier, []) or []) for tier in self._tier_loaded),
+            "last_search": dict(self._last_search_audit or {}),
+            "observed_ts": time.time(),
+        }
+
+    def _lookup_unload_enabled(self) -> bool:
+        raw = os.getenv("MB_MEM_CELL_KEEP_LOOKUP_CACHE", "").strip().lower()
+        return raw not in {"1", "true", "yes", "on"}
+
+    def _unload_tier_rows(self, tiers: Sequence[str], *, reason: str = "lookup_done") -> None:
+        """Release canonical tier rows held only for a bounded lookup."""
+
+        if not self._lookup_unload_enabled():
+            return
+        for raw_tier in tiers:
+            tier = self._coerce_tier(raw_tier)
+            with self._tier_lock(tier):
+                if self._dirty_tier_rows.get(tier):
+                    continue
+                self._tier_rows.pop(tier, None)
+                self._tier_index.pop(tier, None)
+                self._tier_loaded.discard(tier)
+                audit = self._tier_load_audit.setdefault(tier, {})
+                audit["unloaded_after_lookup"] = True
+                audit["unload_reason"] = str(reason or "lookup_done")
+                audit["unload_ts"] = time.time()
+
     def _write_shard(self, tier: str, rows: List[Dict[str, Any]]) -> None:
+        if self.disabled:
+            return
         tier = self._coerce_tier(tier)
         path = self._shard_path(tier)
         with self._tier_lock(tier):
@@ -730,6 +840,8 @@ class MemCellStore:
                     self._stores[tier] = JSONLStore(str(path))
 
     def flush_tier(self, tier: str) -> None:
+        if self.disabled:
+            return
         tier = self._coerce_tier(tier)
         with self._tier_lock(tier):
             if self.composer_enabled and tier != "hot":
@@ -742,6 +854,8 @@ class MemCellStore:
         return self.derived_dir / shard
 
     def _read_derived_rows(self) -> List[Dict[str, Any]]:
+        if self.disabled:
+            return []
         path = self._derived_path()
         if not path.exists():
             return []
@@ -751,6 +865,8 @@ class MemCellStore:
             return []
 
     def _write_rows_to_path(self, path: Path, rows: Sequence[Dict[str, Any]]) -> None:
+        if self.disabled:
+            return
         path.parent.mkdir(parents=True, exist_ok=True)
         with self._process_shard_lock(path):
             tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}.tmp")
@@ -773,6 +889,8 @@ class MemCellStore:
         self._write_rows_to_path(self._derived_path(), rows)
 
     def _iter_derived_rows(self) -> Iterable[Dict[str, Any]]:
+        if self.disabled:
+            return []
         if not self.derived_dir.exists():
             return []
         rows: List[Dict[str, Any]] = []
@@ -811,6 +929,10 @@ class MemCellStore:
         flush: bool = True,
     ) -> Dict[str, Any]:
         row = dict(cell or {})
+        if self.disabled:
+            row.setdefault("tier", tier)
+            row.setdefault("schema", "mem_cell.v1.disabled")
+            return row
         tier = self._coerce_tier(str(tier or row.get("tier", "now") or "now"))
         with self._tier_lock(tier):
             row.setdefault("tier", tier)
@@ -2206,6 +2328,8 @@ class MemCellStore:
         tier: str = "learned",
         flush: bool = True,
     ) -> Dict[str, Any]:
+        if self.disabled:
+            return {}
         desired_clean = str(desired_text or "").strip()
         context_clean = str(context_query or "").strip()
         if not desired_clean or not context_clean:
@@ -2294,6 +2418,8 @@ class MemCellStore:
         tier: str = 'now',
         flush: bool = True,
     ) -> Dict[str, Any]:
+        if self.disabled:
+            return {}
         utterance = self.make_text_cell(
             text=text, topic=topic, role=role, transport_source=transport_source, source=source, meta=meta, tier=tier
         )
@@ -2532,6 +2658,8 @@ class MemCellStore:
         window.  This prevents a single old-but-idle row from graduating merely
         because wall-clock time passed.
         """
+        if self.disabled:
+            return {"probed": 0, "promoted": 0, "expired": 0, "kept": 0}
         now_value = float(time.time() if now_ts is None else now_ts)
         ttl_s = max(1.0, float(hot_ttl_hours) * 3600.0)
         hold_s = max(0.0, float(now_hold_hours) * 3600.0)
@@ -2590,6 +2718,8 @@ class MemCellStore:
         *,
         retention_hours: Optional[Dict[str, float]] = None,
     ) -> Dict[str, int]:
+        if self.disabled:
+            return {"probed": 0, "promoted": 0, "pruned": 0, "kept": 0}
         retention = {
             "hot": HOT_MEMORY_TTL_HOURS,
             "now": 36.0,
@@ -2684,6 +2814,8 @@ class MemCellStore:
         It now stages an additive update so concurrent usage increments cannot
         overwrite one another.  The returned row is the pre-compose snapshot.
         """
+        if self.disabled:
+            return None
         target = str(cell_id or "").strip()
         if not target:
             return None
@@ -2726,6 +2858,8 @@ class MemCellStore:
         min_support_count: int = 2,
         min_encounter_sum: int = 3,
     ) -> Dict[str, int]:
+        if self.disabled:
+            return {"probed": 0, "written": 0}
         prior_rows = [row for row in self._iter_derived_rows() if isinstance(row, dict)]
         prior_by_id = {str(row.get("id", "") or ""): dict(row) for row in prior_rows if str(row.get("id", "") or "")}
         groups: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
@@ -2868,6 +3002,8 @@ class MemCellStore:
         retention_hours: float = 336.0,
         max_rows: int = 512,
     ) -> Dict[str, int]:
+        if self.disabled:
+            return {"probed": 0, "pruned": 0, "kept": 0}
         source_rows = [dict(r) for r in (rows if rows is not None else self._iter_derived_rows()) if isinstance(r, dict)]
         now_ts = time.time()
         best_by_norm: Dict[str, Dict[str, Any]] = {}
@@ -2898,9 +3034,42 @@ class MemCellStore:
         self._write_derived_rows(kept)
         return {"probed": len(source_rows), "pruned": pruned, "kept": len(kept)}
 
-    def _iter_rows(self, tier: str) -> Iterable[Dict[str, Any]]:
+    def _iter_rows(self, tier: str, *, reason: str = "iter_rows") -> Iterable[Dict[str, Any]]:
         tier = self._coerce_tier(tier)
-        return [dict(row) for row in self._load_tier_rows(tier)]
+        return [dict(row) for row in self._load_tier_rows(tier, reason=reason)]
+
+    def find_cells_by_kind(
+        self,
+        kind: str,
+        *,
+        limit: int = 256,
+        tiers: Sequence[str] = ("learned", "long", "hot", "now", "short"),
+    ) -> List[Dict[str, Any]]:
+        """Return a bounded snapshot of cells with an exact semantic kind."""
+
+        if self.disabled:
+            return []
+        wanted = str(kind or "").strip()
+        if not wanted or limit <= 0:
+            return []
+        rows: List[Dict[str, Any]] = []
+        searched_tiers = [self._coerce_tier(tier) for tier in tiers]
+        try:
+            for tier in searched_tiers:
+                for row in self._iter_rows(tier, reason=f"find_cells_by_kind:{wanted[:80]}"):
+                    if str(row.get("kind", "") or "") != wanted:
+                        continue
+                    rows.append(dict(row))
+            rows.sort(
+                key=lambda row: (
+                    float(row.get("usage_count", 0) or 0),
+                    float(row.get("last_used_ts", row.get("last_seen", row.get("ts", 0.0))) or 0.0),
+                ),
+                reverse=True,
+            )
+            return rows[: int(limit)]
+        finally:
+            self._unload_tier_rows(searched_tiers, reason=f"find_cells_by_kind:{wanted[:80]}")
 
     def search_text_cells(
         self,
@@ -2909,6 +3078,8 @@ class MemCellStore:
         limit: int = 8,
         tiers: Sequence[str] = ("learned", "long", "hot", "now", "short"),
     ) -> List[Dict[str, Any]]:
+        if self.disabled:
+            return []
         q = str(query_text or '').strip()
         if not q:
             return []
@@ -2920,9 +3091,10 @@ class MemCellStore:
         tier_bias = {"derived": 1.16, "learned": 1.08, "long": 1.0, "hot": 0.96, "now": 0.88, "short": 0.74}
         hits: List[Dict[str, Any]] = []
         now_ts = time.time()
+        searched_tiers = [self._coerce_tier(tier) for tier in tiers]
 
-        for tier in tiers:
-            for row in self._iter_rows(tier):
+        for tier in searched_tiers:
+            for row in self._iter_rows(tier, reason=f"search_text_cells:{q[:80]}"):
                 if not isinstance(row, dict):
                     continue
                 anchor = row.get('anchor', {}) if isinstance(row.get('anchor', {}), dict) else {}
@@ -3077,4 +3249,26 @@ class MemCellStore:
             })
 
         hits.sort(key=lambda h: float(h.get('score', 0.0)), reverse=True)
-        return hits[:max(1, int(limit))]
+        found = hits[:max(1, int(limit))]
+        self._last_search_audit = {
+            "schema": "memory.mem_cell_search_audit.v1",
+            "source": "MemCellStore.search_text_cells",
+            "query_text": q[:160],
+            "searched_tiers": searched_tiers,
+            "limit": int(limit),
+            "hits_returned": len(found),
+            "top_hits": [
+                {
+                    "cell_id": str(hit.get("cell_id", "") or ""),
+                    "kind": str(hit.get("kind", "") or ""),
+                    "tier": str(hit.get("tier", "") or ""),
+                    "score": float(hit.get("score", 0.0) or 0.0),
+                    "anchor_text": str(hit.get("anchor_text", "") or "")[:120],
+                }
+                for hit in found[:5]
+                if isinstance(hit, Mapping)
+            ],
+            "ts": time.time(),
+        }
+        self._unload_tier_rows(searched_tiers, reason=f"search_text_cells:{q[:80]}")
+        return found

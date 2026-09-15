@@ -9,6 +9,7 @@ from .event_bus import EventBus
 from .neuron_base import BaseNeuron, Event
 from microbrain.core.attention_controller import AttentionController
 from microbrain.policy.policy_engine import PolicyEngine
+from microbrain.speech_egress_guard import guard_speech_event, observe_speech_context
 from microbrain.utils.heartbeat_stream import (
     canonicalize_event_in_place,
     is_infrastructure_event,
@@ -138,6 +139,8 @@ class Orchestrator:
         if not isinstance(event, Event):
             return
         canonicalize_event_in_place(event)
+        if event.topic != "act/speech":
+            observe_speech_context(event, self.kv_store)
         if is_infrastructure_event(event):
             self.body_event_queue.put_nowait(event)
         else:
@@ -308,6 +311,16 @@ class Orchestrator:
                                 )
                             )
                         continue
+
+                    # Final structural review and obligation dedupe occur only
+                    # after policy has allowed the candidate.  A vetoed first
+                    # candidate therefore cannot consume the obligation and
+                    # suppress a later valid fallback.
+                    if event.topic == "act/speech":
+                        event = guard_speech_event(event, self.kv_store)
+                        if event is None:
+                            continue
+                        observe_speech_context(event, self.kv_store)
 
                     for produced in await self.bus.dispatch(event):
                         self._queue_event(produced)

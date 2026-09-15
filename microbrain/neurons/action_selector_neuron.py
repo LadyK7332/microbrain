@@ -45,6 +45,7 @@ class ActionSelectorNeuron(BaseNeuron):
         constraints = context.get("constraints", {}) if isinstance(context.get("constraints", {}), Mapping) else {}
         pattern = hypothesis.get("pattern_analysis", {}) if isinstance(hypothesis.get("pattern_analysis", {}), Mapping) else {}
         memory_check = hypothesis.get("memory_check", {}) if isinstance(hypothesis.get("memory_check", {}), Mapping) else {}
+        response_obligation = payload.get("response_obligation", {}) if isinstance(payload.get("response_obligation", {}), Mapping) else {}
 
         crisis_mode = bool(constraints.get("crisis_mode", False))
         boredom_level = _safe_float(boredom.get("level", 0.0))
@@ -202,6 +203,7 @@ class ActionSelectorNeuron(BaseNeuron):
             "hypothesis": dict(hypothesis),
             "selected_action": selected_action,
             "trigger": dict(trigger),
+            "response_obligation": dict(response_obligation),
         }
 
         return [
@@ -216,6 +218,7 @@ class ActionSelectorNeuron(BaseNeuron):
                     "trigger": trigger.get("kind", "contextual"),
                     "selected_action": selected_action,
                     "hypothesis_id": decision["hypothesis_id"],
+                    "obligation_id": str(response_obligation.get("obligation_id", "")),
                     "use_association": should_use_association,
                 },
             )

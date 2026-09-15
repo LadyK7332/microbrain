@@ -367,6 +367,7 @@ def guard_native_response(
     payload: Mapping[str, Any] | None = None,
     raw_meta: Mapping[str, Any] | None = None,
     syntax_guidance: Mapping[str, Any] | None = None,
+    response_obligation: Mapping[str, Any] | None = None,
 ) -> ResponseObligationResult:
     """Accept, repair, or drop a final native response surface.
 
@@ -376,7 +377,13 @@ def guard_native_response(
     answer; it only checks whether the surface satisfies the immediate turn.
     """
     payload = payload if isinstance(payload, Mapping) else {}
+    explicit = response_obligation if isinstance(response_obligation, Mapping) else payload.get("response_obligation")
+    explicit = explicit if isinstance(explicit, Mapping) else {}
     turn_type, required_slots, subject = _classify_turn(user_text, payload)
+    if explicit:
+        turn_type = str(explicit.get("required_act") or explicit.get("obligation_kind") or turn_type)
+        subject = _clean_subject(explicit.get("target_surface") or explicit.get("target_ref") or subject)
+        required_slots = tuple(str(item) for item in list(explicit.get("required_slots", []) or []))
     proposed = str(proposed_reply or "").strip()
     invalid, invalid_reason = _is_orphan_fragment(proposed, user_text=user_text, turn_type=turn_type)
 
@@ -386,6 +393,25 @@ def guard_native_response(
             text=proposed,
             action="accept",
             reason=invalid_reason,
+            turn_type=turn_type,
+            subject=subject,
+            required_slots=tuple(required_slots),
+            original_text=str(user_text or ""),
+            proposed_text=proposed,
+            repaired=False,
+            ts=time.time(),
+        )
+
+    # An explicit obligation is a contract, not permission for this guard to
+    # invent semantics.  Invalid/empty native output is deferred to the learned
+    # surface realizer and remains visible as an expression gap if none exists.
+    if explicit:
+        required = bool(explicit.get("required", False)) and not bool(explicit.get("silence_allowed", False))
+        return ResponseObligationResult(
+            schema=RESPONSE_OBLIGATION_SCHEMA,
+            text="",
+            action="defer" if required else "drop",
+            reason=f"explicit_obligation_{invalid_reason}_requires_realization" if required else invalid_reason,
             turn_type=turn_type,
             subject=subject,
             required_slots=tuple(required_slots),
