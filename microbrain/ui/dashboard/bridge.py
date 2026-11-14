@@ -206,10 +206,14 @@ class DashboardBridge:
                     ts = 0.0
                 if ts > self._last_visual_ts:
                     self._last_visual_ts = ts
+                    ui_state = dict(safe_json(state))
+                    gaze = self.orch.kv_store.get("vision:gaze_state", None)
+                    if isinstance(gaze, Mapping):
+                        ui_state["_ui_gaze"] = safe_json(gaze)
                     await self._enqueue(
                         UIMessage(
                             topic=DASHBOARD_VISION_TOPIC,
-                            payload=safe_json(state),
+                            payload=ui_state,
                             source="ui.dashboard.visual_sampler",
                             meta={
                                 "ui_hidden": True,
@@ -314,6 +318,7 @@ class DashboardBridge:
             "adrenaline": safe_json(kv.get("body:adrenaline", {})),
             "capability": safe_json(kv.get("capability:state", {})),
             "vision": safe_json(kv.get("visual:current", {})),
+            "vision_gaze": safe_json(kv.get("vision:gaze_state", None)),
             "organs": {
                 "memory_composer": bool(kv.get("mem_cell:composer:started", False)),
                 "read_sidecar": bool(kv.get("read:sidecar_started", False)),
