@@ -27,6 +27,7 @@ _LEADING_SLASH_COMMANDS = {
     "/slearn",
     "/vision",
     "/camera",
+    "/scene",
     "/focus",
     "/acc",
     "/echo",
@@ -345,6 +346,13 @@ class TextInputNeuron(BaseNeuron):
                 cmd_text=text_norm,
                 ctx=ctx,
                 channel=channel,
+                correlation_id=event.correlation_id,
+            )
+
+        # Scene hints are command-plane context, never a percept or identity assertion.
+        if (not acc_applied) and command_root == "/scene":
+            return await self._handle_scene_command(
+                cmd_text=text_norm, ctx=ctx, channel=channel,
                 correlation_id=event.correlation_id,
             )
 
@@ -1077,6 +1085,37 @@ class TextInputNeuron(BaseNeuron):
             "Unknown /camera subcommand. Try: list, select, on, off, preview on|off, status",
             channel=channel,
             correlation_id=correlation_id,
+        )]
+
+    # ------------------------------------------------------------------
+    # /scene: operator-provided location hint (not a verified visual location).
+    # ------------------------------------------------------------------
+    async def _handle_scene_command(self, cmd_text: str, ctx, channel: str, correlation_id: str) -> List[Event]:
+        parts = str(cmd_text or "").strip().split(maxsplit=1)
+        value = parts[1].strip() if len(parts) > 1 else ""
+        active = await ctx.get_kv("scene:manual_active", None)
+        current = str(active.get("name") or "") if isinstance(active, dict) else ""
+        if not value or value.lower() == "status":
+            return [self._speech_control(
+                f"Scene: {current or '(automatic / unspecified)'}. Usage: /scene NAME | /scene status | /scene clear",
+                channel=channel, correlation_id=correlation_id,
+            )]
+        if value.lower() == "clear":
+            await ctx.set_kv("scene:manual_active", None)
+            return [self._speech_control(
+                "Manual scene context cleared; no location has been visually verified.",
+                channel=channel, correlation_id=correlation_id,
+            )]
+        if len(value) > 80 or not re.fullmatch(r"[\\w][\\w .'-]*", value, re.UNICODE):
+            return [self._speech_error(
+                "Scene name must be 1-80 characters (letters, digits, spaces, ., ' or -).",
+                channel=channel, correlation_id=correlation_id,
+            )]
+        packet = {"name": value, "source": "operator_hint", "activated_at": time.time(), "verified": False}
+        await ctx.set_kv("scene:manual_active", packet)
+        return [self._speech_control(
+            f"Scene context: {value} (operator hint; visual identity unverified).",
+            channel=channel, correlation_id=correlation_id,
         )]
 
     # ------------------------------------------------------------------
