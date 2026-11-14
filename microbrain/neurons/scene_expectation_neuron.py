@@ -179,6 +179,9 @@ class SceneExpectationNeuron(BaseNeuron):
         }
 
     def _place_key(self, scene: Mapping[str, Any]) -> str:
+        hint = (scene.get("meta") or {}).get("location_hint", {})
+        if isinstance(hint, Mapping) and str(hint.get("name") or "").strip():
+            return "manual:" + str(hint["name"]).strip().casefold()
         mods = scene.get("modalities", {}) if isinstance(scene.get("modalities", {}), Mapping) else {}
         internal = mods.get("internal", {}) if isinstance(mods.get("internal", {}), Mapping) else {}
         source_event = scene.get("source_event", {}) if isinstance(scene.get("source_event", {}), Mapping) else {}

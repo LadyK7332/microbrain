@@ -54,6 +54,14 @@ class BaseObjectFrameNeuron(BaseNeuron):
         previous_scene = await ctx.get_kv("object:current_scene", {})
         previous_scene_id = str(previous_scene.get("object_id", "") or "") if isinstance(previous_scene, dict) else ""
         scene = build_scene_object(recent, internal_state=internal_state, previous_scene_id=previous_scene_id)
+        location_hint = await ctx.get_kv("scene:manual_active", None)
+        if isinstance(location_hint, dict) and str(location_hint.get("name") or "").strip():
+            # This biases place-specific recall without making observed-object claims.
+            scene.setdefault("meta", {})["location_hint"] = {
+                "name": str(location_hint["name"]),
+                "source": "operator_hint",
+                "verified": False,
+            }
 
         await ctx.set_kv("object:last", obj)
         await ctx.set_kv("object:recent", recent)

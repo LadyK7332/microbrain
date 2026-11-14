@@ -47,6 +47,7 @@ from microbrain.ui.frontend_common import (
     should_show_in_conversation,
 )
 from microbrain.ui.dashboard.config_catalog import scan_repo
+from microbrain.ui.dashboard.gaze_overlay import gaze_overlay_geometry
 from microbrain.vision_state import (
     bbox_xywh,
     has_visual_motion_salience,
@@ -833,6 +834,7 @@ class VisionCanvas(QWidget):
         self._show_motion = False
         self._highlight_track_id = ""
         self._focus_track_id = ""
+        self._gaze_state: dict[str, Any] | None = None
         self._highlight_generation = 0
         self._motion_seen: dict[str, float] = {}
         self._frame_frozen = False
@@ -865,6 +867,13 @@ class VisionCanvas(QWidget):
         if self._frame_frozen:
             return
         self._overlays = self.decorate_objects(overlays[-64:])
+        self.update()
+
+    def set_gaze_state(self, gaze: Mapping[str, Any] | None) -> None:
+        """Expose existing gaze controller telemetry without changing attention."""
+        if self._frame_frozen:
+            return
+        self._gaze_state = dict(gaze) if isinstance(gaze, Mapping) else None
         self.update()
 
     def decorate_objects(self, objects: list[dict[str, Any]] | list[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -1088,6 +1097,43 @@ class VisionCanvas(QWidget):
             if flash_selected:
                 cx, cy = rx + rw / 2.0, ry + rh / 2.0
                 painter.drawLine(int(x0), int(cy), int(cx), int(cy))
+
+        # Presentation-only gaze marker, layered above the object overlays.
+        # Coordinates are relative to the displayed image, not the widget.
+        gaze = gaze_overlay_geometry(
+            self._gaze_state,
+            image_left=x0, image_top=y0,
+            image_width=scaled.width(), image_height=scaled.height(),
+        )
+        if gaze is not None:
+            mode = gaze["mode"]
+            color = QColor({
+                "search": VISION_COLOR_MOTION,
+                "roam": VISION_COLOR_MOTION,
+                "inspect": VISION_COLOR_FOCUSED,
+                "lock": VISION_COLOR_FOCUSED,
+                "hold": VISION_COLOR_FOCUSED,
+                "manual": VISION_COLOR_NOTICED,
+                "release": VISION_COLOR_LOST,
+            }.get(mode, VISION_COLOR_SELECTED))
+            cx, cy = gaze["cx"], gaze["cy"]
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            aperture = QPen(color, 1)
+            aperture.setStyle(Qt.DashLine)
+            painter.setPen(aperture)
+            painter.setBrush(Qt.NoBrush)
+            r = gaze["aperture_radius"]
+            painter.drawEllipse(QPointF(cx, cy), r, r)
+            painter.setPen(QPen(color, 2))
+            painter.drawEllipse(QPointF(cx, cy), 7.0, 7.0)
+            painter.drawLine(QPointF(cx - 11, cy), QPointF(cx - 8, cy))
+            painter.drawLine(QPointF(cx + 8, cy), QPointF(cx + 11, cy))
+            label = mode + (" · " + gaze["track_id"] if gaze["track_id"] else "")
+            painter.drawText(
+                int(min(x0 + scaled.width() - 4, max(x0 + 4, cx + 13))),
+                int(max(y0 + 15, cy - 12)),
+                label[:48],
+            )
 
 
 class VisionInspectorWidget(QWidget):
@@ -1385,6 +1431,7 @@ class PresenceWindow(QMainWindow):
         current = self.panels["process"].status_label.text().split(" | cap ", 1)[0]
         self.panels["process"].set_status(f"{current} | {self.capability_strip.compact_text()}")
 
+        self.vision.set_gaze_state(payload.get("vision_gaze"))
         vision = payload.get("vision", {}) if isinstance(payload.get("vision"), Mapping) else {}
         objects = vision.get("objects") if isinstance(vision.get("objects"), list) else []
         if objects and not self.vision_inspector.frozen:
@@ -1429,6 +1476,8 @@ class PresenceWindow(QMainWindow):
             self.panels["process"].set_status(f"{current} | {self.capability_strip.compact_text()}")
             return
         if msg.topic == "percept/vision":
+            if isinstance(payload.get("focus"), Mapping):
+                self.vision.set_gaze_state(payload["focus"])
             ref = str(payload.get("data_ref") or payload.get("frame_ref") or "")
             frame_bytes = payload.get("jpeg_bytes")
             width = int(payload.get("width") or 0)
@@ -1442,6 +1491,8 @@ class PresenceWindow(QMainWindow):
             return
 
         if msg.topic == "ui/vision_current":
+            if isinstance(payload.get("_ui_gaze"), Mapping):
+                self.vision.set_gaze_state(payload["_ui_gaze"])
             objects = payload.get("objects") if isinstance(payload.get("objects"), list) else []
             normalized = [dict(item) for item in objects if isinstance(item, Mapping)]
             if not self.vision_inspector.frozen:
