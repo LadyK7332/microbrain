@@ -1106,7 +1106,7 @@ class TextInputNeuron(BaseNeuron):
                 "Manual scene context cleared; no location has been visually verified.",
                 channel=channel, correlation_id=correlation_id,
             )]
-        if len(value) > 80 or not re.fullmatch(r"[\\w][\\w .'-]*", value, re.UNICODE):
+        if len(value) > 80 or not re.fullmatch(r"[\w][\w .'-]*", value, re.UNICODE):
             return [self._speech_error(
                 "Scene name must be 1-80 characters (letters, digits, spaces, ., ' or -).",
                 channel=channel, correlation_id=correlation_id,
